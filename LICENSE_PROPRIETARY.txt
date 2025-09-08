@@ -1,0 +1,32 @@
+Proprietary Software License — AhmedMonib E-Shop
+
+Copyright (c) 2025 Ahmed Monib
+All rights reserved.
+
+This file accompanies the AhmedMonib E-Shop software (the "Software"). The Software and all associated source code, documentation, configurations, assets, and related materials are the confidential and proprietary property of the copyright owner.
+
+1. License Grant
+   - The Software is licensed, not sold. Use of the Software is permitted only pursuant to a separate written Commercial License Agreement executed by the copyright owner ("Licensor") and the licensee ("Licensee").
+   - No rights are granted by implication, estoppel, or otherwise beyond those expressly set forth in the executed Commercial License Agreement.
+
+2. Restrictions
+   - Licensee shall not copy, modify, distribute, sublicense, lease, rent, sell, transfer, or otherwise make available the Software to any third party except as expressly permitted by the Commercial License Agreement.
+   - Licensee shall not remove, alter, or obscure any proprietary notices, labels, or marks in the Software.
+
+3. Source Code
+   - Access to source code is available only if explicitly granted in the executed Commercial License Agreement and subject to any related escrow, payment, and confidentiality conditions.
+
+4. Confidentiality
+   - The Software and any non-public materials provided with it are confidential. Licensee must protect them with at least the same degree of care it uses to protect its own confidential information, but not less than reasonable care.
+
+5. Warranty Disclaimer & Limitation of Liability
+   - The Software is provided "AS IS" without warranty of any kind. To the maximum extent permitted by applicable law, Licensor disclaims all warranties, whether express, implied, statutory, or otherwise, including any implied warranties of merchantability, fitness for a particular purpose, and non-infringement.
+   - In no event shall Licensor be liable for any indirect, incidental, special, consequential, or punitive damages, or loss of profits, data, or business, even if advised of the possibility of such damages.
+
+6. Termination
+   - Any violation of the terms of the Commercial License Agreement or this proprietary license entitles Licensor to terminate the license immediately and seek remedies available at law or in equity.
+
+7. Governing Law
+   - Any disputes arising under this license or any Commercial License Agreement shall be governed by the laws specified in the executed Commercial License Agreement.
+
+Contact: ahmedmounib2@gmail.com
