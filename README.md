@@ -7,8 +7,6 @@
 > * Stripe Checkout integration with robust webhook handling (PaymentIntent verification, refunds, expired sessions)
 > * Order export (PDF) & fulfilment tooling, GDPR data export, Sentry observability, and 89.28% test coverage.
 
-This `README.md` is ready to copy & paste to the repository root. It documents architecture, payment & order flows, deployment domains, how session persistence works, how to add screenshots to the README for your portfolio, licensing for commercial sale, and how to run locally **without Docker**.
-
 ---
 
 ## Table of contents
