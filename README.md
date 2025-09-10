@@ -32,7 +32,10 @@
     * [How to run tests](#how-to-run-tests)
     * [Test status](#test-status)
   * [How to run locally (no Docker)](#how-to-run-locally-no-docker)
+    * [Local HTTPS for development (optional but recommended)](#local-https-for-development-optional-but-recommended)
   * [Environment variables used](#environment-variables-used)
+    * [Example `.env` for local development (copy \& fill)](#example-env-for-local-development-copy--fill)
+    * [Deployment platform variables (Railway / Vercel)](#deployment-platform-variables-railway--vercel)
   * [Redis debugging quick commands](#redis-debugging-quick-commands)
   * [Screenshots](#screenshots)
     * [Orders \& Fulfilment](#orders--fulfilment)
@@ -389,6 +392,93 @@ npm run dev
 
 5. Visit the frontend URL printed by Vite (commonly `http://localhost:5173`).
 
+ ---
+
+### Local HTTPS for development (optional but recommended)
+
+This project can run the backend locally over **HTTPS** to better mimic production (certs are stored under `backend/cert/` in this repo). If you enable HTTPS you will typically open the backend URL first and accept the certificate in your browser; afterwards open the frontend at `https://localhost:5173`.
+
+**Quick note:** you can instead open **`https://localhost:5000`** (your backend) in the browser and accept the certificate there **before** opening **`https://localhost:5173`** — accepting the cert for the backend often prevents browser warnings when you then visit the frontend dev server.
+
+1) **Recommended (mkcert)** — easiest, trusted CA for local development
+
+```bash
+# install mkcert (example: macOS/Homebrew)
+brew install mkcert nss
+mkcert -install
+
+# generate SAN cert files used by the server (writes to backend/cert/)
+mkcert -key-file backend/cert/localhost2-key.pem \
+       -cert-file backend/cert/localhost2.pem \
+       localhost 127.0.0.1 ::1 www.localhost
+chmod 600 backend/cert/localhost2-key.pem
+```
+
+2) **OpenSSL (manual alternative)** — create a SAN cert without mkcert
+
+```bash
+cat > san.cnf <<'EOF'
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_ca
+prompt = no
+
+[req_distinguished_name]
+CN = localhost
+
+[v3_ca]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+DNS.2 = 127.0.0.1
+DNS.3 = ::1
+DNS.4 = www.localhost
+EOF
+
+openssl req -x509 -nodes -newkey rsa:2048 \
+  -keyout backend/cert/localhost2-key.pem \
+  -out backend/cert/localhost2.pem \
+  -days 825 -config san.cnf
+chmod 600 backend/cert/localhost2-key.pem
+```
+
+3) **Trust the cert (make browser accept it)**
+
+Use the OS-specific commands below to add the generated certificate to the system/browser trust store so browsers accept `https://localhost:5000` and `https://localhost:5173` without warnings.
+
+* **macOS**
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain backend/cert/localhost2.pem
+```
+
+* **Ubuntu / Debian**
+
+```bash
+sudo cp backend/cert/localhost2.pem /usr/local/share/ca-certificates/localhost2.crt
+sudo update-ca-certificates
+```
+
+* **Fedora / RHEL**
+
+```bash
+sudo trust anchor --store backend/cert/localhost2.pem
+```
+
+* **Windows (Admin PowerShell)**
+
+```powershell
+# Add to LocalMachine\Root
+Import-Certificate -FilePath .\backend\cert\localhost+2.pem -CertStoreLocation Cert:\LocalMachine\Root
+```
+
+If you used `mkcert` (recommended) it will automatically install the CA into the system/browser stores for you. After trusting the cert, restart your browser.
+
+**Restart servers:** after replacing cert files restart the backend dev server (nodemon will usually pick changes; otherwise `npm run dev` from repo root).
+
+---
+
 ---
 
 ## Environment variables used
@@ -465,6 +555,111 @@ USE_HTML_REDIRECT
 ```
 
 Remember to configure these per environment (Railway, Vercel, local).
+
+---
+
+### Example `.env` for local development (copy & fill)
+
+Below are **copy-ready** example files for local development. Put the backend block in `backend/.env` and the frontend block in `frontend/.env`.
+
+**backend/.env (local dev example)**
+
+```env
+# Server
+NODE_ENV=development
+PORT=5001
+CLIENT_URL=https://localhost:5173
+SERVER_URL=https://localhost:5001
+DEV_ORIGIN=https://localhost:5173,https://localhost:3000
+COOKIE_DOMAIN=
+ENFORCE_HTTPS=false
+TRUST_PROXY=false
+FORCE_SECURE_COOKIES=false
+
+# Database
+MONGO_URI=mongodb://localhost:27017/your-db-name
+
+# Redis (Optional)
+UPSTASH_REDIS_URL=
+
+# JWT / Auth
+ACCESS_TOKEN_SECRET=changeme_access_secret
+REFRESH_TOKEN_SECRET=changeme_refresh_secret
+ACCESS_TOKEN_EXPIRE=15m
+REFRESH_TOKEN_EXPIRE=7d
+MAX_SESSION_LIFETIME_DAYS=30
+CSRF_SECRET=changeme_csrf
+COOKIE_SECRET=changeme_cookie_secret
+JWT_SECRET=changeme_jwt_secret
+DEBUG_REFRESH=false
+
+# OAuth Providers
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_CALLBACK_URL=http://localhost:5001/api/auth/google/callback
+GOOGLE_LINK_CALLBACK_URL=http://localhost:5001/api/auth/google/link/callback
+FACEBOOK_APP_ID=
+FACEBOOK_APP_SECRET=
+FACEBOOK_CALLBACK_URL=http://localhost:5001/api/auth/facebook/callback
+FACEBOOK_LINK_CALLBACK_URL=http://localhost:5001/api/auth/facebook/link/callback
+
+# Stripe
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
+
+# Email Service (SendGrid)
+SENDGRID_API_KEY=
+SENDGRID_FROM_EMAIL=your-email@example.com
+SENDGRID_FROM_NAME="Ecommerce store"
+SUPPORT_EMAIL=your-support@example.com
+
+# Cloudinary
+CLOUDINARY_CLOUD_NAME=
+CLOUDINARY_API_KEY=
+CLOUDINARY_API_SECRET=
+
+# Sentry
+SENTRY_DSN=
+SENTRY_RELEASE=backend@local
+
+# File uploads / pricing
+UPLOADS_BASE_DIR=./uploads
+PRODUCT_IMAGES_DIR=./uploads/products
+TAX_RATE=0.14
+SHIPPING_COST=70
+
+# Local HTTPS cert usage flags (optional)
+USE_LOCAL_HTTPS=true
+LOCAL_CERT_PATH=./cert/localhost2.pem
+LOCAL_KEY_PATH=./cert/localhost2-key.pem
+```
+
+**frontend/.env (local dev example for Vite)**
+
+```env
+VITE_API_BASE_URL=https://localhost:5001
+VITE_CLIENT_BASE_URL=https://localhost:5173
+VITE_KEEPALIVE_INTERVAL_MS=300000
+VITE_STRIPE_PUBLISHABLE_KEY=
+VITE_SENTRY_DSN=
+VITE_SENTRY_RELEASE=frontend@local
+VITE_SENTRY_TRACES_SAMPLE_RATE=0.1
+VITE_TAX_RATE=0.14
+VITE_SHIPPING_COST=70
+```
+
+Notes:
+* Keep secrets out of source control — commit only `.env.example` with placeholders.
+* If you run backend locally over HTTPS (see "Local HTTPS for development" above), set `USE_LOCAL_HTTPS=true` and ensure the `LOCAL_CERT_PATH` / `LOCAL_KEY_PATH` point to the cert files (or let server code load `backend/cert/localhost+2.pem` by default).
+
+---
+
+### Deployment platform variables (Railway / Vercel)
+
+The README already lists the primary deployment variables in groups. To be explicit:
+
+* **Railway / server-side**: populate the backend keys shown in `backend/.env` (MONGO_URI, REDIS, STRIPE_*, SENDGRID_*, SENTRY_*, CALLBACK URLs, COOKIE_DOMAIN, etc.) in Railway's environment variables panel.
+* **Vercel / frontend**: populate the `VITE_*` variables (API base, stripe publishable key, Sentry keys, client base URL and any feature flags).
 
 ## Redis debugging quick commands
 
