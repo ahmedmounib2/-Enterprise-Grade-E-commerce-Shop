@@ -41,6 +41,7 @@
     * [Orders \& Fulfilment](#orders--fulfilment)
     * [Create Product \& Variants](#create-product--variants)
     * [Analytics \& Campaigns](#analytics--campaigns)
+    * [Emails](#emails)
   * [Commercial license (proprietary) \& selling notes](#commercial-license-proprietary--selling-notes)
   * [Contact / commercial enquiries](#contact--commercial-enquiries)
 
@@ -649,6 +650,7 @@ VITE_SHIPPING_COST=70
 ```
 
 Notes:
+
 * Keep secrets out of source control — commit only `.env.example` with placeholders.
 * If you run backend locally over HTTPS (see "Local HTTPS for development" above), set `USE_LOCAL_HTTPS=true` and ensure the `LOCAL_CERT_PATH` / `LOCAL_KEY_PATH` point to the cert files (or let server code load `backend/cert/localhost+2.pem` by default).
 
@@ -737,6 +739,29 @@ GET cart_backup:<userId>
 *Marketing campaigns / mailing list management.*
 
 ---
+
+### Emails
+
+![Email Campaign Subscription Confirmation](./docs/screenshots/email-campaign-subscription-confirmation-email.png)
+*Email campaign subscription confirmation email.*
+
+![Emails Sent to Inbox (Not Spam)](./docs/screenshots/emails-sent-to-inbox-not-spam.png)
+*Emails successfully delivered to inbox (not marked as spam).*
+
+![Order Confirmation Email (COD with Variants)](./docs/screenshots/order-confirmation-email-cashOnDelivery-some-products-with-variants.png)
+*Order confirmation email for cash-on-delivery orders with product variants.*
+
+![Order Confirmation Email (Paid with Variants)](./docs/screenshots/order-confirmation-email-paid-order-products-have%20variants.png)
+*Order confirmation email for paid orders with product variants.*
+
+![Order Cancellation Confirmation](./docs/screenshots/order_cancelation_confirmation_email.png)
+*Order cancellation confirmation email.*
+
+![Reset Password Link Email](./docs/screenshots/reset_password_link_email.png)
+*Password reset link email.*
+
+![Verify Email](./docs/screenshots/local_sigunp_verify_email.png)
+*Local signup Email verification request email.*
 
 ## Commercial license (proprietary) & selling notes
 
