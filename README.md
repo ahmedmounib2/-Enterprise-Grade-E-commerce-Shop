@@ -11,39 +11,48 @@
 
 ## Table of contents
 
-* [AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop](#ahmedmonib-e-shop--enterprise-grade-e-commerce-shop)
-  * [Table of contents](#table-of-contents)
-  * [One-line pitch](#one-line-pitch)
-  * [Live demo \& hosted domains](#live-demo--hosted-domains)
-  * [What this repo contains](#what-this-repo-contains)
-  * [Key features (summary)](#key-features-summary)
-  * [Payment \& order flow (detailed)](#payment--order-flow-detailed)
-    * [Checkout (Stripe) flow — `createCheckoutSession`](#checkout-stripe-flow--createcheckoutsession)
-    * [Stripe webhooks \& async handling — `stripeWebhook`](#stripe-webhooks--async-handling--stripewebhook)
-    * [COD flow (Cash-on-Delivery) — `createCODOrder` \& `codCheckoutSuccess`](#cod-flow-cash-on-delivery--createcodorder--codcheckoutsuccess)
-    * [Stock reservation \& restoration (variant-aware)](#stock-reservation--restoration-variant-aware)
-    * [Failure \& expired session handling](#failure--expired-session-handling)
-  * [Products, variants \& model behavior](#products-variants--model-behavior)
-  * [Auth \& session persistence — how it works (plain language)](#auth--session-persistence--how-it-works-plain-language)
-  * [Order fulfilment, PDF export \& canceled order labeling](#order-fulfilment-pdf-export--canceled-order-labeling)
-  * [GDPR \& user data export](#gdpr--user-data-export)
-  * [Security \& observability](#security--observability)
-  * [Testing \& CI](#testing--ci)
-    * [How to run tests](#how-to-run-tests)
-    * [Test status](#test-status)
-  * [How to run locally (no Docker)](#how-to-run-locally-no-docker)
-    * [Local HTTPS for development (optional but recommended)](#local-https-for-development-optional-but-recommended)
-  * [Environment variables used](#environment-variables-used)
-    * [Example `.env` for local development (copy \& fill)](#example-env-for-local-development-copy--fill)
-    * [Deployment platform variables (Railway / Vercel)](#deployment-platform-variables-railway--vercel)
-  * [Redis debugging quick commands](#redis-debugging-quick-commands)
-  * [Screenshots](#screenshots)
-    * [Orders \& Fulfilment](#orders--fulfilment)
-    * [Create Product \& Variants](#create-product--variants)
-    * [Analytics \& Campaigns](#analytics--campaigns)
-    * [Emails](#emails)
-  * [Commercial license (proprietary) \& selling notes](#commercial-license-proprietary--selling-notes)
-  * [Contact / commercial enquiries](#contact--commercial-enquiries)
+- [AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop](#ahmedmonib-e-shop--enterprise-grade-e-commerce-shop)
+  - [Table of contents](#table-of-contents)
+  - [One-line pitch](#one-line-pitch)
+  - [Live demo \& hosted domains](#live-demo--hosted-domains)
+  - [What this repo contains](#what-this-repo-contains)
+  - [Key features (summary)](#key-features-summary)
+  - [Payment \& order flow (detailed)](#payment--order-flow-detailed)
+    - [Checkout (Stripe) flow — `createCheckoutSession`](#checkout-stripe-flow--createcheckoutsession)
+    - [Stripe webhooks \& async handling — `stripeWebhook`](#stripe-webhooks--async-handling--stripewebhook)
+    - [COD flow (Cash-on-Delivery) — `createCODOrder` \& `codCheckoutSuccess`](#cod-flow-cash-on-delivery--createcodorder--codcheckoutsuccess)
+    - [Stock reservation \& restoration (variant-aware)](#stock-reservation--restoration-variant-aware)
+    - [Failure \& expired session handling](#failure--expired-session-handling)
+  - [Products, variants \& model behavior](#products-variants--model-behavior)
+    - [Product creation \& image upload pipeline (frontend → backend → Cloudinary)](#product-creation--image-upload-pipeline-frontend--backend--cloudinary)
+      - [1) Frontend (Create / Edit Product forms)](#1-frontend-create--edit-product-forms)
+      - [2) Upload middleware (backend)](#2-upload-middleware-backend)
+      - [3) Image processing (Sharp)](#3-image-processing-sharp)
+      - [4) Cloudinary upload \& cleanup](#4-cloudinary-upload--cleanup)
+      - [5) Variants \& image mapping](#5-variants--image-mapping)
+      - [6) Storage of record](#6-storage-of-record)
+      - [7) Environment (what to set)](#7-environment-what-to-set)
+      - [8) Operational notes](#8-operational-notes)
+  - [Auth \& session persistence — how it works (plain language)](#auth--session-persistence--how-it-works-plain-language)
+  - [Order fulfilment, PDF export \& canceled order labeling](#order-fulfilment-pdf-export--canceled-order-labeling)
+  - [GDPR \& user data export](#gdpr--user-data-export)
+  - [Security \& observability](#security--observability)
+  - [Testing \& CI](#testing--ci)
+    - [How to run tests](#how-to-run-tests)
+    - [Test status](#test-status)
+  - [How to run locally (no Docker)](#how-to-run-locally-no-docker)
+    - [Local HTTPS for development (optional but recommended)](#local-https-for-development-optional-but-recommended)
+  - [Environment variables used](#environment-variables-used)
+    - [Example `.env` for local development (copy \& fill)](#example-env-for-local-development-copy--fill)
+    - [Deployment platform variables (Railway / Vercel)](#deployment-platform-variables-railway--vercel)
+  - [Redis debugging quick commands](#redis-debugging-quick-commands)
+  - [Screenshots](#screenshots)
+    - [Orders \& Fulfilment](#orders--fulfilment)
+    - [Create Product \& Variants](#create-product--variants)
+    - [Analytics \& Campaigns](#analytics--campaigns)
+    - [Emails](#emails)
+  - [Commercial license (proprietary) \& selling notes](#commercial-license-proprietary--selling-notes)
+  - [Contact / commercial enquiries](#contact--commercial-enquiries)
 
 ---
 
@@ -92,10 +101,11 @@ Enterprise-grade e-commerce storefront with robust session security, per-variant
   * Admin product flows with variant generation and image management.
 * Fulfilment & Admin
 
-  * Order listing, status changes, PDF export for fulfilment/labeling, canceled order labeling and audit trails.
+* Order listing, status changes, PDF export for fulfilment/labeling, canceled order labeling and audit trails.
+* **Fully responsive Admin Dashboard** — manage orders, add products, edit variants, and run the store from a **phone or tablet** (mobile-friendly layouts and inputs).
 * Privacy & Compliance
 
-  * GDPR-ready: user data export endpoint and account deletion/anonymization tooling.
+* GDPR-ready: user data export endpoint and account deletion/anonymization tooling.
 * Observability & Security
 
   * Sentry client & server integration, Winston logging with daily rotation and PII redaction.
@@ -257,6 +267,113 @@ The webhook handler validates Stripe signatures and supports multiple events:
 * Ability to **hide** items from the UI (instead of deleting) so you can retain product data and reinstate when restocked.
 
 ---
+
+### Product creation & image upload pipeline (frontend → backend → Cloudinary)
+
+This project implements a **robust, rate-limit-friendly** image flow for both product creation and editing. It works the same in local dev and production (Railway).
+
+#### 1) Frontend (Create / Edit Product forms)
+
+* Users can attach up to **10 gallery images** (`images[]`) and optional **per-variant images** (`colorImages[]`).
+* When variants include a Color attribute, the form pairs each uploaded variant image with a **`colorKeys`** string (one per file), so the backend can map it to the correct variant.
+* All data is submitted as `multipart/form-data`:
+  * `name.*`, `description.*`, `category.*` (multi-lang fields)
+  * `price` (base product price)
+  * `images` (0—10 gallery images)
+  * `variants` (JSON of the variant grid with attributes/stock/price)
+  * `colorImages` (0—N files, one per colored variant you want an override image for)
+  * `colorKeys` (0—N strings, aligned to `colorImages`)
+* **Editing** additionally sends:
+  * `keepImages` — array of existing gallery URLs that should stay
+  * `keepVariantImages` — array (by variant index) of URLs (or `null`) to keep/clear
+
+> Frontend uses a generous Axios timeout to accommodate 10-image batches. Gallery/variant files are appended individually; the backend processes them **sequentially** to avoid burst limits.
+
+#### 2) Upload middleware (backend)
+
+`backend/src/middleware/upload.middleware.js`
+
+* Uses **Multer** with disk storage:
+  * Destination: `UPLOADS_BASE_DIR` (env) — defaults to `uploads` at project root
+  * Safe filename format: `${Date.now()}-<uuid>.<ext>`
+  * **Type guard**: only `jpeg/jpg/png/webp` allowed
+  * **Limits**: `files: 20`, `fileSize: MAX_UPLOAD_MB` (env, default `25MB`)
+* After the request passes the middleware, `req.files` contains all uploaded files ready for processing.
+
+#### 3) Image processing (Sharp)
+
+`backend/src/utils/imageProcessor.js`
+
+* Converts each raw upload to an optimized **WebP**:
+  * `800x800` **cover** crop, then `toFormat('webp')`
+  * Writes to **`uploads/products/`** (folder ensured if missing)
+  * Removes the **original raw** temp file
+  * Returns the **filename** (e.g., `product-<uuid>.webp`)
+
+> Design note: We always write to `uploads/products` locally (even in production) as a **temporary processing step**; the system of record is **Cloudinary**.
+
+#### 4) Cloudinary upload & cleanup
+
+In `product.controller.js` we use a single helper:
+
+* `processAndUpload(file)`:
+  1. Calls `processProductImage(file)` → get processed WebP filename
+  2. Uploads `<UPLOADS_BASE_DIR>/<PRODUCT_IMAGES_DIR>/<filename>` to Cloudinary
+     * `folder: CLOUDINARY_FOLDER` (defaults to `products`)
+     * `resource_type: 'image'`, `unique_filename: true`, `overwrite: false`
+  3. **Deletes** the processed WebP after upload
+  4. Returns `secure_url`
+* **Sequential** uploads (for both gallery and variant images) avoid Cloudinary rate-limit spikes and make 10-image batches reliable on slower networks.
+* A best-effort `cleanupTempUploads(req.files)` runs in `finally{}` to remove any Multer temps.
+
+#### 5) Variants & image mapping
+
+**Create** (`POST /api/products`):
+
+* Gallery: every file in `images` → `processAndUpload` → push to `product.images`.
+* Variants:
+  * Parse `variants` JSON (attributes/stock/price per row).
+  * If `colorImages` provided, pair **index-aligned** `colorKeys` to build a `colorToUrl` map (e.g., `{ "Red": <url>, "Blue": <url> }`).
+  * For each variant, if it has a `Color` (or `color`) attribute, set `variant.image = colorToUrl[color]` when present.
+  * **No gallery images?** Seed gallery from the `colorToUrl` values so the product still has images.
+
+**Edit** (`PUT /api/products/:id`):
+
+* **Deletes** Cloudinary images that are *not* listed in `keepImages`.
+* Uploads any new `images`, then sets `product.images = [...keepImages, ...newUrls]`.
+* For variants: uploads new `colorImages` and maps them to attributes like create; otherwise uses the corresponding `keepVariantImages[idx]` value.
+
+#### 6) Storage of record
+
+* The **authoritative** product image URLs live in MongoDB (`product.images` and `variant.image`).
+* The **only** persistent storage for image binaries is **Cloudinary**. The `uploads/` folder is **ephemeral** (processing temp).
+
+#### 7) Environment (what to set)
+
+* **Backend (Railway / local)**
+
+  ```env
+  # Cloudinary credentials
+  CLOUDINARY_CLOUD_NAME=...
+  CLOUDINARY_API_KEY=...
+  CLOUDINARY_API_SECRET=...
+  # Upload pipeline
+  UPLOADS_BASE_DIR=uploads           # temp processing base dir (no leading ./ in prod)
+  PRODUCT_IMAGES_DIR=products        # temp subfolder for processed webp files
+  CLOUDINARY_FOLDER=products         # Cloudinary target folder
+  MAX_UPLOAD_MB=25                   # per-file limit enforced by Multer
+  ```
+
+* **CSP** (already configured): `img-src` allows `https://res.cloudinary.com` so images render in all environments.
+
+#### 8) Operational notes
+
+* **Batch size**: 10 gallery images (plus per-variant images) are supported; uploads run **sequentially** to avoid rate-limit bursts.
+* **Timeouts**: The frontend Axios instance uses extended timeouts for create/edit product calls to accommodate slower networks + large images.
+* **Safety**: Any Multer temp that somehow survives processing is cleaned in a `finally{}` block.
+* **Editing deletions**: When an admin removes a gallery image, the backend issues a `cloudinary.uploader.destroy("products/<publicId>")` before saving the new list.
+
+> TL;DR — Drop up to 10 images (+ optional per-variant images), the backend processes to WebP, uploads to Cloudinary (one by one), cleans temp files, and persists Cloudinary URLs on the product.
 
 ## Auth & session persistence — how it works (plain language)
 
@@ -549,10 +666,13 @@ PORT
 NODE_ENV
 VITE_TAX_RATE
 VITE_SHIPPING_COST
-UPLOADS_BASE_DIR
-PRODUCT_IMAGES_DIR
+UPLOADS_BASE_DIR         # temp processing base dir (e.g., "uploads")
+PRODUCT_IMAGES_DIR       # temp subdir for processed webp (e.g., "products")
+CLOUDINARY_FOLDER        # Cloudinary folder for final assets (e.g., "products")
+MAX_UPLOAD_MB            # Multer per-file size limit in MB (default 25)
 COOKIE_DOMAIN
 USE_HTML_REDIRECT
+
 ```
 
 Remember to configure these per environment (Railway, Vercel, local).
@@ -624,10 +744,13 @@ SENTRY_DSN=
 SENTRY_RELEASE=backend@local
 
 # File uploads / pricing
-UPLOADS_BASE_DIR=./uploads
-PRODUCT_IMAGES_DIR=./uploads/products
+UPLOADS_BASE_DIR=uploads # use bare path (no ./) to match prod
+PRODUCT_IMAGES_DIR=products
+CLOUDINARY_FOLDER=products
 TAX_RATE=0.14
 SHIPPING_COST=70
+# optionally raise this if you use very large originals
+MAX_UPLOAD_MB=25
 
 # Local HTTPS cert usage flags (optional)
 USE_LOCAL_HTTPS=true
