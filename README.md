@@ -17,6 +17,7 @@
 
 - [AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop](#ahmedmonib-e-shop--enterprise-grade-e-commerce-shop)
   - [Table of contents](#table-of-contents)
+  - [Maintainer context](#maintainer-context)
   - [One-line pitch](#one-line-pitch)
   - [Live demo \& hosted domains](#live-demo--hosted-domains)
   - [Monorepo architecture \& workspaces](#monorepo-architecture--workspaces)
@@ -77,6 +78,16 @@
 
 ---
 
+## Maintainer context
+
+This project is built and maintained by a single freelance developer. Any "playbook" style
+documentation in [`docs/`](docs/) is optional scaffolding kept around for potential future growth of
+the project into a team setting; it is **not** required for day-to-day solo development. Feel free
+to ignore those extras unless you want structured guidance when collaborating with additional
+contributors later on.
+
+---
+
 ## One-line pitch
 
 Enterprise-grade e-commerce storefront with robust session security, per-variant inventory,
@@ -134,11 +145,19 @@ npm -w mobile run start:lan     # Metro on LAN (update HOSTNAME env in package.j
 
 ### Environment references
 
+Solo development rarely needs heavy process docs, but these optional references are available if you
+decide to collaborate with others or formalise operations:
+
 - [`mobile/env.md`](mobile/env.md) — environments, workspace responsibilities, run modes, deployment
   checklists.
 - [`mobile/dev-setup.md`](mobile/dev-setup.md) — Android toolchain, device connectivity, Expo
   workflows.
-- [`docs/INCIDENT_RESPONSE.md`](docs/INCIDENT_RESPONSE.md) — production incident playbook.
+- [`docs/deployment.md`](docs/deployment.md) — optional release runbook covering frontend, backend,
+  and mobile rollouts when multiple people coordinate deployments.
+- [`docs/security/access-controls.md`](docs/security/access-controls.md) — optional template for
+  documenting account provisioning and least-privilege roles once more contributors join.
+- [`docs/INCIDENT_RESPONSE.md`](docs/INCIDENT_RESPONSE.md) — optional production incident playbook
+  if you later need structured response expectations.
 
 ---
 
@@ -1219,9 +1238,13 @@ Check LICENSE_PROPRIETARY.txt
 
 ## Mobile app download placeholder
 
-- **Google Play (production)** — _Public Play Store link coming soon once approved after tests._
+Use this section once the Android build is live:
+
+- **Google Play (production)** — _Add the public Play Store link here once approved._
 - **QR code** — _Embed a QR image or markdown link here so testers can scan and download the
   APK/AAB._
+
+For pre-release distribution you can temporarily link to an Expo build or internal testing track.
 
 ---
 
@@ -1232,8 +1255,11 @@ the Expo mobile client). Update or rotate as needed before sharing broadly.
 
 | Role            | Email / Username         | Password |
 | --------------- | ------------------------ | -------- |
-| Admin           | `ahmedmonib61@gmail.com` | `1234567` |
-| Regular shopper | `amonib831@gmail.com`    | `1234567` |
+| Admin           | `ahmedmonib61@gmail.com` | `123456` |
+| Regular shopper | `amonib831@gmail.com`    | `123456` |
+
+> ⚠️ **Security note:** These accounts are for evaluation only. Reset or disable them prior to
+> handing the codebase to a paying client.
 
 ---
 
