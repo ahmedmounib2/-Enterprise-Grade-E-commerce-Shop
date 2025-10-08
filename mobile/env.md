@@ -127,6 +127,12 @@ headers).
 | `MAIL_CONFIRM_WEB_URL`       | Optional HTTPS override used inside confirmation emails.       | `https://shop.example.com/mailing/confirm`             |
 | `MOBILE_OAUTH_REDIRECT_URI`  | Custom-scheme deep link for OAuth return.                      | `eshop://oauth`                                        |
 
+> **Branding tip:** The public-facing app name shown in the Google Play Console (e.g. "Ecommerce")
+> can differ from the internal deep-link scheme (`eshop://…`). Only change the scheme and the values
+> above if you intend to rebrand all mobile links and have also updated `mobile/app.config.js`, the
+> published Android intent filters, and any emails that reference these URIs. Simply renaming the
+> store listing does **not** require touching the scheme or redirect values.
+>
 ### Shared contracts
 
 - Keep Vercel and Railway `PUBLIC_CLIENT_FALLBACK_URL` synchronized.

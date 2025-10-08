@@ -1255,8 +1255,7 @@ the Expo mobile client). Update or rotate as needed before sharing broadly.
 
 | Role            | Email / Username         | Password |
 | --------------- | ------------------------ | -------- |
-| Admin           | `ahmedmonib61@gmail.com` | `123456` |
-| Regular shopper | `amonib831@gmail.com`    | `123456` |
+| Regular shopper | `amonib831@gmail.com`    | `1234567` |
 
 > ⚠️ **Security note:** These accounts are for evaluation only. Reset or disable them prior to
 > handing the codebase to a paying client.
