@@ -1333,11 +1333,8 @@ Check LICENSE_PROPRIETARY.txt
 
 Use this section once the Android build is live:
 
-- **Google Play (production)** — _Add the public Play Store link here once approved._
-- **QR code** — _Embed a QR image or markdown link here so testers can scan and download the
-  APK/AAB._
-
-For pre-release distribution you can temporarily link to an Expo build or internal testing track.
+- **Google Play (production)** — _Public Play Store link coming soon_
+- **QR code** — _coming soon_
 
 ---
 
@@ -1348,7 +1345,6 @@ the Expo mobile client). Update or rotate as needed before sharing broadly.
 
 | Role            | Email / Username         | Password |
 | --------------- | ------------------------ | -------- |
-| Admin           | `ahmedmonib61@gmail.com` | `123456` |
 | Regular shopper | `amonib831@gmail.com`    | `123456` |
 
 > ⚠️ **Security note:** These accounts are for evaluation only. Reset or disable them prior to
@@ -1372,14 +1368,17 @@ Extra reference material that complements this README:
   end checklist for preparing a Play Store build.
 - [`mobile/docs/internalTesting-and-productionAABinstall.md`](mobile/docs/internalTesting-and-productionAABinstall.md)
   — AAB sideload/testing guide.
-- [`mobile/docs/mobile-checkout-flow.md`](mobile/docs/mobile-checkkout-flow.md) — annotated mobile
+- [`mobile/docs/mobile-checkout-flow.md`](mobile/docs/mobile-checkout-flow.md) — annotated mobile
   checkout sequence with deeplink notes.
 - [`mobile/certs/README.md`](mobile/certs/README.md) — explains the local HTTPS certificates and how
   to rotate them.
 - [`docs/DAISYUI-THEME.md`](docs/DAISYUI-THEME.md) — shared DaisyUI theming internals for web and
   mobile.
 - [`docs/THEME.md`](docs/THEME.md) — native token architecture for both platforms.
-
+- [`draft.md`](draft.md) — scratchpad for marketing copy/launch notes.
+- [`eslint-cheatsheet.md`](eslint-cheatsheet.md) — linting reference for contributors.
+- [`prettier-configuration-cheatSheet.md`](prettier-configuration-cheatSheet.md) — Prettier usage
+  guide tailored to this repo.
 
 ---
 
