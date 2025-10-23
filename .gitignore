@@ -1,0 +1,16 @@
+.env
+.env.*
+*.pem
+*.p12
+*.jks
+ecommerce_env_backup.txt
+.env
+.env.*
+*.pem
+*.p12
+*.jks
+ecommerce_env_backup.txt
+ecommerce_env_backup.txt
+.env
+.env.*
+*.env
