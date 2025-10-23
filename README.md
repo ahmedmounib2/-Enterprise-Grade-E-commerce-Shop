@@ -1311,7 +1311,7 @@ variant chips and quantity controls._
 ![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg) _Order history
 with status tracking._
 
-![Mobile — Profile tools](./docs/screenshots/mobile-app-profile-page-delete-acount&exportData-section-light.jpg)
+![Mobile — Profile tools](./docs/screenshots/mbile-app-profile-page-delete-acount&exportData-section-light.jpg)
 _Profile management, GDPR export, and delete account actions._
 
 ## Commercial license (proprietary) & selling notes
@@ -1375,7 +1375,6 @@ Extra reference material that complements this README:
 - [`docs/DAISYUI-THEME.md`](docs/DAISYUI-THEME.md) — shared DaisyUI theming internals for web and
   mobile.
 - [`docs/THEME.md`](docs/THEME.md) — native token architecture for both platforms.
-- [`draft.md`](draft.md) — scratchpad for marketing copy/launch notes.
 - [`eslint-cheatsheet.md`](eslint-cheatsheet.md) — linting reference for contributors.
 - [`prettier-configuration-cheatSheet.md`](prettier-configuration-cheatSheet.md) — Prettier usage
   guide tailored to this repo.
