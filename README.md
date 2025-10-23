@@ -24,6 +24,8 @@
     - [Workspaces](#workspaces)
     - [Common scripts](#common-scripts)
     - [Environment references](#environment-references)
+    - [DaisyUI theming (web + mobile)](#daisyui-theming-web--mobile)
+    - [Wishlist DTO \& API contract](#wishlist-dto--api-contract)
   - [Deployment surfaces \& release workflow](#deployment-surfaces--release-workflow)
     - [Frontend (Vercel)](#frontend-vercel)
     - [Backend (Railway Docker image)](#backend-railway-docker-image)
@@ -75,6 +77,7 @@
   - [Contact / commercial enquiries](#contact--commercial-enquiries)
   - [Mobile app download placeholder](#mobile-app-download-placeholder)
   - [Demo credentials (web \& mobile)](#demo-credentials-web--mobile)
+  - [Additional documentation](#additional-documentation)
 
 ---
 
@@ -159,6 +162,75 @@ decide to collaborate with others or formalise operations:
 - [`docs/INCIDENT_RESPONSE.md`](docs/INCIDENT_RESPONSE.md) — optional production incident playbook
   if you later need structured response expectations.
 
+### DaisyUI theming (web + mobile)
+
+The Tailwind/DaisyUI palettes live outside the native theme tokens so designers can iterate on
+colours without disturbing existing light/dark logic. The shared catalogue is generated once and the
+bridges in each client translate it into platform-friendly tokens, which is how we can flip the
+entire colour system in minutes:
+
+- [`docs/DAISYUI-THEME.md`](docs/DAISYUI-THEME.md) — explains the source-of-truth files and how to
+  propagate updates across platforms.
+- [`docs/THEME.md`](docs/THEME.md) — native token architecture (light/dark palettes, typography) for
+  both web and mobile clients.
+- `shared/theme/daisyThemes.js` — authoritative DaisyUI catalogue that the build scripts consume.
+- `frontend/theme/styleThemes.js` — bridges the DaisyUI catalogue with the native tokens and exports
+  helpers for Tailwind + the React context.
+- `frontend/tailwind.config.js` — loads the DaisyUI palette list and passes it to the plugin at
+  build time.
+- `mobile/scripts/build-mobile-theme.mjs` — converts the shared catalogue into Expo-friendly
+  JavaScript before Metro starts.
+- `mobile/src/theme/generated/daisyThemes.js` — the generated mirror that NativeWind consumes.
+- `mobile/src/theme/styleThemes.js` — mobile bridge that keeps DaisyUI logic separate from the
+  native palette definitions.
+
+Because the shared generators hydrate both clients, rebranding requires editing **one** DaisyUI
+entry or the native `themeTokens.js` file, running `npm run gen:mobile-theme`, and restarting the
+relevant dev servers. The storefront, dashboard, and Expo app inherit the new palette instantly
+without manual CSS or component tweaks.
+
+Each catalogue ships with the full set of official DaisyUI themes (35 as of v5.3) plus the bespoke
+native palette. Every entry exposes both a light and dark variant so the navbar theme picker can
+switch between **36** options without fighting the existing appearance toggle.
+
+**Adding a new DaisyUI theme**
+
+1. Duplicate an entry in `frontend/theme/daisyThemes.js` (or the mobile counterpart) within the
+   `DAISY_STYLE_THEMES` array.
+2. Pick lighter colours for the `light` object and darker tones for the `dark` object so each mode
+   matches the palette intent.
+3. Provide a unique `id`, `label`, and `description` to surface it inside the theme picker.
+4. Copy the updated `daisyThemes.js` file between web and mobile if both apps should share the
+   palette.
+5. Restart `npm -w frontend run dev` (and/or `npm -w mobile run start`) so Tailwind/Metro reloads
+   the config.
+
+Run `npm install` once, then restart the relevant dev server (`npm -w frontend run dev` or
+`npm -w mobile run start`) after editing a palette so Tailwind picks up the new configuration.
+
+---
+
+### Wishlist DTO & API contract
+
+The wishlist flow is intentionally thin so the web and mobile clients can share the exact same DTO
+and optimistic update logic:
+
+- **Endpoint:** `POST /api/users/me/wishlist`
+- **Body DTO:** `{ "productId": string }`
+- **Success response:** `{ success: true, data: { ids: string[], products: WishlistProduct[] } }`
+
+Key implementation files:
+
+- Backend controller and DTO normalisation (`normalizeWishlistIds`, `normalizeWishlistProduct`):
+  `backend/src/controllers/user.controller.js`
+- Route registration: `backend/src/routes/user.routes.js`
+- Frontend Zustand store that consumes the DTO and handles optimistic updates:
+  `frontend/src/stores/useUserStore.js`
+- Mobile Expo store mirroring the same contract: `mobile/src/stores/useUserStore.js`
+
+All three surfaces share the same shape, so adding wishlist toggles or badges in any client only
+requires UI work—the network contract and cached data stay in sync automatically.
+
 ---
 
 ## Deployment surfaces & release workflow
@@ -167,7 +239,28 @@ decide to collaborate with others or formalise operations:
 
 - Project **Root Directory** must be `frontend`.
 - `frontend/vercel.json` enforces `npm ci --legacy-peer-deps`, configures rewrites for `/api/*`, and
-  applies SPA fallbacks + cache headers.
+  applies SPA fallbacks + cache headers.### Wishlist DTO & API contract
+
+  The wishlist flow is intentionally thin so the web and mobile clients can share the exact same DTO
+  and optimistic update logic:
+
+  - **Endpoint:** `POST /api/users/me/wishlist`
+  - **Body DTO:** `{ "productId": string }`
+  - **Success response:** `{ success: true, data: { ids: string[], products: WishlistProduct[] } }`
+
+  Key implementation files:
+
+  - Backend controller and DTO normalisation (`normalizeWishlistIds`, `normalizeWishlistProduct`):
+    `backend/src/controllers/user.controller.js`
+  - Route registration: `backend/src/routes/user.routes.js`
+  - Frontend Zustand store that consumes the DTO and handles optimistic updates:
+    `frontend/src/stores/useUserStore.js`
+  - Mobile Expo store mirroring the same contract: `mobile/src/stores/useUserStore.js`
+
+  All three surfaces share the same shape, so adding wishlist toggles or badges in any client only
+  requires UI work—the network contract and cached data stay in sync automatically.
+
+  ---
 - Trigger deployments from CI or manually via CLI:
 
   ```bash
@@ -1260,6 +1353,33 @@ the Expo mobile client). Update or rotate as needed before sharing broadly.
 
 > ⚠️ **Security note:** These accounts are for evaluation only. Reset or disable them prior to
 > handing the codebase to a paying client.
+
+---
+
+## Additional documentation
+
+Extra reference material that complements this README:
+
+- [`frontend/README.md`](frontend/README.md) — frontend-specific architecture, scripts, and tooling.
+- [`mobile/dev-setup.md`](mobile/dev-setup.md) — Expo environment setup and troubleshooting.
+- [`mobile/custom-dev-setup.md`](mobile/custom-dev-setup.md) — deeper dive into native module
+  development and custom client rebuilds.
+- [`mobile/docs/branding.md`](mobile/docs/branding.md) — how to apply bespoke branding assets in the
+  Expo app.
+- [`mobile/docs/build-and-install.md`](mobile/docs/build-and-install.md) — reproducible build and
+  installation steps for QA and stakeholders.
+- [`mobile/docs/android-release-play-store.md`](mobile/docs/android-release-play-store.md) — end-to
+  end checklist for preparing a Play Store build.
+- [`mobile/docs/internalTesting-and-productionAABinstall.md`](mobile/docs/internalTesting-and-productionAABinstall.md)
+  — AAB sideload/testing guide.
+- [`mobile/docs/mobile-checkout-flow.md`](mobile/docs/mobile-checkkout-flow.md) — annotated mobile
+  checkout sequence with deeplink notes.
+- [`mobile/certs/README.md`](mobile/certs/README.md) — explains the local HTTPS certificates and how
+  to rotate them.
+- [`docs/DAISYUI-THEME.md`](docs/DAISYUI-THEME.md) — shared DaisyUI theming internals for web and
+  mobile.
+- [`docs/THEME.md`](docs/THEME.md) — native token architecture for both platforms.
+
 
 ---
 
