@@ -243,13 +243,11 @@ requires UI work—the network contract and cached data stay in sync automatical
 
   The wishlist flow is intentionally thin so the web and mobile clients can share the exact same DTO
   and optimistic update logic:
-
   - **Endpoint:** `POST /api/users/me/wishlist`
   - **Body DTO:** `{ "productId": string }`
   - **Success response:** `{ success: true, data: { ids: string[], products: WishlistProduct[] } }`
 
   Key implementation files:
-
   - Backend controller and DTO normalisation (`normalizeWishlistIds`, `normalizeWishlistProduct`):
     `backend/src/controllers/user.controller.js`
   - Route registration: `backend/src/routes/user.routes.js`
@@ -260,7 +258,8 @@ requires UI work—the network contract and cached data stay in sync automatical
   All three surfaces share the same shape, so adding wishlist toggles or badges in any client only
   requires UI work—the network contract and cached data stay in sync automatically.
 
-  ---
+  ***
+
 - Trigger deployments from CI or manually via CLI:
 
   ```bash
@@ -862,6 +861,20 @@ refreshes the 30-day window.
   authorization flows, stock reservation, Stripe webhooks, and end-to-end checkout scenarios —
   automated in CI with deterministic mocks for external services.
 
+```bash
+# from repo root
+
+# run all workspaces and forward args
+npm -ws run test -- --coverage --coverageReporters=text-summary
+
+Per-package (useful while debugging)
+# backend only
+npm run -w backend test -- --coverage --coverageReporters=text-summary
+
+# frontend only
+npm run -w frontend test -- --coverage --coverageReporters=text-summary
+```
+
 ---
 
 ## How to run locally (no Docker)
@@ -1311,7 +1324,7 @@ variant chips and quantity controls._
 ![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg) _Order history
 with status tracking._
 
-![Mobile — Profile tools](./docs/screenshots/mbile-app-profile-page-delete-acount&exportData-section-light.jpg)
+![Mobile — Profile tools](./docs/screenshots/mobile-app-profile-page-delete-acount&exportData-section-light.jpg)
 _Profile management, GDPR export, and delete account actions._
 
 ## Commercial license (proprietary) & selling notes
@@ -1333,8 +1346,10 @@ Check LICENSE_PROPRIETARY.txt
 
 Use this section once the Android build is live:
 
-- **Google Play (production)** — _Public Play Store link coming soon_
-- **QR code** — _coming soon_
+- **Google Play (production)** — <https://play.google.com/store/apps/details?id=com.ahmedmonib.eshop>
+- **QR code** —
+
+- ![Mobile — QR Code](./docs/screenshots/play-eshop-qr.png)
 
 ---
 
@@ -1343,12 +1358,9 @@ Use this section once the Android build is live:
 All credentials are scoped to the staging environment (`https://www.ahmedmonib-eshop-demo.com` and
 the Expo mobile client). Update or rotate as needed before sharing broadly.
 
-| Role            | Email / Username         | Password |
-| --------------- | ------------------------ | -------- |
-| Regular shopper | `amonib831@gmail.com`    | `123456` |
-
-> ⚠️ **Security note:** These accounts are for evaluation only. Reset or disable them prior to
-> handing the codebase to a paying client.
+| Role            | Email / Username      | Password |
+| --------------- | --------------------- | -------- |
+| Regular shopper | `amonib831@gmail.com` | `123456` |
 
 ---
 
