@@ -20,6 +20,7 @@
   - [Maintainer context](#maintainer-context)
   - [One-line pitch](#one-line-pitch)
   - [Live demo \& hosted domains](#live-demo--hosted-domains)
+  - [Mobile app download links](#mobile-app-download-links)
   - [Monorepo architecture \& workspaces](#monorepo-architecture--workspaces)
     - [Workspaces](#workspaces)
     - [Common scripts](#common-scripts)
@@ -74,10 +75,9 @@
     - [Emails](#emails)
     - [Mobile](#mobile)
   - [Commercial license (proprietary) \& selling notes](#commercial-license-proprietary--selling-notes)
-  - [Contact / commercial enquiries](#contact--commercial-enquiries)
-  - [Mobile app download placeholder](#mobile-app-download-placeholder)
   - [Demo credentials (web \& mobile)](#demo-credentials-web--mobile)
   - [Additional documentation](#additional-documentation)
+  - [Contact / commercial enquiries](#contact--commercial-enquiries)
 
 ---
 
@@ -104,6 +104,16 @@ reservation/restore logic, Stripe payments, order fulfilment tooling, and produc
 - Frontend (alternate / staging): `https://ecommerce-mern-website-seven.vercel.app`
 - API (production): `https://api.ahmedmonib-eshop-demo.com` (Railway)
 - Railway preview: `https://e-commerce-mern-stack-website-production.up.railway.app`
+
+---
+
+## Mobile app download links
+
+- **Google Play (production)** —
+  <https://play.google.com/store/apps/details?id=com.ahmedmonib.eshop>
+- **QR code** —
+
+- ![Mobile — QR Code](./docs/screenshots/play-eshop-qr.png)
 
 ---
 
@@ -239,26 +249,7 @@ requires UI work—the network contract and cached data stay in sync automatical
 
 - Project **Root Directory** must be `frontend`.
 - `frontend/vercel.json` enforces `npm ci --legacy-peer-deps`, configures rewrites for `/api/*`, and
-  applies SPA fallbacks + cache headers.### Wishlist DTO & API contract
-
-  The wishlist flow is intentionally thin so the web and mobile clients can share the exact same DTO
-  and optimistic update logic:
-  - **Endpoint:** `POST /api/users/me/wishlist`
-  - **Body DTO:** `{ "productId": string }`
-  - **Success response:** `{ success: true, data: { ids: string[], products: WishlistProduct[] } }`
-
-  Key implementation files:
-  - Backend controller and DTO normalisation (`normalizeWishlistIds`, `normalizeWishlistProduct`):
-    `backend/src/controllers/user.controller.js`
-  - Route registration: `backend/src/routes/user.routes.js`
-  - Frontend Zustand store that consumes the DTO and handles optimistic updates:
-    `frontend/src/stores/useUserStore.js`
-  - Mobile Expo store mirroring the same contract: `mobile/src/stores/useUserStore.js`
-
-  All three surfaces share the same shape, so adding wishlist toggles or badges in any client only
-  requires UI work—the network contract and cached data stay in sync automatically.
-
-  ***
+  applies SPA fallbacks + cache headers.
 
 - Trigger deployments from CI or manually via CLI:
 
@@ -284,17 +275,15 @@ requires UI work—the network contract and cached data stay in sync automatical
 
 - Required Railway variables:
 
-  | Key                          | Example                                                    | Notes                                      |
-  | ---------------------------- | ---------------------------------------------------------- | ------------------------------------------ |
-  | Key                          | Example                                                    | Notes                                      |
-  | ---------------------------- | ------------------------------------------------------     | ------------------------------------------ |
-  | `SESSION_SECRET`             | `base64:Vh1YhGq7...`                                       | Generate a 32+ byte random string.         |
-  | `SESSION_REDIS_PREFIX`       | `session:`                                                 | Optional; keep consistent across envs.     |
-  | `PUBLIC_CLIENT_FALLBACK_URL` | `https://www.ahmedmonib-eshop-demo.com/reset-password`     | Must match the frontend fallback.          |
-  | `MOBILE_RESET_REDIRECT_URI`  | `eshop://reset-password`                                   | Deep link opened by reset emails.          |
-  | `MOBILE_MAIL_CONFIRM_URI`    | `eshop://mailing/confirm`                                  | Deep link opened by mailing emails.        |
-  | `MAIL_CONFIRM_WEB_URL`       | `https://shop.example.com/mailing/confirm?token={{token}}` | Overrides the browser confirmation URL.    |
-  | `MOBILE_OAUTH_REDIRECT_URI`  | `eshop://oauth`                                            | Deep link used by OAuth providers.         |
+  | Key                          | Example                                                    | Notes                                          |
+  | ---------------------------- | ---------------------------------------------------------- | --------------------------------------------- |
+  | `SESSION_SECRET`             | `base64:Vh1YhGq7...`                                       | Generate a 32+ byte random string.            |
+  | `SESSION_REDIS_PREFIX`       | `session:`                                                 | Optional; keep consistent across envs.        |
+  | `PUBLIC_CLIENT_FALLBACK_URL` | `https://www.ahmedmonib-eshop-demo.com/reset-password`     | Must match the frontend fallback.             |
+  | `MOBILE_RESET_REDIRECT_URI`  | `eshop://reset-password`                                   | Deep link opened by reset emails.             |
+  | `MOBILE_MAIL_CONFIRM_URI`    | `eshop://mailing/confirm`                                  | Deep link opened by mailing emails.           |
+  | `MAIL_CONFIRM_WEB_URL`       | `https://shop.example.com/mailing/confirm?token={{token}}` | Overrides the browser confirmation URL.       |
+  | `MOBILE_OAUTH_REDIRECT_URI`  | `eshop://oauth`                                            | Deep link used by OAuth providers.            |
 
 - Redeploy whenever you change env vars, email templates, or native deep-link paths.
 
@@ -408,8 +397,10 @@ Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
   Railway.
 - `mobile/` — Expo + React Native custom dev client with deep-link integration for password reset
   and OAuth flows. See [`mobile/custom-dev-setup.md`](mobile/custom-dev-setup.md).
-- `tests/` — Unit/integration/E2E test suites (Jest, supertest, Cypress) and mocks (including
-  in-memory Mongo for CI).
+- `backend/src/tests/` + `backend/test/` — Jest unit/integration/E2E suites (supertest, fixtures,
+  and in-memory Mongo harness for CI).
+- `frontend/src/tests/` + `frontend/cypress/` — React Testing Library coverage and Cypress
+  storefront flows.
 - Root Dockerfile + Railway config for container-based API deployments.
 - CI workflows for builds and Sentry releases (GitHub Actions).
 - Full production-ready features: auth, cart, checkout, admin product & order management, order
@@ -885,12 +876,11 @@ npm run -w frontend test -- --coverage --coverageReporters=text-summary
 
 ```bash
 # from repo root
-cd backend
-npm ci
-
-cd ../frontend
-npm ci
+npm install
 ```
+
+> Workspace-specific scripts (e.g., `npm -w backend run dev`) assume dependencies were installed
+> from the repository root.
 
 2. Create `.env` files:
 
@@ -1340,19 +1330,6 @@ Check LICENSE_PROPRIETARY.txt
 
 ---
 
-## Contact / commercial enquiries
-
-## Mobile app download placeholder
-
-Use this section once the Android build is live:
-
-- **Google Play (production)** — <https://play.google.com/store/apps/details?id=com.ahmedmonib.eshop>
-- **QR code** —
-
-- ![Mobile — QR Code](./docs/screenshots/play-eshop-qr.png)
-
----
-
 ## Demo credentials (web & mobile)
 
 All credentials are scoped to the staging environment (`https://www.ahmedmonib-eshop-demo.com` and
@@ -1392,6 +1369,8 @@ Extra reference material that complements this README:
   guide tailored to this repo.
 
 ---
+
+## Contact / commercial enquiries
 
 For purchase, licensing, deployment assistance, or a demo with admin credentials contact:
 **[ahmedmounib2@gmail.com](mailto:ahmedmounib2@gmail.com)**
