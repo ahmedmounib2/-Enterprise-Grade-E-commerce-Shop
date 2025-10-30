@@ -93,8 +93,9 @@ contributors later on.
 
 ## One-line pitch
 
-Enterprise-grade e-commerce storefront with robust session security, per-variant inventory,
-reservation/restore logic, Stripe payments, order fulfilment tooling, and production observability.
+Enterprise-grade e-commerce web storefront and Expo mobile app sharing a single Node/Express API,
+complete with robust session security, per-variant inventory, reservation/restore logic, Stripe
+payments, order fulfilment tooling, and production observability.
 
 ---
 
