@@ -1315,7 +1315,7 @@ variant chips and quantity controls._
 ![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg) _Order history
 with status tracking._
 
-![Mobile — Profile tools](./docs/screenshots/mobile-app-profile-page-delete-acount&exportData-section-light.jpg)
+![Mobile — Profile tools](./docs\screenshots\mobile-app-profile-page-delete-acount&exportData-section-light.jpg)
 _Profile management, GDPR export, and delete account actions._
 
 ## Commercial license (proprietary) & selling notes
