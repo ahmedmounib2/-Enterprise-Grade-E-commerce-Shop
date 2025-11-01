@@ -376,18 +376,19 @@ All mobile-specific runbooks live alongside the app code:
 
 Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
 
-- ![Mobile — Home light](./docs/screenshots/mobile-app-homepage-light.jpg) _Native home screen with
-  featured sliders._
+- ![Mobile — Home light](./docs/screenshots/mobile-app-homepage-light.jpg)
+  _Native home screen with featured sliders._
+
 - ![Mobile — Deals & best sellers](./docs/screenshots/mobile-app-Deals,bestSellers-sliders-dark.jpg)
   _Dark mode promotional rails._
-- ![Mobile — Category grid](./docs/screenshots/mobile-app-category-page-dark.jpg) _Category browsing
-  with image tiles._
-- ![Mobile — Cart (light)](./docs/screenshots/mobile-app-cart-page-light.jpg) _Cart summary with
-  quantity controls._
-- ![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg) _Past orders
-  with status badges._
-- ![Mobile — Profile & account tools](./docs/screenshots/mobile-app-profile-page-light.jpg) _Profile
-  settings including export/delete controls._
+ ![Mobile — Category grid](./docs/screenshots/mobile-app-category-page-dark.jpg)
+  _Category browsing with image tiles._
+- ![Mobile — Cart (light)](./docs/screenshots/mobile-app-cart-page-light.jpg)
+  _Cart summary with quantity controls._
+- ![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg)
+  _Past orders with status badges._
+- ![Mobile — Profile & account tools](./docs/screenshots/mobile-app-profile-page-light.jpg)
+  _Profile settings including export/delete controls._
 
 ---
 
@@ -1231,11 +1232,11 @@ GET cart_backup:<userId>
 
 ### Orders & Fulfilment
 
-![Orders — Paginated list](./docs/screenshots/admin_panel_orders_pagination.png) _Orders list with
-pagination._
+![Orders — Paginated list](./docs/screenshots/admin_panel_orders_pagination.png)
+_Orders list with pagination._
 
-![Orders — Dark mode list](./docs/screenshots/admin_panel_orders_dark.png) _Orders list (dark
-theme)._
+![Orders — Dark mode list](./docs/screenshots/admin_panel_orders_dark.png)
+_Orders list (dark theme)._
 
 ![Orders — Multi-order status update (light)](./docs/screenshots/admin_panel_orders_multi_order_status_update_light.png)
 _Bulk update order statuses (multi-select)._
@@ -1256,8 +1257,8 @@ _Expanded order with customer view (dark theme)._
 
 ### Create Product & Variants
 
-![Create product — Admin panel](./docs/screenshots/admin_panel_create_product.png) _Admin UI —
-Create product (base fields)._
+![Create product — Admin panel](./docs/screenshots/admin_panel_create_product.png)
+_Admin UI — Create product (base fields)._
 
 ![Create product — Variants editor](./docs/screenshots/admin_panel_create_product_variants.png)
 _Admin UI — Create product with variants (light theme)._
@@ -1269,11 +1270,11 @@ _Admin UI — Create product with variants (dark theme)._
 
 ### Analytics & Campaigns
 
-![Admin — Analytics dashboard (dark)](./docs/screenshots/admin_panel_analytics_dark.png) _Admin
-analytics dashboard — sales, users, revenue._
+![Admin — Analytics dashboard (dark)](./docs/screenshots/admin_panel_analytics_dark.png)
+_Admin analytics dashboard — sales, users, revenue._
 
-![Admin — Campaigns](./docs/screenshots/admin_campaigns.png) _Marketing campaigns / mailing list
-management._
+![Admin — Campaigns](./docs/screenshots/admin_campaigns.png)
+_Marketing campaigns / mailing list management._
 
 ---
 
@@ -1282,8 +1283,8 @@ management._
 ![Email Campaign Subscription Confirmation](./docs/screenshots/email-campaign-subscription-confirmation-email.png)
 _Email campaign subscription confirmation email._
 
-![Emails Sent to Inbox (Not Spam)](./docs/screenshots/emails-sent-to-inbox-not-spam.png) _Emails
-successfully delivered to inbox (not marked as spam)._
+![Emails Sent to Inbox (Not Spam)](./docs/screenshots/emails-sent-to-inbox-not-spam.png)
+_Emails successfully delivered to inbox (not marked as spam)._
 
 ![Order Confirmation Email (COD with Variants)](./docs/screenshots/order-confirmation-email-cashOnDelivery-some-products-with-variants.png)
 _Order confirmation email for cash-on-delivery orders with product variants._
@@ -1294,27 +1295,27 @@ _Order confirmation email for paid orders with product variants._
 ![Order Cancellation Confirmation](./docs/screenshots/order_cancelation_confirmation_email.png)
 _Order cancellation confirmation email._
 
-![Reset Password Link Email](./docs/screenshots/reset_password_link_email.png) _Password reset link
-email._
+![Reset Password Link Email](./docs/screenshots/reset_password_link_email.png)
+_Password reset link email._
 
-![Verify Email](./docs/screenshots/local_sigunp_verify_email.png) _Local signup Email verification
-request email._
+![Verify Email](./docs/screenshots/local_sigunp_verify_email.png)
+_Local signup Email verification request email._
 
 ---
 
 ### Mobile
 
-![Mobile — Home light](./docs/screenshots/mobile-app-homepage-light.jpg) _Native home screen with
-featured sliders._
+![Mobile — Home light](./docs/screenshots/mobile-app-homepage-light.jpg)
+_Native home screen with featured sliders._
 
-![Mobile — Category grid](./docs/screenshots/mobile-app-category-page-dark.jpg) _Category browsing
-with hero banners._
+![Mobile — Category grid](./docs/screenshots/mobile-app-category-page-dark.jpg)
+_Category browsing with hero banners._
 
-![Mobile — Cart (light)](./docs/screenshots/mobile-app-cart-page-light.jpg) _Cart summary with
-variant chips and quantity controls._
+![Mobile — Cart (light)](./docs/screenshots/mobile-app-cart-page-light.jpg)
+_Cart summary with variant chips and quantity controls._
 
-![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg) _Order history
-with status tracking._
+![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg)
+_Order history with status tracking._
 
 ![Mobile — Profile tools](./docs/screenshots/mobile-app-profile-page-delete-acount&exportData-section-light.jpg)
 _Profile management, GDPR export, and delete account actions._
