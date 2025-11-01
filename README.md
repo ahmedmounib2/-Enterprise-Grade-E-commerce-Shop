@@ -276,15 +276,15 @@ requires UI work—the network contract and cached data stay in sync automatical
 
 - Required Railway variables:
 
-  | Key                          | Example                                                    | Notes                                          |
-  | ---------------------------- | ---------------------------------------------------------- | --------------------------------------------- |
-  | `SESSION_SECRET`             | `base64:Vh1YhGq7...`                                       | Generate a 32+ byte random string.            |
-  | `SESSION_REDIS_PREFIX`       | `session:`                                                 | Optional; keep consistent across envs.        |
-  | `PUBLIC_CLIENT_FALLBACK_URL` | `https://www.ahmedmonib-eshop-demo.com/reset-password`     | Must match the frontend fallback.             |
-  | `MOBILE_RESET_REDIRECT_URI`  | `eshop://reset-password`                                   | Deep link opened by reset emails.             |
-  | `MOBILE_MAIL_CONFIRM_URI`    | `eshop://mailing/confirm`                                  | Deep link opened by mailing emails.           |
-  | `MAIL_CONFIRM_WEB_URL`       | `https://shop.example.com/mailing/confirm?token={{token}}` | Overrides the browser confirmation URL.       |
-  | `MOBILE_OAUTH_REDIRECT_URI`  | `eshop://oauth`                                            | Deep link used by OAuth providers.            |
+  | Key                          | Example                                                    | Notes                                   |
+  | ---------------------------- | ---------------------------------------------------------- | --------------------------------------- |
+  | `SESSION_SECRET`             | `base64:Vh1YhGq7...`                                       | Generate a 32+ byte random string.      |
+  | `SESSION_REDIS_PREFIX`       | `session:`                                                 | Optional; keep consistent across envs.  |
+  | `PUBLIC_CLIENT_FALLBACK_URL` | `https://www.ahmedmonib-eshop-demo.com/reset-password`     | Must match the frontend fallback.       |
+  | `MOBILE_RESET_REDIRECT_URI`  | `eshop://reset-password`                                   | Deep link opened by reset emails.       |
+  | `MOBILE_MAIL_CONFIRM_URI`    | `eshop://mailing/confirm`                                  | Deep link opened by mailing emails.     |
+  | `MAIL_CONFIRM_WEB_URL`       | `https://shop.example.com/mailing/confirm?token={{token}}` | Overrides the browser confirmation URL. |
+  | `MOBILE_OAUTH_REDIRECT_URI`  | `eshop://oauth`                                            | Deep link used by OAuth providers.      |
 
 - Redeploy whenever you change env vars, email templates, or native deep-link paths.
 
@@ -1315,7 +1315,7 @@ variant chips and quantity controls._
 ![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg) _Order history
 with status tracking._
 
-![Mobile — Profile tools](./docs\screenshots\mobile-app-prof-delete-acount.light.jpg)
+![Mobile — Profile tools](./docs/screenshots/mobile-app-profile-page-delete-acount&exportData-section-light.jpg)
 _Profile management, GDPR export, and delete account actions._
 
 ## Commercial license (proprietary) & selling notes
