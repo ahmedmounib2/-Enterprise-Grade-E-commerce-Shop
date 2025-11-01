@@ -131,7 +131,8 @@ workspace so tooling, builds, and deployments stay isolated but share a single l
 | `backend`    | `backend/`  | Express API deployed to Railway using the root Dockerfile.                      |
 | `mobile`     | `mobile/`   | Expo + React Native custom development client (Android) with deep-link support. |
 | `shared`     | `shared/`   | Localization bundle consumed by web and mobile clients.                         |
-| `packages/*` | `packages/` | Supporting libraries (e.g., eslint configs) shared across apps.                 |
+| `packages/*` | `packages/` | Shared Axios API client (`@eshop/api-client`) with optional SSL pinning for Expo/React Native. |
+|
 
 ### Common scripts
 
