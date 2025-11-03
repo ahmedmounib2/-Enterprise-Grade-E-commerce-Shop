@@ -1358,8 +1358,6 @@ Extra reference material that complements this README:
   installation steps for QA and stakeholders.
 - [`mobile/docs/android-release-play-store.md`](mobile/docs/android-release-play-store.md) — end-to
   end checklist for preparing a Play Store build.
-- [`mobile/docs/internalTesting-and-productionAABinstall.md`](mobile/docs/internalTesting-and-productionAABinstall.md)
-  — AAB sideload/testing guide.
 - [`mobile/docs/mobile-checkout-flow.md`](mobile/docs/mobile-checkout-flow.md) — annotated mobile
   checkout sequence with deeplink notes.
 - [`mobile/certs/README.md`](mobile/certs/README.md) — explains the local HTTPS certificates and how

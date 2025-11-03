@@ -25,10 +25,12 @@ campaign-specific themes.
 | -------- | ------------------------------------------- | ------------------------------------------------------------- |
 | Shared   | `shared/theme/daisyThemes.js`               | DaisyUI palette definitions consumed by all platforms.        |
 | Web      | `frontend/theme/styleThemes.js`             | Bridges DaisyUI palettes with the native tokens/context.      |
+| Web      | `frontend/src/contexts/ThemeContext.jsx`    | Applies DaisyUI IDs + CSS vars to the DOM at runtime.         |
 | Mobile   | `mobile/src/theme/generated/daisyThemes.js` | Generated mirror for NativeWind/Tailwind RN.                  |
 | Mobile   | `mobile/src/theme/styleThemes.js`           | Mobile bridge that keeps native + DaisyUI logic separated.    |
+| Mobile   | `mobile/src/theme/ThemeContext.js`          | Propagates active palette/fonts across the Expo app.          |
 | Shared   | `frontend/tailwind.config.js`               | Registers DaisyUI and loads the exported themes for Tailwind. |
-| Docs     | `daisyui-theme.md` (this file)              | Reference guide for future theme changes.                     |
+| Docs     | `docs/DAISYUI-THEME.md` (this file)         | Reference guide for future theme changes.                     |
 
 ## How themes are registered
 
@@ -40,7 +42,13 @@ campaign-specific themes.
 4. `mobile/scripts/build-mobile-theme.mjs` reads the shared catalogue and serialises it into
    `mobile/src/theme/generated/daisyThemes.js` so Metro loads a pure JavaScript module instead of
    the original ESM source.
-5. At runtime, setting `data-theme="abyss-light"` (or `-dark`) on the `<html>` element activates the
+5. At runtime, `frontend/src/contexts/ThemeContext.jsx` sets `data-theme="<id>-light|dark"` on the
+   `<html>` element (and mirrors the choice in local storage) so DaisyUI swaps palettes without
+   touching the native token selection. The same context also writes CSS variables for legacy
+   components while keeping `color-scheme` up to date.
+6. On mobile, `mobile/src/theme/ThemeContext.js` exposes the converted palettes through
+   `useThemePreference()` so NativeWind-powered components and bespoke views can read the active
+   DaisyUI colours.
 
 ### Keeping in sync with upstream DaisyUI
 
@@ -60,9 +68,10 @@ always match what upstream ships. If DaisyUI releases a new preset:
 2. Update the relevant palette inside `shared/theme/daisyThemes.js`. Every token is documented
    inline to explain where it appears. Start with the commented "Abyss" entry as a reference for how
    the keys map to UI areas.
-3. Run `npm run gen:mobile-theme` so the Expo project receives the updated, converted palette.
+3. Run `npm run gen:mobile-theme` so the Expo project receives the updated, converted palette in
+   `mobile/src/theme/generated/daisyThemes.js`.
 4. Restart your dev server (`npm -w frontend run dev`) so Tailwind picks up the updated
-   configuration.
+   configuration and `ThemeContext` rehydrates the new palette IDs.
 
 ### Adding a brand-new theme
 
