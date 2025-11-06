@@ -125,13 +125,14 @@ workspace so tooling, builds, and deployments stay isolated but share a single l
 
 ### Workspaces
 
-| Workspace    | Path        | Purpose                                                                         |
-| ------------ | ----------- | ------------------------------------------------------------------------------- |
-| `frontend`   | `frontend/` | React (Vite) SPA deployed to Vercel.                                            |
-| `backend`    | `backend/`  | Express API deployed to Railway using the root Dockerfile.                      |
-| `mobile`     | `mobile/`   | Expo + React Native custom development client (Android) with deep-link support. |
-| `shared`     | `shared/`   | Localization bundle consumed by web and mobile clients.                         |
+| Workspace    | Path        | Purpose                                                                                        |
+| ------------ | ----------- | ---------------------------------------------------------------------------------------------- |
+| `frontend`   | `frontend/` | React (Vite) SPA deployed to Vercel.                                                           |
+| `backend`    | `backend/`  | Express API deployed to Railway using the root Dockerfile.                                     |
+| `mobile`     | `mobile/`   | Expo + React Native custom development client (Android) with deep-link support.                |
+| `shared`     | `shared/`   | Localization bundle consumed by web and mobile clients.                                        |
 | `packages/*` | `packages/` | Shared Axios API client (`@eshop/api-client`) with optional SSL pinning for Expo/React Native. |
+
 |
 
 ### Common scripts
@@ -376,19 +377,19 @@ All mobile-specific runbooks live alongside the app code:
 
 Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
 
-- ![Mobile — Home light](./docs/screenshots/mobile-app-homepage-light.jpg)
-  _Native home screen with featured sliders._
+- ![Mobile — Home light](./docs/screenshots/mobile-app-homepage-light.jpg) _Native home screen with
+  featured sliders._
 
 - ![Mobile — Deals & best sellers](./docs/screenshots/mobile-app-Deals,bestSellers-sliders-dark.jpg)
   _Dark mode promotional rails._
- ![Mobile — Category grid](./docs/screenshots/mobile-app-category-page-dark.jpg)
-  _Category browsing with image tiles._
-- ![Mobile — Cart (light)](./docs/screenshots/mobile-app-cart-page-light.jpg)
-  _Cart summary with quantity controls._
-- ![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg)
-  _Past orders with status badges._
-- ![Mobile — Profile & account tools](./docs/screenshots/mobile-app-profile-page-light.jpg)
-  _Profile settings including export/delete controls._
+  ![Mobile — Category grid](./docs/screenshots/mobile-app-category-page-dark.jpg) _Category browsing
+  with image tiles._
+- ![Mobile — Cart (light)](./docs/screenshots/mobile-app-cart-page-light.jpg) _Cart summary with
+  quantity controls._
+- ![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg) _Past orders
+  with status badges._
+- ![Mobile — Profile & account tools](./docs/screenshots/mobile-app-profile-page-light.jpg) _Profile
+  settings including export/delete controls._
 
 ---
 
@@ -597,7 +598,9 @@ The webhook handler validates Stripe signatures and supports multiple events:
   - `deal` (discount percentage) applied to item price calculation.
 
 - Variants:
-  - Stored as objects with `attributes` (Map-like), `price`, `stock`, and optional `image`.
+  - Stored as objects with `attributes` (Map-like), `price`, `stock`, and optional `images` (up to
+    10 URLs).
+  - `image` remains as the first entry of `images` for compatibility with legacy consumers.
   - Matching helper `findMatchingVariant(product, variantAttributes)` is used widely to:
     - Determine per-item price on checkout and line items.
     - Decrement / increment the exact variant stock on reserve/restore.
@@ -622,9 +625,10 @@ editing. It works the same in local dev and production (Railway).
 #### 1) Frontend (Create / Edit Product forms)
 
 - Users can attach up to **10 gallery images** (`images[]`) and optional **per-variant images**
-  (`colorImages[]`).
+  (`colorImages[]`). Each variant can store **up to 10** images of its own.
 - When variants include a Color attribute, the form pairs each uploaded variant image with a
-  **`colorKeys`** string (one per file), so the backend can map it to the correct variant.
+  **`colorKeys`** string (one per file). Multiple files may use the same color key so that a single
+  variant (e.g. "Red") can receive an image gallery.
 - All data is submitted as `multipart/form-data`:
   - `name.*`, `description.*`, `category.*` (multi-lang fields)
   - `price` (base product price)
@@ -634,7 +638,7 @@ editing. It works the same in local dev and production (Railway).
   - `colorKeys` (0—N strings, aligned to `colorImages`)
 - **Editing** additionally sends:
   - `keepImages` — array of existing gallery URLs that should stay
-  - `keepVariantImages` — array (by variant index) of URLs (or `null`) to keep/clear
+  - `keepVariantImages` — array (by variant index) of URL arrays to retain for each variant
 
 > Frontend uses a generous Axios timeout to accommodate 10-image batches. Gallery/variant files are
 > appended individually; the backend processes them **sequentially** to avoid burst limits.
@@ -686,12 +690,12 @@ In `product.controller.js` we use a single helper:
 - Gallery: every file in `images` → `processAndUpload` → push to `product.images`.
 - Variants:
   - Parse `variants` JSON (attributes/stock/price per row).
-  - If `colorImages` provided, pair **index-aligned** `colorKeys` to build a `colorToUrl` map (e.g.,
-    `{ "Red": <url>, "Blue": <url> }`).
-  - For each variant, if it has a `Color` (or `color`) attribute, set
-    `variant.image = colorToUrl[color]` when present.
-  - **No gallery images?** Seed gallery from the `colorToUrl` values so the product still has
-    images.
+  - Pair `colorImages` with `colorKeys` to build a `color → [urls...]` lookup. Duplicate keys are
+    allowed so a single color can receive multiple images.
+  - For each variant, merge uploaded URLs + existing `variant.images` (if provided) and keep the
+    first 10 unique entries. The first URL is mirrored to `variant.image` for legacy flows.
+  - **No gallery images?** Seed the main gallery from the flattened variant galleries so the product
+    still renders images.
 
 **Edit** (`PUT /api/products/:id`):
 
@@ -702,7 +706,7 @@ In `product.controller.js` we use a single helper:
 
 #### 6) Storage of record
 
-- The **authoritative** product image URLs live in MongoDB (`product.images` and `variant.image`).
+- The **authoritative** product image URLs live in MongoDB (`product.images` and `variant.images`).
 - The **only** persistent storage for image binaries is **Cloudinary**. The `uploads/` folder is
   **ephemeral** (processing temp).
 
@@ -1232,11 +1236,11 @@ GET cart_backup:<userId>
 
 ### Orders & Fulfilment
 
-![Orders — Paginated list](./docs/screenshots/admin_panel_orders_pagination.png)
-_Orders list with pagination._
+![Orders — Paginated list](./docs/screenshots/admin_panel_orders_pagination.png) _Orders list with
+pagination._
 
-![Orders — Dark mode list](./docs/screenshots/admin_panel_orders_dark.png)
-_Orders list (dark theme)._
+![Orders — Dark mode list](./docs/screenshots/admin_panel_orders_dark.png) _Orders list (dark
+theme)._
 
 ![Orders — Multi-order status update (light)](./docs/screenshots/admin_panel_orders_multi_order_status_update_light.png)
 _Bulk update order statuses (multi-select)._
@@ -1257,8 +1261,8 @@ _Expanded order with customer view (dark theme)._
 
 ### Create Product & Variants
 
-![Create product — Admin panel](./docs/screenshots/admin_panel_create_product.png)
-_Admin UI — Create product (base fields)._
+![Create product — Admin panel](./docs/screenshots/admin_panel_create_product.png) _Admin UI —
+Create product (base fields)._
 
 ![Create product — Variants editor](./docs/screenshots/admin_panel_create_product_variants.png)
 _Admin UI — Create product with variants (light theme)._
@@ -1270,11 +1274,11 @@ _Admin UI — Create product with variants (dark theme)._
 
 ### Analytics & Campaigns
 
-![Admin — Analytics dashboard (dark)](./docs/screenshots/admin_panel_analytics_dark.png)
-_Admin analytics dashboard — sales, users, revenue._
+![Admin — Analytics dashboard (dark)](./docs/screenshots/admin_panel_analytics_dark.png) _Admin
+analytics dashboard — sales, users, revenue._
 
-![Admin — Campaigns](./docs/screenshots/admin_campaigns.png)
-_Marketing campaigns / mailing list management._
+![Admin — Campaigns](./docs/screenshots/admin_campaigns.png) _Marketing campaigns / mailing list
+management._
 
 ---
 
@@ -1283,8 +1287,8 @@ _Marketing campaigns / mailing list management._
 ![Email Campaign Subscription Confirmation](./docs/screenshots/email-campaign-subscription-confirmation-email.png)
 _Email campaign subscription confirmation email._
 
-![Emails Sent to Inbox (Not Spam)](./docs/screenshots/emails-sent-to-inbox-not-spam.png)
-_Emails successfully delivered to inbox (not marked as spam)._
+![Emails Sent to Inbox (Not Spam)](./docs/screenshots/emails-sent-to-inbox-not-spam.png) _Emails
+successfully delivered to inbox (not marked as spam)._
 
 ![Order Confirmation Email (COD with Variants)](./docs/screenshots/order-confirmation-email-cashOnDelivery-some-products-with-variants.png)
 _Order confirmation email for cash-on-delivery orders with product variants._
@@ -1295,27 +1299,27 @@ _Order confirmation email for paid orders with product variants._
 ![Order Cancellation Confirmation](./docs/screenshots/order_cancelation_confirmation_email.png)
 _Order cancellation confirmation email._
 
-![Reset Password Link Email](./docs/screenshots/reset_password_link_email.png)
-_Password reset link email._
+![Reset Password Link Email](./docs/screenshots/reset_password_link_email.png) _Password reset link
+email._
 
-![Verify Email](./docs/screenshots/local_sigunp_verify_email.png)
-_Local signup Email verification request email._
+![Verify Email](./docs/screenshots/local_sigunp_verify_email.png) _Local signup Email verification
+request email._
 
 ---
 
 ### Mobile
 
-![Mobile — Home light](./docs/screenshots/mobile-app-homepage-light.jpg)
-_Native home screen with featured sliders._
+![Mobile — Home light](./docs/screenshots/mobile-app-homepage-light.jpg) _Native home screen with
+featured sliders._
 
-![Mobile — Category grid](./docs/screenshots/mobile-app-category-page-dark.jpg)
-_Category browsing with hero banners._
+![Mobile — Category grid](./docs/screenshots/mobile-app-category-page-dark.jpg) _Category browsing
+with hero banners._
 
-![Mobile — Cart (light)](./docs/screenshots/mobile-app-cart-page-light.jpg)
-_Cart summary with variant chips and quantity controls._
+![Mobile — Cart (light)](./docs/screenshots/mobile-app-cart-page-light.jpg) _Cart summary with
+variant chips and quantity controls._
 
-![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg)
-_Order history with status tracking._
+![Mobile — Order history](./docs/screenshots/mobile-app-order-history-page-dark.jpg) _Order history
+with status tracking._
 
 ![Mobile — Profile tools](./docs/screenshots/mobile-app-profile-page-delete-acount&exportData-section-light.jpg)
 _Profile management, GDPR export, and delete account actions._
@@ -1358,6 +1362,8 @@ Extra reference material that complements this README:
   installation steps for QA and stakeholders.
 - [`mobile/docs/android-release-play-store.md`](mobile/docs/android-release-play-store.md) — end-to
   end checklist for preparing a Play Store build.
+- [`mobile/docs/internalTesting-and-productionAABinstall.md`](mobile/docs/internalTesting-and-productionAABinstall.md)
+  — AAB sideload/testing guide.
 - [`mobile/docs/mobile-checkout-flow.md`](mobile/docs/mobile-checkout-flow.md) — annotated mobile
   checkout sequence with deeplink notes.
 - [`mobile/certs/README.md`](mobile/certs/README.md) — explains the local HTTPS certificates and how
