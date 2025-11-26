@@ -46,6 +46,10 @@
     - [Stock reservation \& restoration (variant-aware)](#stock-reservation--restoration-variant-aware)
     - [Failure \& expired session handling](#failure--expired-session-handling)
   - [Products, variants \& model behavior](#products-variants--model-behavior)
+  - [Dynamic categories system (tree + drag-and-drop)](#dynamic-categories-system-tree--drag-and-drop)
+    - [Data model \& flags](#data-model--flags)
+    - [Admin workflow (drag-and-drop + image upload)](#admin-workflow-drag-and-drop--image-upload)
+    - [Customer browsing (categories-first, then products)](#customer-browsing-categories-first-then-products)
     - [Product creation \& image upload pipeline (frontend → backend → Cloudinary)](#product-creation--image-upload-pipeline-frontend--backend--cloudinary)
       - [1) Frontend (Create / Edit Product forms)](#1-frontend-create--edit-product-forms)
       - [2) Upload middleware (backend)](#2-upload-middleware-backend)
@@ -617,6 +621,62 @@ The webhook handler validates Stripe signatures and supports multiple events:
 
 ---
 
+## Dynamic categories system (tree + drag-and-drop)
+
+The store now supports a **feature-flagged, nested category tree** with drag-and-drop management,
+localized labels, Cloudinary-hosted images, and leaf-aware browsing. Enable it in both clients by
+setting `FEATURE_CATEGORY_TREE_V2=true` on the backend and `VITE_FEATURE_CATEGORY_TREE_V2=true` on
+the frontend.
+
+### Data model & flags
+
+- Categories are stored in `Category` documents with localized `name` fields, unique `slug`,
+  optional `parentCategory` for nesting, `imageUrl`, `isActive`, and `position` for
+  ordering.【F:backend/src/models/category.model.js†L5-L25】
+- The backend exposes `GET /categories/tree` only when `FEATURE_CATEGORY_TREE_V2` is enabled; it
+  builds a tree sorted by `position`, calculates per-node product counts, and can optionally hide
+  inactive or empty branches via `includeHidden` / `hideEmpty` query
+  params.【F:backend/src/controllers/category.controller.js†L48-L114】【F:backend/src/controllers/category.controller.js†L132-L155】
+- Product creation/editing requires `categoryId` and `subCategoryId` when the flag is enabled; both
+  IDs and their slugs are stored on each product for quick
+  lookup.【F:backend/src/controllers/product.controller.js†L429-L459】【F:backend/src/controllers/product.controller.js†L820-L843】
+
+### Admin workflow (drag-and-drop + image upload)
+
+- The **Admin → Categories** tab renders only when the flag is on and provides a drag-and-drop tree
+  editor powered by the `useCategoryStore` Zustand slice (fetch, create, update, delete,
+  reorder).【F:frontend/src/pages/AdminPage.jsx†L9-L82】【F:frontend/src/components/CategoryManager.jsx†L1-L205】
+- Drag handles let admins move categories before/after/into siblings; the client builds a flat
+  `{ id, parentCategory, position }[]` payload and posts it to `POST /categories/reorder` with cycle
+  detection on both client and
+  server.【F:frontend/src/components/CategoryManager.jsx†L160-L211】【F:backend/src/controllers/category.controller.js†L304-L355】
+- Create/edit forms accept localized names, slug, parent selection, activation toggle, and either a
+  direct `imageUrl` or uploaded file; uploads are processed via Sharp, stored temporarily under
+  `UPLOADS_BASE_DIR/CATEGORY_IMAGES_DIR`, and pushed to the `CLOUDINARY_CATEGORY_FOLDER` path before
+  cleanup.【F:frontend/src/components/CategoryManager.jsx†L33-L139】【F:backend/src/controllers/category.controller.js†L72-L122】
+- Deletion is blocked when a category still has children to prevent orphaned
+  branches.【F:backend/src/controllers/category.controller.js†L236-L260】
+
+### Customer browsing (categories-first, then products)
+
+- Home and category pages consume the tree from `/categories/tree` (with `hideEmpty=true` by
+  default) and render localized labels via
+  `useCategoryStore`.【F:frontend/src/pages/HomePage.jsx†L5-L83】【F:frontend/src/stores/useCategoryStore.js†L23-L77】
+- Category routes call `GET /categories/browse/:slug`, which returns either child categories or a
+  paginated product list with breadcrumb-style ancestors. Pagination is handled client-side by
+  requesting successive pages while retaining prior
+  results.【F:backend/src/controllers/category.controller.js†L260-L355】【F:frontend/src/pages/CategoryPage.jsx†L1-L174】
+- Navbar dropdowns still fall back to the static locale-based list when the flag is off, so the
+  legacy flat categories remain functional alongside the new
+  system.【F:frontend/src/components/Navbar.jsx†L1-L113】
+- A **feature-flagged "All" menu (V2)** uses the dynamic tree with hide-empty rules; set
+  `VITE_FEATURE_NAV_CATEGORY_MENU_V2=true` in `frontend/.env` to enable the accordion-style dropdown
+  that routes directly to leaf categories and expands non-leaf nodes on row click (flag off keeps
+  the legacy
+  menu).【F:frontend/src/components/Navbar.jsx†L1-L130】【F:frontend/src/components/nav/NavAllMenuV2.jsx†L1-L138】
+
+---
+
 ### Product creation & image upload pipeline (frontend → backend → Cloudinary)
 
 This project implements a **robust, rate-limit-friendly** image flow for both product creation and
@@ -1077,6 +1137,8 @@ PORT
 NODE_ENV
 VITE_TAX_RATE
 VITE_SHIPPING_COST
+VITE_FEATURE_CATEGORY_TREE_V2
+VITE_FEATURE_NAV_CATEGORY_MENU_V2
 UPLOADS_BASE_DIR         # temp processing base dir (e.g., "uploads")
 PRODUCT_IMAGES_DIR       # temp subdir for processed webp (e.g., "products")
 CLOUDINARY_FOLDER        # Cloudinary folder for final assets (e.g., "products")
