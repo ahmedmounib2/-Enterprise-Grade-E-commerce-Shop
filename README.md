@@ -25,6 +25,31 @@
     - [Workspaces](#workspaces)
     - [Common scripts](#common-scripts)
     - [Environment references](#environment-references)
+    - [Multi-store / multi-tenant foundations (Sprint 00)](#multi-store--multi-tenant-foundations-sprint-00)
+    - [Seller onboarding flow (design \& implementation)](#seller-onboarding-flow-design--implementation)
+      - [Entry points \& UX design](#entry-points--ux-design)
+      - [Data model design (Seller + Store)](#data-model-design-seller--store)
+      - [API flow (step-by-step)](#api-flow-step-by-step)
+      - [State machine (clear, enforced transitions)](#state-machine-clear-enforced-transitions)
+      - [Security \& ownership controls](#security--ownership-controls)
+      - [Post-approval seller experience](#post-approval-seller-experience)
+      - [Operational notes](#operational-notes)
+    - [Seller store settings, storefront policies, and admin review flow](#seller-store-settings-storefront-policies-and-admin-review-flow)
+      - [Seller settings: editable fields \& review gates](#seller-settings-editable-fields--review-gates)
+      - [What happens when a seller updates policies or branding](#what-happens-when-a-seller-updates-policies-or-branding)
+      - [Admin review workflow (store profile + policy updates)](#admin-review-workflow-store-profile--policy-updates)
+      - [Storefront policy rendering (public store page + checkout)](#storefront-policy-rendering-public-store-page--checkout)
+      - [Pause store (Hide All) behavior](#pause-store-hide-all-behavior)
+    - [Seller product creation \& admin moderation (end-to-end)](#seller-product-creation--admin-moderation-end-to-end)
+      - [Flow overview (from seller draft to storefront)](#flow-overview-from-seller-draft-to-storefront)
+      - [Data model \& status fields (seller-aware products)](#data-model--status-fields-seller-aware-products)
+      - [Seller experience (create, save draft, submit)](#seller-experience-create-save-draft-submit)
+      - [Backend pipeline (validation, images, ownership)](#backend-pipeline-validation-images-ownership)
+      - [Admin moderation workflow (review, approve, reject)](#admin-moderation-workflow-review-approve-reject)
+      - [State transitions \& audit trail](#state-transitions--audit-trail)
+      - [Visibility rules \& storefront behavior](#visibility-rules--storefront-behavior)
+      - [Operational safeguards \& failure handling](#operational-safeguards--failure-handling)
+    - [Mobile Category Tree v2 (dynamic categories)](#mobile-category-tree-v2-dynamic-categories)
     - [DaisyUI theming (web + mobile)](#daisyui-theming-web--mobile)
     - [Wishlist DTO \& API contract](#wishlist-dto--api-contract)
   - [Deployment surfaces \& release workflow](#deployment-surfaces--release-workflow)
@@ -71,7 +96,15 @@
   - [Environment variables used](#environment-variables-used)
     - [Example `.env` for local development (copy \& fill)](#example-env-for-local-development-copy--fill)
     - [Deployment platform variables (Railway / Vercel)](#deployment-platform-variables-railway--vercel)
-  - [Redis debugging quick commands](#redis-debugging-quick-commands)
+  - [Redis (Optional)](#redis-optional)
+    - [Architecture overview](#architecture-overview)
+    - [Environment variables](#environment-variables)
+    - [Redis configuration examples](#redis-configuration-examples)
+    - [Redis debugging quick commands (WSL/Ubuntu)](#redis-debugging-quick-commands-wslubuntu)
+      - [Install Redis locally (dev sessions)](#install-redis-locally-dev-sessions)
+      - [Start Redis](#start-redis)
+      - [Verify it’s running](#verify-its-running)
+      - [Useful inspection commands](#useful-inspection-commands)
   - [Screenshots](#screenshots)
     - [Orders \& Fulfilment](#orders--fulfilment)
     - [Create Product \& Variants](#create-product--variants)
@@ -178,6 +211,384 @@ decide to collaborate with others or formalise operations:
   documenting account provisioning and least-privilege roles once more contributors join.
 - [`docs/INCIDENT_RESPONSE.md`](docs/INCIDENT_RESPONSE.md) — optional production incident playbook
   if you later need structured response expectations.
+
+Mobile-only feature flags live in `mobile/.env.*`. To exercise the Category Tree v2 UI, set
+`EXPO_PUBLIC_FEATURE_MOBILE_CATEGORY_TREE_V2=true` in your dev/tunnel profile; leave it `false`
+until you are ready to launch in production, then flip it to `true` in `.env.production` as well
+(`.env` files on Vercel/Railway do not need this flag).
+
+### Multi-store / multi-tenant foundations (Sprint 00)
+
+- Added dedicated **Seller** and **Store** models with ownership metadata and scoped indexes on
+  `sellerId` and `slug` to support isolation.
+- Products and orders carry seller/store references plus approval, visibility, and payout status
+  fields; required indexes are synced during migrations for sellers, stores, products, and orders.
+- Run the idempotent migration to seed the platform admin seller/store and backfill existing data:
+  `npm -w backend exec node src/migrations/0001_multi_tenant_foundation.js` (requires the usual DB
+  env vars such as `MONGO_URI`).
+- Public store lookup is available at `GET /api/stores/{slug}` and only surfaces the `StorePublic`
+  fields when the multi-seller flag is enabled.
+- Enable the sprint by setting `FEATURE_MULTI_SELLER=true` in the backend environment (and the
+  corresponding frontend flag if you want UI exposure) before starting the app.
+  - Seller onboarding (application + KYC docs + admin review) lives behind `FEATURE_SELLER_KYC`. Add
+    the flag in each environment so the UI and APIs stay in sync:
+  - Backend: set `FEATURE_SELLER_KYC=true` in `backend/.env` (and in Railway env vars for deployed
+    services).
+- Frontend: set `VITE_FEATURE_SELLER_KYC=true` in `frontend/.env` (and mirror the variable in Vercel
+  project settings for preview/production as needed).
+
+### Seller onboarding flow (design & implementation)
+
+The seller onboarding flow is designed as a **KYC-first onboarding pipeline** with explicit
+ownership scoping, document capture, and staged activation. It ensures that any seller-visible
+feature requires an approved, verified seller record plus a matching store profile. The flow spans
+frontend entry points, backend application APIs, KYC administration, and post-approval store
+provisioning. The implementation focuses on three priorities: **secure ownership**, **clear state
+transitions**, and **audit-friendly data snapshots**.
+
+#### Entry points & UX design
+
+- **Pre-application gate:** `/seller/pre-apply` explains requirements and prevents accidental
+  submissions before the seller is ready with documents. This provides a soft landing zone before
+  sharing sensitive data.
+- **Application form:** `/seller/apply` collects business identity, store name, contact info, and
+  banking/settlement details. It builds a unified `application` payload that is stored on the Seller
+  model rather than scattering fields across multiple models.
+- **Access gating:** Seller routes are blocked for non-sellers or non-verified sellers. The UI
+  checks the authenticated user’s seller status and KYC status before allowing access to the seller
+  dashboard, giving a consistent “access denied” path for admins or standard users.
+
+#### Data model design (Seller + Store)
+
+- **Seller** is the primary identity for onboarding. Key fields include:
+  - `ownerUserId` (ownership linkage to the user)
+  - `businessName` / `slug`
+  - `status` (`active` / `inactive`)
+  - `kyc.status` (`draft`, `pending`, `verified`, `rejected`, `action_required`)
+  - `application` (normalized KYC + business data payload)
+  - `application.banking` (encrypted with `SELLER_DATA_SECRET` to minimize exposure at rest)
+- **Store** represents the customer-facing storefront and is **created only after approval**. Store
+  data is generated from the seller’s approved profile and defaults to a safe baseline (branding,
+  policies, visibility) until the seller completes store customization.
+- **Admin store (platform-owned storefront):** During server setup, an idempotent migration creates
+  a **platform seller + store** that powers the main website experience (e.g., “Sold by
+  E-commerce/Main Store”). This store acts as the default merchant for legacy products, platform-run
+  inventory, and “first-party” listings while keeping the seller/onboarding system cleanly
+  separated. It shares the same Seller/Store schema but is owned by the platform admin and is
+  provisioned before any third-party seller onboarding begins.
+
+#### API flow (step-by-step)
+
+1. **Create/Update application** — `POST /api/sellers/apply`
+   - Authenticated users submit their seller application.
+   - The backend either creates a new Seller or updates the existing Seller tied to `ownerUserId`.
+   - The application can be saved as **draft** or **pending** (submit for review), which lets
+     sellers progressively complete details without triggering review too early.
+   - Banking payloads are encrypted and stored in `application.banking`.
+2. **Upload documents** — `POST /api/sellers/:id/docs`
+   - Sellers upload KYC documents (IDs, registrations, etc.).
+   - Each document is stored in `SellerDocument`, linked by `sellerId`. This keeps document metadata
+     isolated from the seller profile and supports audit trails.
+3. **Review status** — `GET /api/sellers/me`
+   - Sellers retrieve their onboarding status (application, KYC status, documents, and store
+     provisioning state) in a single response.
+4. **Admin decision** — `PATCH /api/sellers/admin/:id/verify`
+   - Admins mark KYC as `verified`, `rejected`, or `action_required`.
+   - Rejections store both `kyc.rejectionReason` and a frozen `kyc.rejectedApplication` snapshot for
+     auditability.
+   - For `action_required`, sellers can re-submit without losing their previous submission context.
+5. **Store provisioning** (auto after approval)
+   - On approval, the backend ensures a Store exists for the seller, using defaults derived from the
+     seller profile (store name, slug, branding defaults, and basic policies).
+   - Sellers can then configure their store via the seller dashboard settings page.
+
+#### State machine (clear, enforced transitions)
+
+| Seller `status` | KYC `status`      | Meaning / Access                                                         |
+| --------------- | ----------------- | ------------------------------------------------------------------------ |
+| `inactive`      | `draft`           | Application saved but not submitted. Seller dashboard access is blocked. |
+| `inactive`      | `pending`         | Submitted for review; admin action required.                             |
+| `inactive`      | `action_required` | Seller must re-submit updates; previous data is preserved.               |
+| `inactive`      | `rejected`        | Rejected with reason; seller must restart or re-apply.                   |
+| `active`        | `verified`        | Approved; full seller access unlocked and store provisioning enabled.    |
+
+#### Security & ownership controls
+
+- **Ownership enforcement:** All seller endpoints use `protectRoute` + role restriction plus
+  `requireSeller`, ensuring only the seller who owns a seller profile can access seller APIs.
+- **Data isolation:** Seller-scoped queries use `sellerId` consistently (orders, products, store
+  settings) to prevent cross-tenant leakage.
+- **Encrypted banking data:** Sensitive settlement details are stored with encryption using
+  `SELLER_DATA_SECRET`, limiting exposure if raw DB access occurs.
+- **Email notifications:** Seller KYC status changes trigger transactional email updates (approved,
+  rejected, or action required) so sellers receive a clear next step.
+
+#### Post-approval seller experience
+
+- Once `status=active` and `kyc.status=verified`, sellers can access:
+  - **Seller dashboard** for orders, store settings, and policy updates.
+  - **Store customization** (branding, policies, contact info, categories).
+  - **Order management** scoped to their products only.
+- If the store is paused or status changes, storefront visibility is updated without affecting the
+  seller’s underlying KYC verification.
+
+#### Operational notes
+
+- The onboarding flow is intentionally **idempotent**: repeated submissions update the same seller
+  record instead of creating duplicates.
+- Drafts allow multi-step completion, while pending submissions lock the application for review.
+- Rejections preserve a snapshot of the submitted application to support support reviews or audits.
+
+### Seller store settings, storefront policies, and admin review flow
+
+This section documents how **seller settings and store policies** are edited, when changes require
+admin review, and how the public storefront stays consistent while reviews are pending. The flow is
+split into seller UI behavior, backend review gating, and storefront policy rendering.
+
+#### Seller settings: editable fields & review gates
+
+Seller settings live in the seller dashboard’s **Store profile** page and are backed by the store
+profile API. The editable fields are grouped into **reviewed** vs **instant** updates:
+
+**Fields that require admin review (store review pipeline):**
+
+- **Store name** (only before KYC approval; after verification it is locked for sellers).
+- **Store description** (long-form description shown on the store page).
+- **Logo + banner images** (branding assets).
+- **SEO tagline + short description** (SEO metadata for the store page).
+- **Shipping policy + return/refund policy** (seller policies shown to buyers).
+
+When any of the above change, the backend marks the store profile as `reviewStatus=pending` and
+captures a **review snapshot** of the last approved profile so the storefront can keep showing
+approved content. Sellers see these fields **locked** while review is pending.
+
+**Fields that can be updated without review:**
+
+- **Support email + support phone** (customer contact info).
+- **Profile categories** (up to 5 category tags + optional category descriptions).
+- **Branding object overrides** (theme/branding metadata stored under `branding`).
+
+These updates save immediately and do **not** require admin approval, unless a store review is
+already pending, in which case the same fields are temporarily locked to avoid conflicting edits.
+
+#### What happens when a seller updates policies or branding
+
+When a seller hits **Save** on the store settings page:
+
+1. The backend validates required fields (store name, logo, description, shipping policy, return
+   policy).
+2. If a **reviewed** field changed, the backend:
+   - Stores a **review snapshot** of the last approved profile.
+   - Marks the store as `reviewStatus=pending`.
+   - Locks store branding + policy fields until a decision is made.
+3. The store profile record **still stores the new edits** immediately, but the public storefront
+   continues to serve the **previous snapshot** until approval.
+4. Sellers see a review banner in the settings UI when changes are **rejected** or **action
+   required**, including the admin’s notes.
+
+Policy edits are **forward-looking only**: the seller UI explicitly warns that **new orders** use
+the latest approved policies, while prior orders keep their original policy snapshot at the time of
+purchase.
+
+#### Admin review workflow (store profile + policy updates)
+
+Store profile reviews appear in the admin **Seller Requests → Policy update reviews** tab:
+
+1. Admins can list store review requests by `reviewStatus` using the admin store review API.
+2. The review screen displays:
+   - **Live approved** store description + policies.
+   - **Submitted changes** with highlighted diffs.
+   - Branding previews (logo + banner).
+3. Admin decisions:
+   - **Approve** → `reviewStatus=approved`, clear `reviewSnapshot`, the new profile goes live.
+   - **Reject** → `reviewStatus=rejected`, keep `reviewNotes`, storefront stays on last approved
+     snapshot.
+   - **Action required** → `reviewStatus=action_required` with required notes.
+4. Email notifications are sent automatically to the seller on approve/reject/action required.
+
+This workflow ensures **brand/policy edits are moderated** while the storefront remains stable for
+buyers.
+
+#### Storefront policy rendering (public store page + checkout)
+
+**Public store pages** always read policy and branding data from the **last approved snapshot** if a
+store review is pending. This means that while a seller is editing or awaiting approval, customers
+see the **previously approved** shipping/return policies and branding details on:
+
+- Storefront tabs (Shipping policy + Return & refund policy).
+- Store profile branding (logo, banner, description).
+
+**Checkout policy snapshots** are captured at order creation time from the **approved store
+profile** so that order history can always display the exact policy the buyer agreed to.
+Specifically:
+
+- During checkout, the backend resolves the **approved** policy source (current store profile if
+  `reviewStatus=approved`, otherwise the `reviewSnapshot`) and derives the **shipping** and
+  **return/refund** policy text.
+- These values are persisted on the **Order** as immutable fields (e.g.,
+  `orderShippingPolicy`/`orderReturnPolicy` or `order_shipping_policy`/`order_return_policy`
+  depending on API shape).
+- Because the order record stores the policy text at purchase time, **future policy edits do not
+  retroactively alter** the buyer’s stored terms. Order detail views always read from the order
+  snapshot rather than the seller’s live settings.
+
+#### Pause store (Hide All) behavior
+
+The seller settings page includes a **Pause store** (Hide All) action that lets sellers temporarily
+hide all of their products **without changing policies**. When enabled:
+
+- The store status becomes `hidden`.
+- All seller products are set to **hidden** with a `pausedByStore` flag.
+- Customers no longer see the store’s listings in search/browse.
+
+When the seller resumes the store, products paused by the store are reactivated. This is designed as
+a **temporary safety switch** for sellers who want to pause orders while policies are being reviewed
+or updated.reviewed or updated.
+
+### Seller product creation & admin moderation (end-to-end)
+
+This section documents how **seller-owned products** move from draft creation to admin moderation
+and finally into storefront visibility. The flow is designed to keep strict ownership boundaries
+between sellers, enforce content quality through moderation, and guarantee the storefront never
+shows unreviewed inventory. Think of it as a staged pipeline with explicit status fields,
+human-in-the-loop review, and an auditable trail.
+
+#### Flow overview (from seller draft to storefront)
+
+1. **Seller creates product draft** in the seller dashboard.
+2. **Images + variants are uploaded and validated** through the same pipeline used by admin products
+   (Sharp + Cloudinary), but the product is flagged as seller-owned.
+3. **Seller submits for review** (state moves from `draft` → `pending`).
+4. **Admin reviews the submission** inside the moderation queue.
+5. **Admin approves or rejects**:
+   - **Approved** → product becomes `approved` and can be visible in storefront listings.
+   - **Rejected** → seller receives reason and can edit & resubmit.
+6. **Seller updates product** (if needed) and repeats the submit process.
+
+This keeps the storefront clean (no unreviewed listings) while still letting sellers iterate quickly
+in draft mode.
+
+#### Data model & status fields (seller-aware products)
+
+Seller products extend the base Product model with seller-scoped metadata and moderation status
+fields. The primary fields that drive this flow include:
+
+- `sellerId` + `storeId`: ownership scope, used to filter product access and listing results.
+- `createdBy`: the authenticated user who created the product (for audit traces).
+- `visibility`: determines if the product can be surfaced (`public`, `hidden`, `archived`).
+- `approvalStatus`: moderation state (`draft`, `pending`, `approved`, `rejected`).
+- `moderation`: optional admin notes (decision reason, reviewer ID, timestamps).
+
+These fields allow the backend to enforce seller isolation and keep admin decisions transparent and
+traceable.
+
+#### Seller experience (create, save draft, submit)
+
+**Seller dashboard (create product):**
+
+- The seller fills in base fields (title, description, category, pricing).
+- Variants and images are created just like the platform admin UI, but scoped to their store.
+- The UI treats the product as a **draft** until the seller explicitly clicks **Submit for review**.
+
+**Save flows:**
+
+- **Save Draft** → persists the product with `approvalStatus=draft`.
+- **Submit for review** → sends a status update to `pending` and locks fields that require review
+  (admin-side approval required before public visibility).
+
+If a seller edits an already-approved product, the system can re-open moderation (e.g., move back to
+`pending`) depending on the fields changed. This preserves quality without blocking minor metadata
+changes unnecessarily.
+
+#### Backend pipeline (validation, images, ownership)
+
+The backend applies the same robust product creation pipeline used by admins, plus seller-specific
+guards:
+
+1. **Authentication + seller validation**
+   - Requires an authenticated user with `seller` role.
+   - Verifies the seller is `active` with `kyc.status=verified`.
+2. **Ownership scoping**
+   - `sellerId` and `storeId` are always bound server-side; the client cannot spoof them.
+   - This prevents sellers from attaching products to another store.
+3. **Payload validation**
+   - Enforces required fields (name, price, category, inventory).
+   - Validates variants and SKU uniqueness within the seller scope.
+4. **Image pipeline**
+   - Uses Sharp to normalize images and Cloudinary to store final assets.
+   - Temporary files are cleaned up after upload.
+5. **Default moderation fields**
+   - New seller products default to `approvalStatus=draft` (or `pending` if submitted).
+   - `visibility` defaults to `hidden` until approval.
+
+#### Admin moderation workflow (review, approve, reject)
+
+Admins have a moderation queue scoped to seller submissions:
+
+1. **Review list** shows all `approvalStatus=pending` products.
+2. **Detail view** includes:
+   - Seller identity (business name, store name).
+   - Product metadata, variants, images, category mapping.
+   - Historical submissions / prior rejection notes.
+3. **Decision**
+   - **Approve** → sets `approvalStatus=approved`, `visibility=public` (or scheduled visibility).
+   - **Reject** → sets `approvalStatus=rejected`, `visibility=hidden`, and writes a rejection
+     reason.
+4. **Notification**
+   - Seller receives a status update in dashboard (and optionally email).
+
+This workflow ensures every seller product has a clear admin decision before being shown in public
+lists or categories.
+
+#### State transitions & audit trail
+
+The flow is intentionally explicit to avoid ambiguous states:
+
+| Current status | Action                      | Next status | Notes                                               |
+| -------------- | --------------------------- | ----------- | --------------------------------------------------- |
+| `draft`        | Seller submits for review   | `pending`   | Locks fields requiring admin review.                |
+| `pending`      | Admin approves              | `approved`  | Product becomes eligible for storefront visibility. |
+| `pending`      | Admin rejects               | `rejected`  | Seller must edit and resubmit.                      |
+| `rejected`     | Seller edits and re-submits | `pending`   | New review cycle; rejection reason preserved.       |
+| `approved`     | Seller edits core fields    | `pending`   | Optional re-review depending on change sensitivity. |
+| `approved`     | Admin unpublishes/archives  | `hidden`    | Keeps record, removes from storefront.nsitivity.    |
+| `approved`     | Admin unpublishes/archives  | `hidden`    | Keeps record, removes from storefront.              |
+
+All transitions are logged with timestamps and reviewer IDs to provide a clear audit trail for
+compliance or dispute resolution.
+
+#### Visibility rules & storefront behavior
+
+Storefront queries enforce the visibility rules:
+
+- Only `approvalStatus=approved` products are allowed in public listings.
+- `visibility=public` is required for storefront exposure.
+- Admin can soft-hide products without deleting them.
+- Seller drafts and rejected items remain accessible only inside seller dashboards.
+
+This separation guarantees that the public catalog only contains approved listings.
+
+#### Operational safeguards & failure handling
+
+- **Idempotency:** repeated submissions update the same product record; duplicates are not created.
+- **Validation errors:** the API returns structured validation responses (field-level errors), and
+  images are rolled back if the product fails validation.
+- **Image failures:** failed Cloudinary uploads trigger cleanup of temporary files and return a
+  retryable error to the seller UI.
+- **Moderation consistency:** any attempted public visibility change without approval is rejected
+  server-side.
+- **Soft delete:** archived products are retained for reporting and audit purposes.
+
+### Mobile Category Tree v2 (dynamic categories)
+
+- The mobile home screen now mirrors the dynamic category tree (same source of truth as web) when
+  `EXPO_PUBLIC_FEATURE_MOBILE_CATEGORY_TREE_V2=true`.
+- The flag is baked into native builds via `app.config.js` extras. After changing the flag or
+  updating `app.config.js`, rebuild the **internal release APK** so the embedded config is
+  refreshed.
+- The Expo debug/dev client will pick up JS-only changes over Metro, but you only need to rebuild it
+  if you want a new native binary with the updated `app.config.js` extras (e.g., for offline testing
+  without Metro).
 
 ### DaisyUI theming (web + mobile)
 
@@ -684,8 +1095,11 @@ editing. It works the same in local dev and production (Railway).
 
 #### 1) Frontend (Create / Edit Product forms)
 
-- Users can attach up to **10 gallery images** (`images[]`) and optional **per-variant images**
-  (`colorImages[]`). Each variant can store **up to 10** images of its own.
+- Users can attach gallery images (`images[]`) and optional **per-variant images**
+  (`colorImages[]`). Each variant can store **up to 10** images of its own, with total uploads
+  bounded by the configured **`MAX_UPLOAD_FILES`** limit (default: `120`). For workflows that need
+  roughly **50 images across gallery + variants**, set `MAX_UPLOAD_FILES=120` to leave retry
+  headroom.
 - When variants include a Color attribute, the form pairs each uploaded variant image with a
   **`colorKeys`** string (one per file). Multiple files may use the same color key so that a single
   variant (e.g. "Red") can receive an image gallery.
@@ -711,7 +1125,9 @@ editing. It works the same in local dev and production (Railway).
   - Destination: `UPLOADS_BASE_DIR` (env) — defaults to `uploads` at project root
   - Safe filename format: `${Date.now()}-<uuid>.<ext>`
   - **Type guard**: only `jpeg/jpg/png/webp` allowed
-  - **Limits**: `files: 20`, `fileSize: MAX_UPLOAD_MB` (env, default `25MB`)
+  - **Limits**: `files: MAX_UPLOAD_FILES` (env, default `120`), `fileSize: MAX_UPLOAD_MB` (env,
+    default `25MB`). Admins uploading ~50 images per product should set `MAX_UPLOAD_FILES` to around
+    `120` to leave space for retries/bursty uploads.
 - After the request passes the middleware, `req.files` contains all uploaded files ready for
   processing.
 
@@ -949,27 +1365,27 @@ npm install
 > Workspace-specific scripts (e.g., `npm -w backend run dev`) assume dependencies were installed
 > from the repository root.
 
-2. Create `.env` files:
+1. Create `.env` files:
 
 - `backend/.env` — list of env variables (see the list below), **do not** commit secrets to repo.
 - `frontend/.env` — `VITE_API_BASE_URL` pointing at your backend (e.g.,
   `http://localhost:5000/api`).
 
-3. Start backend:
+1. Start backend:
 
 ```bash
 cd backend
 npm run dev
 ```
 
-4. Start frontend:
+1. Start frontend:
 
 ```bash
 cd frontend
 npm run dev
 ```
 
-5. Visit the frontend URL printed by Vite (commonly `http://localhost:5173`).
+1. Visit the frontend URL printed by Vite (commonly `http://localhost:5173`).
 
 ---
 
@@ -980,7 +1396,7 @@ under `backend/cert/` in this repo). If you enable HTTPS you will typically open
 first and accept the certificate in your browser; afterwards open the frontend at
 `https://localhost:5173`.
 
-**Quick note:** you can instead open **`https://localhost:5000`** (your backend) in the browser and
+**Quick note:** you can instead open **`https://localhost:5001`** (your backend) in the browser and
 accept the certificate there **before** opening **`https://localhost:5173`** — accepting the cert
 for the backend often prevents browser warnings when you then visit the frontend dev server.
 
@@ -998,7 +1414,7 @@ mkcert -key-file backend/cert/localhost2-key.pem \
 chmod 600 backend/cert/localhost2-key.pem
 ```
 
-2. **OpenSSL (manual alternative)** — create a SAN cert without mkcert
+1. **OpenSSL (manual alternative)** — create a SAN cert without mkcert
 
 ```bash
 cat > san.cnf <<'EOF'
@@ -1027,7 +1443,7 @@ openssl req -x509 -nodes -newkey rsa:2048 \
 chmod 600 backend/cert/localhost2-key.pem
 ```
 
-3. **Trust the cert (make browser accept it)**
+1. **Trust the cert (make browser accept it)**
 
 Use the OS-specific commands below to add the generated certificate to the system/browser trust
 store so browsers accept `https://localhost:5000` and `https://localhost:5173` without warnings.
@@ -1143,6 +1559,7 @@ UPLOADS_BASE_DIR         # temp processing base dir (e.g., "uploads")
 PRODUCT_IMAGES_DIR       # temp subdir for processed webp (e.g., "products")
 CLOUDINARY_FOLDER        # Cloudinary folder for final assets (e.g., "products")
 MAX_UPLOAD_MB            # Multer per-file size limit in MB (default 25)
+MAX_UPLOAD_FILES         # Multer max file count (default 120; raise for large galleries)
 COOKIE_DOMAIN
 USE_HTML_REDIRECT
 
@@ -1175,13 +1592,21 @@ FORCE_SECURE_COOKIES=false
 MONGO_URI=mongodb://localhost:27017/your-db-name
 
 # Redis (Optional)
-UPSTASH_REDIS_URL=
+REDIS_DRIVER=rest
+UPSTASH_REDIS_REST_URL=
+UPSTASH_REDIS_REST_TOKEN=
+# Or use TCP locally instead of REST:
+# REDIS_URL=redis://localhost:6379
+
+# Sessions (optional — falls back to MemoryStore)
+SESSION_REDIS_URL=redis://127.0.0.1:6379
+SESSION_REDIS_PREFIX=session:dev:
 
 # JWT / Auth
 ACCESS_TOKEN_SECRET=changeme_access_secret
 REFRESH_TOKEN_SECRET=changeme_refresh_secret
 SESSION_SECRET=changeme_session_secret
-SESSION_REDIS_PREFIX=session:
+
 ACCESS_TOKEN_EXPIRE=15m
 REFRESH_TOKEN_EXPIRE=7d
 MAX_SESSION_LIFETIME_DAYS=30
@@ -1225,6 +1650,7 @@ PRODUCT_IMAGES_DIR=products
 CLOUDINARY_FOLDER=products
 TAX_RATE=0.14
 SHIPPING_COST=70
+MAX_UPLOAD_FILES=120 # allows ~50 gallery + variant images with retry headroom
 # optionally raise this if you use very large originals
 MAX_UPLOAD_MB=25
 
@@ -1267,13 +1693,133 @@ The README already lists the primary deployment variables in groups. To be expli
 - **Vercel / frontend**: populate the `VITE_*` variables (API base, stripe publishable key, Sentry
   keys, client base URL and any feature flags).
 
-## Redis debugging quick commands
+## Redis (Optional)
 
-Use `redis-cli` or your managed Redis console:
+Redis backs refresh tokens, stock reservations, cart backups, and other cache-like features. The
+Redis helpers live in `backend/src/lib/cache/*` and expose a **driver abstraction** while banning
+raw Redis usage in controllers/services.
+
+### Architecture overview
+
+**1) Cache + app state (driver-based)**
+
+- `backend/src/lib/cache/index.js` chooses a driver:
+  - `REDIS_DRIVER=rest|tcp|auto` (default: `auto`)
+  - `rest` uses Upstash REST (`UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`)
+  - `tcp` uses ioredis TLS (`REDIS_URL` or `UPSTASH_REDIS_URL`)
+- Controllers/services should only use:
+  - `cacheGetJSON`, `cacheSetJSON`, `cacheSetNXJSON`, `cacheDel`, `cacheKeys`
+  - and/or higher-level helpers (e.g. `authCache.js`, stock reservation helpers)
+- Benefit: controllers don’t depend on vendor/library details (Upstash REST vs ioredis TCP). TTL,
+  key naming, JSON serialization, retries, and logging live in one place. Easier tests + migrations.
+
+**2) Express sessions (explicit, separate, TCP-only)**
+
+- Sessions use a dedicated client: `backend/src/lib/sessionRedisClient.js`
+- Sessions are **explicit** and **never auto-use** cache Redis settings:
+  - Sessions use **ONLY** `SESSION_REDIS_URL`
+  - No implicit `localhost` default
+  - No fallback to `REDIS_URL` / `UPSTASH_REDIS_URL`
+- Behavior:
+  - If `SESSION_REDIS_URL` is missing → MemoryStore (OK in dev)
+  - If `SESSION_REDIS_URL` is set but unreachable/wrong → fail fast in logs and still fall back to
+    MemoryStore (keeps dev usable; production should treat this as misconfig)
+
+> Important nuance: REST is great for cache-style operations. For strict atomicity (Lua / multi /
+> strong concurrency guarantees), TCP is preferred in production. That’s the intended split:
+> **Railway/Prod = TCP**, dev can use REST for cache-read-heavy paths if TCP is blocked.
+
+### Environment variables
+
+**Cache / driver-based Redis**
+
+- `REDIS_DRIVER=rest|tcp|auto`
+- REST:
+  - `UPSTASH_REDIS_REST_URL`
+  - `UPSTASH_REDIS_REST_TOKEN`
+- TCP:
+  - `REDIS_URL` (or `UPSTASH_REDIS_URL`) as `rediss://default:<password>@<host>:6379`
+
+**Sessions (TCP-only)**
+
+- `SESSION_REDIS_URL=redis://127.0.0.1:6379` (local) OR `rediss://...` (managed)
+- `SESSION_REDIS_PREFIX` (recommended)
+  - `session:dev:` for dev
+  - `session:prod:` for prod
+
+### Redis configuration examples
+
+**Local development (cache via Upstash REST, sessions via local Redis):**
+
+```env
+# Cache/auth/stock/etc
+REDIS_DRIVER=rest
+UPSTASH_REDIS_REST_URL=https://your-upstash-endpoint.upstash.io
+UPSTASH_REDIS_REST_TOKEN=your-upstash-rest-token
+
+# Sessions (local)
+SESSION_REDIS_URL=redis://127.0.0.1:6379
+SESSION_REDIS_PREFIX=session:dev:
+```
+
+**Production (Railway, Upstash TCP with TLS):**
+
+```env
+NODE_ENV=production
+
+# Cache/auth/stock/etc
+REDIS_DRIVER=tcp
+REDIS_URL=rediss://default:<password>@<your-upstash-host>:6379
+
+# Sessions (managed TCP)
+SESSION_REDIS_URL=rediss://default:<password>@<your-upstash-host>:6379
+SESSION_REDIS_PREFIX=session:prod:
+```
+
+### Redis debugging quick commands (WSL/Ubuntu)
+
+#### Install Redis locally (dev sessions)
 
 ```bash
-# connect (example)
-redis-cli -h 127.0.0.1 -p 6379
+sudo apt update
+sudo apt install -y redis-server redis-tools
+```
+
+#### Start Redis
+
+If your WSL has systemd enabled:
+
+```bash
+sudo systemctl enable redis-server
+sudo systemctl start redis-server
+```
+
+If systemd is NOT enabled (common on WSL):
+
+```bash
+sudo service redis-server start
+```
+
+#### Verify it’s running
+
+```bash
+redis-cli ping
+# PONG
+```
+
+#### Useful inspection commands
+
+```bash
+# List keys (small dev only). Prefer SCAN in real environments.
+redis-cli --scan --pattern "session:*"
+redis-cli --scan --pattern "session:dev:*"
+
+# Check TTL / value (debugging)
+redis-cli ttl "session:dev:somekey"
+redis-cli get "session:dev:somekey"
+
+# Delete all dev session keys (careful!)
+redis-cli --scan --pattern "session:dev:*" | xargs -r redis-cli del
 
 # Check TTL for session_start
 TTL session_start:<userId>
@@ -1282,13 +1828,18 @@ TTL session_start:<userId>
 GET refresh_token:<userId>:<jti>
 
 # Reservation keys
-KEYS stock_reservation:*:<orderId>:*
+KEYS stock_reservation:_:<orderId>:_
 
 # Cart backup
 GET cart_backup:<userId>
 ```
 
-> In production prefer `SCAN` instead of `KEYS` to avoid blocking.
+Then set in `backend/.env`:
+
+```env
+SESSION_REDIS_URL=redis://127.0.0.1:6379
+SESSION_REDIS_PREFIX=session:dev:
+```
 
 ---
 
