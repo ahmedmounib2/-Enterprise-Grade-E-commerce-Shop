@@ -34,6 +34,10 @@
       - [Security \& ownership controls](#security--ownership-controls)
       - [Post-approval seller experience](#post-approval-seller-experience)
       - [Operational notes](#operational-notes)
+      - [Seller bank-update review lifecycle (pending/approved/rejected + seller cancel)](#seller-bank-update-review-lifecycle-pendingapprovedrejected--seller-cancel)
+      - [Seller dashboard behavior for bank-update reviews](#seller-dashboard-behavior-for-bank-update-reviews)
+      - [Backend contract for bank-update records](#backend-contract-for-bank-update-records)
+      - [Bank-update API routes (seller + admin)](#bank-update-api-routes-seller--admin)
     - [Seller store settings, storefront policies, and admin review flow](#seller-store-settings-storefront-policies-and-admin-review-flow)
       - [Seller settings: editable fields \& review gates](#seller-settings-editable-fields--review-gates)
       - [What happens when a seller updates policies or branding](#what-happens-when-a-seller-updates-policies-or-branding)
@@ -49,6 +53,13 @@
       - [State transitions \& audit trail](#state-transitions--audit-trail)
       - [Visibility rules \& storefront behavior](#visibility-rules--storefront-behavior)
       - [Operational safeguards \& failure handling](#operational-safeguards--failure-handling)
+    - [Fee Engine \& Seller Subscription Architecture](#fee-engine--seller-subscription-architecture)
+      - [FeeConfig defaults (plan commission + Stripe price)](#feeconfig-defaults-plan-commission--stripe-price)
+      - [Commission rules hierarchy (global/seller/category)](#commission-rules-hierarchy-globalsellercategory)
+      - [Commission calculation \& order locking](#commission-calculation--order-locking)
+      - [Pro Plan subscription purchase flow (Stripe Checkout)](#pro-plan-subscription-purchase-flow-stripe-checkout)
+      - [Subscription renewal \& expiration handling](#subscription-renewal--expiration-handling)
+      - [Admin/operations notes](#adminoperations-notes)
     - [Mobile Category Tree v2 (dynamic categories)](#mobile-category-tree-v2-dynamic-categories)
     - [DaisyUI theming (web + mobile)](#daisyui-theming-web--mobile)
     - [Wishlist DTO \& API contract](#wishlist-dto--api-contract)
@@ -289,6 +300,9 @@ transitions**, and **audit-friendly data snapshots**.
    - Sellers upload KYC documents (IDs, registrations, etc.).
    - Each document is stored in `SellerDocument`, linked by `sellerId`. This keeps document metadata
      isolated from the seller profile and supports audit trails.
+   - For `bank_statement` uploads during onboarding, the backend now increments `version` using the
+     same version resolver used by the bank-update flow, so repeated uploads are explicitly ordered
+     by version (with `createdAt` as a tie-breaker).
 3. **Review status** — `GET /api/sellers/me`
    - Sellers retrieve their onboarding status (application, KYC status, documents, and store
      provisioning state) in a single response.
@@ -338,6 +352,116 @@ transitions**, and **audit-friendly data snapshots**.
   record instead of creating duplicates.
 - Drafts allow multi-step completion, while pending submissions lock the application for review.
 - Rejections preserve a snapshot of the submitted application to support support reviews or audits.
+
+#### Seller bank-update review lifecycle (pending/approved/rejected + seller cancel)
+
+Bank updates for already-verified sellers now run on a dedicated review lifecycle that is separate
+from seller-application KYC statuses. The current lifecycle is:
+
+`pending` → (`approved` | `rejected`) with a seller-side cancel action available from `pending` and
+`rejected`.
+
+There is **no `action_required` state for bank updates**. Any legacy reference to bank-update
+`action_required` should be treated as obsolete.
+
+| Bank update review status | Who sets it           | Meaning                                                                |
+| ------------------------- | --------------------- | ---------------------------------------------------------------------- |
+| `pending`                 | Seller submits update | Admin review is required; storefront/product creation remains paused.  |
+| `approved`                | Admin approve action  | New bank details are promoted to approved payout bank fields.          |
+| `rejected`                | Admin reject action   | Submitted bank update is denied; admin notes explain why.              |
+| `cancelled` (UI outcome)  | Seller cancel action  | Seller reverts to last approved bank profile and clears active review. |
+
+State transition summary:
+
+1. Seller submits a bank update (`pending`).
+2. Admin approves (`approved`) or rejects (`rejected`).
+3. Seller can cancel while review is `pending` or after `rejected`; cancel restores the last
+   approved bank profile and clears the in-flight review metadata.
+
+#### Seller dashboard behavior for bank-update reviews
+
+The seller dashboard payment-method flow now has explicit UX rules:
+
+- **Pending header copy:** pending requests show a clear “under review” header and messaging that
+  product creation/storefront visibility are paused until review resolves.
+- **Denied header + reason:** rejected requests show a denial header and render admin review notes
+  as the reason.
+- **Always-visible cancel button:** a **Cancel and restore last approved bank** action is always
+  visible on bank-update review cards (enabled only when status is cancellable).
+- **Application Details tab:** review UIs include an **Application Details** tab showing submitted
+  bank identity and statement metadata for traceability.
+
+#### Backend contract for bank-update records
+
+The backend model contract is intentionally strict so UI and admin tooling can rely on stable
+semantics:
+
+- Seller KYC bank documents use a single canonical type: `bank_statement`. New records must not use
+  the legacy `bank` type.
+- Bank statement documents now include explicit phase metadata: `isOnboarding=true` for onboarding
+  uploads before seller approval and `isOnboarding=false` for post-approval bank-update uploads.
+- bank statement `version` is incremented in both onboarding and bank-update upload paths, so the
+  latest statement is deterministic without relying on legacy type aliases.
+- `seller.updateReview` is the active review envelope for bank updates (`type/requestType`
+  `bank_update`).
+- `updateReview.status` for bank updates is constrained to `pending`, `approved`, or `rejected`.
+- On deny, the submitted payload is copied into an archived record (`ArchivedBankUpdate`) and the
+  mutable in-review payload is cleared from the active review envelope.
+- `seller.payout.bank` is the approved source of truth for live settlement data. UIs should treat
+  this as canonical approved bank information.
+- Seller cancel restores `application.banking` from `payout.bank` and clears `updateReview`, so the
+  dashboard returns to the last approved bank baseline.
+
+#### Bank-update API routes (seller + admin)
+
+Use the following API routes for the full bank-update lifecycle:
+
+- **Submit bank update (seller):** `POST /api/seller/payment-method`
+  - Submit bank token + statement metadata to start/replace a bank-update review.
+  - Creates/updates `updateReview` with `status=pending` for verified active sellers.
+- **Admin approve/deny review:** `PATCH /api/sellers/admin/:id/update-review?action=approve|reject`
+  - `approve`: promotes submitted bank data to `payout.bank`, marks review `approved`.
+  - `reject`: marks review `rejected`, requires notes, archives denied update snapshot.
+- **Seller cancel update review:**
+  - `POST /api/seller/payment-method/cancel-bank-update`
+  - `POST /api/seller/bank-update/cancel` (alias)
+  - Allowed when current bank-update review is `pending` or `rejected`; restores last approved bank
+    fields and clears active review state.
+  - The primary cancel endpoint is intentionally excluded from the global API rate limiter to avoid
+    blocking seller recovery actions with `429` during repeated cancel/retry attempts.
+    `action_required` remains valid for seller-application KYC and store-profile review workflows,
+    but it is **not** part of the bank-update review state machine. The KYC document access layer
+    now enforces a **view-first, policy-driven** model:
+
+- **Inline viewer is the default** for all roles. Document access uses short-lived view tokens and
+  renders with `Content-Disposition: inline`.
+- **Tiered controls are enforced per document**:
+  - **Tier 1** (`identity`, `authorization`) is **view-only**.
+  - **Tier 2** documents can be viewed and are eligible for tightly controlled admin download.
+- **Audit logging is built in** for view token creation, viewer access attempts, frontend viewer
+  events, and download attempts/outcomes.
+- **Tier 2 downloads are admin-only** and pass through a watermarking step before file delivery.
+
+Current endpoint behavior:
+
+- `GET /api/sellers/docs/:docId/view-token` — seller/admin authorized token issue for viewer use.
+- `GET /api/sellers/admin/docs/:docId/view-token` — admin-scoped token issuance.
+- `GET /api/sellers/docs/view/:token` — secure inline render endpoint.
+- `POST /api/sellers/docs/:docId/audit-events` — client-side viewer audit event ingestion.
+- `GET /api/sellers/admin/docs/:docId/download` — admin-only Tier 2 download with watermarking.
+- `GET /api/sellers/docs/:docId/download` — deprecated and intentionally returns `410` (do not use).
+- `GET /api/sellers/admin/docs/audit` — admin audit query endpoint for operational/compliance
+  review.
+
+Configuration and operational notes for maintainers:
+
+- `FEATURE_SELLER_KYC=true` must remain enabled where seller onboarding/KYC is expected.
+- `SELLER_DOC_VIEW_TOKEN_SECRET` should be set explicitly in each environment; if omitted, the
+  service falls back to `ACCESS_TOKEN_SECRET`.
+- Treat document downloads as an exception path: operational SOP should direct teams to the inline
+  viewer first and reserve Tier 2 download for approved admin workflows.
+- Any older examples, scripts, or runbooks that imply unrestricted seller/admin KYC downloads should
+  be updated to the tiered policy above.
 
 ### Seller store settings, storefront policies, and admin review flow
 
@@ -578,6 +702,172 @@ This separation guarantees that the public catalog only contains approved listin
 - **Moderation consistency:** any attempted public visibility change without approval is rejected
   server-side.
 - **Soft delete:** archived products are retained for reporting and audit purposes.
+
+### Fee Engine & Seller Subscription Architecture
+
+The platform implements a **fee engine** that combines plan-based defaults (Free vs. Pro) with
+time-bound commission rules and a Stripe-backed subscription system. The end goal is to let admins
+set platform economics in the database while keeping commission calculations deterministic and
+auditable for every order.
+
+#### FeeConfig defaults (plan commission + Stripe price)
+
+The **FeeConfig** collection is the **source of truth** for baseline commission rates, plan limits,
+and the Pro plan price metadata. Each configuration record includes:
+
+- `freeCommissionRate` — percentage for Free plan sellers.
+- `proCommissionRate` — percentage for Pro plan sellers.
+- `minimumFee` — fixed minimum fee per item (applied per unit).
+- `freeMaxProducts` / `freeMaxFeatured` — Free plan product + featured product limits.
+- `proMaxProducts` / `proMaxFeatured` — Pro plan product + featured product limits.
+- `proPlanPriceAmount` / `proPlanPriceCurrency` — stored for **read-only display** of plan pricing.
+- `stripePriceId` — Stripe Price ID for the Pro subscription checkout + renewals.
+- `effectiveStartDate` / `effectiveEndDate` — date range for when the config is active.
+
+At runtime the API loads the **active FeeConfig** (effective date window containing “now” and
+highest `effectiveStartDate`) and applies it across order calculations and subscription pricing.
+Commission rates, plan limits, and Stripe Price IDs are **not** controlled by environment variables;
+they live in FeeConfig so admins can adjust them without redeploying. The only exception is the
+optional `STRIPE_PRO_PRICE_ID` fallback (used when no active FeeConfig is found), but the DB value
+always takes precedence. The Pro plan price amount/currency are stored to show admins and sellers
+the current display price; Stripe remains the billing source of truth.
+
+#### Commission rules hierarchy (global/seller/category)
+
+Beyond the FeeConfig defaults, **CommissionRule** records allow time-bound overrides:
+
+- `scope`: `global`, `seller`, or `category`.
+- `percentageRate` and `minimumFee` for the override.
+- `effectiveStartDate` / `effectiveEndDate` to activate the rule.
+- Optional `sellerId` or `categoryId` targets (required for their scope).
+
+When calculating fees, the system **filters to only active rules** (date range includes now) and
+chooses the most specific rule in this order:
+
+1. **Category rule** (if the product category has an active rule).
+2. **Seller rule** (if the seller has an active rule).
+3. **Global rule** (if defined).
+
+If no rule matches, the fee engine falls back to the plan-based defaults in FeeConfig. This gives
+admins precise control over promotions (e.g., category discounts) or negotiated seller rates while
+keeping a single global baseline.
+
+#### Commission calculation & order locking
+
+Commission is computed **per item** during checkout and stored on the order so it never changes
+retroactively. The flow is:
+
+1. Resolve the active rule (category → seller → global) or fall back to the plan commission rate
+   (Free vs. Pro) from FeeConfig.
+2. Calculate net unit price after any deal/discount.
+3. Compute the per-unit fee using `max(netUnit * commissionPct, minimumFee)`.
+4. Multiply by quantity to get the item’s `platformFee`.
+5. Persist `commissionPct`, `commissionRuleId`, `commissionRuleScope`, `commissionMinFee`, and the
+   order-level `commissionTotal`.
+
+This locks the fee details on each order and supports reporting/analytics without recalculating fees
+later. It also ensures minimum fee enforcement on **every unit**, not just per line item.
+
+#### Pro Plan subscription purchase flow (Stripe Checkout)
+
+Sellers can upgrade to the Pro plan via Stripe Checkout. The flow is:
+
+1. Seller clicks **Upgrade to Pro** in the dashboard.
+2. Backend calls `POST /api/seller/subscription/checkout`, resolves the **active FeeConfig
+   `stripePriceId`** (or `STRIPE_PRO_PRICE_ID` fallback), and creates a **Stripe Checkout Session**
+   in `subscription` mode.
+3. The session stores `sellerId` in metadata and returns `session.id` + `session.url`.
+4. After payment, the frontend calls `POST /api/seller/subscription/confirm` (or `/upgrade`) with
+   the `sessionId`. The backend:
+   - Verifies the session is complete and matches the seller.
+   - Loads the Stripe subscription and payment method details.
+   - Sets `subscriptionPlan = "pro"` and `planExpiresAt` using Stripe’s `current_period_end` (or a
+     fallback based on the price interval).
+   - Saves Stripe customer/subscription/payment method metadata on the seller.
+   - Resets the subscription renewal tracking and applies Pro plan limits.
+
+The result is a clean separation: **Stripe handles billing**, while the platform tracks plan state,
+expiry, and limits in the Seller record for fast authorization checks across the product, order, and
+analytics workflows.
+
+#### Subscription renewal & expiration handling
+
+Pro subscriptions auto-renew via a scheduled job:
+
+- **Scheduler:** enabled by default, runs on a cron schedule (hourly by default), and performs an
+  immediate run at startup. It can be disabled with `SUBSCRIPTION_RENEWAL_ENABLED=false`.
+- **Lookahead window:** the job scans for Pro sellers with `planExpiresAt` within the configured
+  lookahead days to ensure renewals happen before expiry.
+  - **Cancel-at-period-end handling:** if a seller’s Stripe record has
+    `payout.stripe.cancelAtPeriodEnd=true`, the renewal sweep will **not** attempt to renew. If the
+  - **Expiration sweep:** in every cycle, the job first downgrades any Pro sellers whose
+    `planExpiresAt` is in the past **and** who are marked cancel-at-period-end, so cancellations are
+    enforced even if the seller never hits the subscription API.
+- **Billing attempt:** uses the seller’s stored Stripe `customerId`, `paymentMethodId`, and
+  `subscriptionId`. If no subscription exists, a new one is created using the active FeeConfig
+  price.
+- **Success path:** plan stays Pro, `planExpiresAt` is extended, and retry counters are reset.
+- **Failure path:** retry attempts are scheduled with a configurable delay. After the final retry,
+  the system schedules a downgrade (grace period) and emails the seller about billing failures.
+- **Downgrade:** once the grace period passes, the seller is auto-downgraded to Free, expiry is
+  cleared, and subscription limits are re-applied.
+
+**Scheduled cron job settings (recommended defaults)**
+
+```env
+# Enable the auto-renewal system by default so Pro sellers auto-renew.
+SUBSCRIPTION_RENEWAL_ENABLED=true
+# Run hourly – frequent sweeps ensure renewals happen promptly.
+SUBSCRIPTION_RENEWAL_CRON="0 * * * *"
+# Use a neutral timezone like UTC to avoid DST issues.
+SUBSCRIPTION_RENEWAL_TZ="UTC"
+# Start attempting renewals 3 days before plan expiry (gives retry window).
+SUBSCRIPTION_RENEWAL_LOOKAHEAD_DAYS=3
+# Try up to 3 payment attempts before giving up.
+SUBSCRIPTION_RENEWAL_MAX_RETRIES=3
+# Wait 12 hours between retries (two retries per day).
+SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS=12
+# If all retries fail, give a 1-day grace period before auto-downgrading.
+SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS=24
+```
+
+**Testing settings (temporary overrides)**
+
+Use these for local testing when you want fast cycles and immediate retry windows:
+
+```env
+# Enable the auto-renewal system.
+SUBSCRIPTION_RENEWAL_ENABLED=true
+# Run every minute so changes are visible quickly.
+SUBSCRIPTION_RENEWAL_CRON="* * * * *"
+# Use a neutral timezone like UTC to avoid DST issues.
+SUBSCRIPTION_RENEWAL_TZ="UTC"
+# Only attempt renewals at/after expiry.
+SUBSCRIPTION_RENEWAL_LOOKAHEAD_DAYS=0
+# Keep retries low for faster downgrade validation.
+SUBSCRIPTION_RENEWAL_MAX_RETRIES=2
+# Wait 1 minutee between retries (leave as-is for realism).
+SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS=0.016
+# Short grace period for testing downgrade enforcement ~2minutes.
+SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS=0.032
+```
+
+Separately, the subscription read endpoint enforces expiration on demand: if a Pro seller’s
+`planExpiresAt` is in the past, the API automatically moves them to the Free plan and clears any
+pending cancellation flags. This ensures the UI and backend authorization stay consistent even if a
+seller’s plan expires between renewal sweeps.
+
+#### Admin/operations notes
+
+- **Update fee defaults:** In the admin dashboard, open **Commission settings** and create/update a
+  FeeConfig record with the Free/Pro commission %, minimum fee, and active date range.
+- **Update Pro plan price:** Create a new **Stripe Price** in Stripe, then paste the new Price ID
+  into FeeConfig. The next checkout/renewal will automatically use the updated price.
+- **Rule overrides:** Use the same admin screen to create seller- or category-specific commission
+  rules when you need targeted promotions or negotiated fee rates.
+
+These changes are stored in the database and take effect immediately without requiring a deploy or
+environment variable updates (except the optional Stripe price fallback).
 
 ### Mobile Category Tree v2 (dynamic categories)
 
@@ -1486,6 +1776,11 @@ pick changes; otherwise `npm run dev` from repo root).
 
 ## Environment variables used
 
+**Fee engine note:** Commission rates, minimum fees, and the Pro plan Stripe Price ID are managed
+via **FeeConfig records in the database**, not environment variables. Use env vars only for secrets
+or scheduling. The optional `STRIPE_PRO_PRICE_ID` value is a fallback if no active FeeConfig exists;
+when both are present, the DB value always wins.
+
 **Authentication & cookies**
 
 ```
@@ -1525,12 +1820,25 @@ UPSTASH_REDIS_URL (or REDIS connection string)
 ```
 STRIPE_SECRET_KEY
 STRIPE_WEBHOOK_SECRET
+STRIPE_PRO_PRICE_ID          # optional fallback if FeeConfig has no stripePriceId
 SENDGRID_API_KEY
 CLOUDINARY_CLOUD_NAME
 CLOUDINARY_API_KEY
 CLOUDINARY_API_SECRET
 SENTRY_DSN
 SENTRY_RELEASE
+```
+
+**Subscription renewal policy (server-side)**
+
+```
+SUBSCRIPTION_RENEWAL_ENABLED         # default true; set to false to disable the cron job
+SUBSCRIPTION_RENEWAL_CRON            # default "0 * * * *" (hourly sweep)
+SUBSCRIPTION_RENEWAL_TZ              # default "UTC"
+SUBSCRIPTION_RENEWAL_LOOKAHEAD_DAYS  # default 3 (renew before expiry)
+SUBSCRIPTION_RENEWAL_MAX_RETRIES     # default 3
+SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS # default 12 (space retries)
+SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS # default 24 (grace before downgrade)
 ```
 
 **Social logins & callbacks**
@@ -1628,6 +1936,17 @@ FACEBOOK_LINK_CALLBACK_URL=http://localhost:5001/api/auth/facebook/link/callback
 # Stripe
 STRIPE_SECRET_KEY=
 STRIPE_WEBHOOK_SECRET=
+# Optional fallback only; FeeConfig in DB takes precedence
+STRIPE_PRO_PRICE_ID=
+
+# Subscription renewal policy (server-side)
+SUBSCRIPTION_RENEWAL_ENABLED=true
+SUBSCRIPTION_RENEWAL_CRON="0 * * * *"
+SUBSCRIPTION_RENEWAL_TZ="UTC"
+SUBSCRIPTION_RENEWAL_LOOKAHEAD_DAYS=3
+SUBSCRIPTION_RENEWAL_MAX_RETRIES=3
+SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS=12
+SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS=24
 
 # Email Service (SendGrid)
 SENDGRID_API_KEY=
