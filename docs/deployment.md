@@ -67,6 +67,8 @@ Rollback: use the Vercel dashboard to promote the previous successful deployment
    - Railway metrics (CPU, memory, HTTP 5xx rate).
    - Sentry alerts for new errors.
    - Stripe webhook deliveries to ensure no events fail.
+   - Settlement scheduler health: verify cron cadence, new batch creation, and payout
+     execution/manual fallback queue metrics after release.
 5. If an issue arises, redeploy the previous container image from the Railway "Deployments" tab or
    roll back the Git commit triggering the automated build.
 

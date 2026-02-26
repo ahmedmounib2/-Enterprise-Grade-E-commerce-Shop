@@ -81,6 +81,8 @@
     - [COD flow (Cash-on-Delivery) — `createCODOrder` \& `codCheckoutSuccess`](#cod-flow-cash-on-delivery--createcodorder--codcheckoutsuccess)
     - [Stock reservation \& restoration (variant-aware)](#stock-reservation--restoration-variant-aware)
     - [Failure \& expired session handling](#failure--expired-session-handling)
+    - [Seller settlements, ledger lifecycle, and payout execution](#seller-settlements-ledger-lifecycle-and-payout-execution)
+    - [Stripe Connect prerequisites (seller payouts)](#stripe-connect-prerequisites-seller-payouts)
   - [Products, variants \& model behavior](#products-variants--model-behavior)
   - [Dynamic categories system (tree + drag-and-drop)](#dynamic-categories-system-tree--drag-and-drop)
     - [Data model \& flags](#data-model--flags)
@@ -417,10 +419,14 @@ semantics:
 Use the following API routes for the full bank-update lifecycle:
 
 - **Submit bank update (seller):** `POST /api/seller/payment-method`
-  - Submit bank token + statement metadata to start/replace a bank-update review.
+  - Submit one-time bank token + statement metadata to start/replace a bank-update review.
+  - Backend immediately exchanges the token with Stripe (`createExternalAccount`) and updates the
+    seller's connected external bank account on their Stripe Connect account.
   - Creates/updates `updateReview` with `status=pending` for verified active sellers.
 - **Admin approve/deny review:** `PATCH /api/sellers/admin/:id/update-review?action=approve|reject`
-  - `approve`: promotes submitted bank data to `payout.bank`, marks review `approved`.
+  - `approve`: promotes previously persisted non-sensitive bank metadata to `payout.bank` and marks
+    review `approved`.
+  - Approval does **not** reuse or persist bank token identifiers; token use is submit-time only.
   - `reject`: marks review `rejected`, requires notes, archives denied update snapshot.
 - **Seller cancel update review:**
   - `POST /api/seller/payment-method/cancel-bank-update`
@@ -1293,6 +1299,68 @@ The webhook handler validates Stripe signatures and supports multiple events:
 
 ---
 
+### Seller settlements, ledger lifecycle, and payout execution
+
+The payout system is implemented as a **double-entry style operational ledger** at seller level:
+
+- Every sale/refund/fee action emits immutable `LedgerEntry` rows (`sale`, `commission`, `refund`,
+  `commission_reversal`, `adjustment`) with integer `amountCents`, currency, and idempotent
+  references to the originating order/refund path.
+- Positive balances that remain `payoutStatus=pending` are candidates for settlement scheduling.
+- When a batch is scheduled, matching ledger rows are marked `scheduled` and linked by
+  `settlementBatchId`.
+- Once payout execution succeeds, rows move to `paid`; they are never recalculated retroactively.
+
+**Settlement lifecycle**
+
+1. Cron (or admin trigger) computes the next period window (`SETTLEMENT_PERIOD_DAYS`).
+2. Eligibility is checked against period end + hold days (`SETTLEMENT_HOLD_DAYS`).
+3. A `SettlementBatch` is created with seller totals and entry count.
+4. One `SettlementPayout` row is created per seller for positive net amounts.
+5. Admin executes the batch:
+   - Stripe transfer success => payout `paid`, ledger rows `paid`.
+   - Missing prerequisites / non-positive amount => payout `manual_required`.
+   - Stripe API error => payout `failed` (batch status updates accordingly).
+
+**Batch statuses (`SettlementBatch.status`)**
+
+- `calculated`: reserved for pre-scheduled calculation states.
+- `scheduled`: payouts are queued and awaiting execution.
+- `paid`: all payouts in the batch are terminally paid.
+- `failed`: at least one payout failed and needs operator intervention.
+
+**Payout statuses (`SettlementPayout.status`)**
+
+- `scheduled`: ready to execute.
+- `paid`: transfer completed (`externalTransferId` recorded).
+- `failed`: Stripe transfer attempt failed.
+- `manual_required`: cannot auto-pay (for example, missing Stripe account); export CSV and process
+  manually.
+
+See the dedicated operator guide for fallback payout + CSV procedures:
+[`docs/settlements-runbook.md`](docs/settlements-runbook.md).
+
+### Stripe Connect prerequisites (seller payouts)
+
+For automatic settlement transfers, each seller must have:
+
+1. A Stripe Connect account ID saved on `seller.payout.stripeAccountId`.
+2. A connected external bank account tokenized via Stripe and attached as
+   `seller.payout.bank.externalAccountId`.
+3. Approved payout/bank details in seller profile (`seller.payout.bank.*`) after any required review
+   flow.
+
+**Account/external-account flow**
+
+- On first payout-method onboarding, backend creates a Stripe Connect Custom account if missing.
+- Backend attaches the submitted bank token with `accounts.createExternalAccount`.
+- Existing external account can be replaced; previous account cleanup is attempted when Stripe
+  supports it.
+- If no `stripeAccountId` exists at execution time, payout is marked `manual_required` and included
+  in CSV fallback export.
+
+---
+
 ## Products, variants & model behavior
 
 - Products support:
@@ -1841,6 +1909,41 @@ SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS # default 12 (space retries)
 SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS # default 24 (grace before downgrade)
 ```
 
+**Settlement scheduler policy (server-side)**
+
+```
+SETTLEMENT_PERIOD_DAYS               # default 15 (window size per month, in days)
+SETTLEMENT_HOLD_DAYS                 # default 0 (days after period end before eligible)
+SETTLEMENT_CRON                      # default "0 0 * * *" (daily sweep)
+SETTLEMENT_TZ                        # optional, default "UTC"
+SETTLEMENT_CURRENCY                  # optional, default "USD"
+```
+
+**Recommended env presets**
+
+Production-like:
+
+```env
+SETTLEMENT_PERIOD_DAYS=15
+SETTLEMENT_HOLD_DAYS=3
+SETTLEMENT_CRON="0 0 * * *"      # once daily at 00:00 UTC
+SETTLEMENT_TZ="UTC"
+SETTLEMENT_CURRENCY="USD"
+```
+
+Local/manual testing (fast feedback):
+
+```env
+SETTLEMENT_PERIOD_DAYS=1
+SETTLEMENT_HOLD_DAYS=0
+SETTLEMENT_CRON="*/2 * * * *"    # every 2 minutes
+SETTLEMENT_TZ="UTC"
+SETTLEMENT_CURRENCY="USD"
+```
+
+> For local manual verification, keep hold days at `0` and run a frequent cron cadence
+> (`*/1`-`*/5 * * * *`) so batches become eligible quickly.
+
 **Social logins & callbacks**
 
 ```
@@ -1859,6 +1962,13 @@ GOOGLE_LINK_CALLBACK_URL
 ```
 PORT
 NODE_ENV
+RATE_WINDOW_MS           # shared limiter window in ms (default 3600000)
+SELLER_REQ_LIMIT         # legacy seller write cap alias (fallback)
+SELLER_READ_LIMIT        # seller GET/HEAD budget (default 1000/hr)
+SELLER_WRITE_LIMIT       # seller POST/PATCH/DELETE budget (default 1000/hr)
+ADMIN_REQ_LIMIT          # legacy admin write cap alias (fallback)
+ADMIN_READ_LIMIT         # admin GET/HEAD budget (default 10000/hr)
+ADMIN_WRITE_LIMIT        # admin POST/PATCH/DELETE budget (default 10000/hr)
 VITE_TAX_RATE
 VITE_SHIPPING_COST
 VITE_FEATURE_CATEGORY_TREE_V2
@@ -1923,6 +2033,15 @@ COOKIE_SECRET=changeme_cookie_secret
 JWT_SECRET=changeme_jwt_secret
 DEBUG_REFRESH=false
 
+# API rate limits
+RATE_WINDOW_MS=3600000
+SELLER_REQ_LIMIT=1000
+SELLER_READ_LIMIT=1000
+SELLER_WRITE_LIMIT=1000
+ADMIN_REQ_LIMIT=10000
+ADMIN_READ_LIMIT=10000
+ADMIN_WRITE_LIMIT=10000
+
 # OAuth Providers
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
@@ -1947,6 +2066,18 @@ SUBSCRIPTION_RENEWAL_LOOKAHEAD_DAYS=3
 SUBSCRIPTION_RENEWAL_MAX_RETRIES=3
 SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS=12
 SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS=24
+
+# Settlement scheduler policy (server-side)
+SETTLEMENT_PERIOD_DAYS=15
+SETTLEMENT_HOLD_DAYS=3
+SETTLEMENT_CRON="0 0 * * *"
+SETTLEMENT_TZ="UTC"
+SETTLEMENT_CURRENCY="USD"
+
+# Local testing override (manual):
+# SETTLEMENT_PERIOD_DAYS=1
+# SETTLEMENT_HOLD_DAYS=0
+# SETTLEMENT_CRON="*/2 * * * *"
 
 # Email Service (SendGrid)
 SENDGRID_API_KEY=
