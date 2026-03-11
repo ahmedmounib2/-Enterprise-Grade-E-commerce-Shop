@@ -1421,6 +1421,9 @@ The payout system is implemented as a **double-entry style operational ledger** 
   `commission_reversal`, `adjustment`) with integer `amountCents`, currency, and idempotent
   references to the originating order/refund path.
 - Seller totals are **netted across all currently pending ledger rows in the eligible period**.
+- Scheduler eligibility includes **all pending entries with `createdAt <= periodEnd`** (not just
+  rows created inside the current window), so prior non-paid rows carry forward automatically until
+  included in a positive-net schedule.
 - If a seller's net is non-positive for that run, no payout row is created for that seller and those
   ledger rows remain `payoutStatus=pending` (carry-forward debt/offset behavior).
 - When the same seller later has enough positive entries to make the net amount positive, scheduler
@@ -1438,7 +1441,13 @@ The payout system is implemented as a **double-entry style operational ledger** 
 5. If `SETTLEMENT_AUTO_EXECUTE=true`, the cron cycle immediately executes the new batch.
 6. Admin can always execute manually via `POST /api/admin/settlements/:id/execute` (manual override
    path remains available even when auto-execute is on).
-7. Payout outcome handling is explicit:
+7. Manual/admin schedule trigger dedupe behavior is explicit and non-erroring:
+   - Existing batch for same `(periodStart, periodEnd, currency)` may return
+     `created: false, deduplicated: true`.
+   - Duplicate-key race safety returns `created: false, reason: 'duplicate'`.
+8. Cron logs also report duplicate/no-op outcomes as `No settlement batch scheduled by cron` with
+   `reason` and `deduplicated` metadata for operator visibility.
+9. Payout outcome handling is explicit:
    - Stripe transfer success => payout `paid`, ledger rows `paid`.
    - Missing prerequisites / non-positive amount => payout `manual_required`.
    - Non-positive payouts are never sent to Stripe transfer creation; they are short-circuited to
@@ -1475,6 +1484,54 @@ See the dedicated operator guide for fallback payout + CSV procedures:
 - `SETTLEMENT_CURRENCY` (default `USD`): settlement currency.
 - `SETTLEMENT_AUTO_EXECUTE` (default `false`): auto-runs transfer execution for newly created cron
   batches.
+- `SETTLEMENT_LOCK_KEY` (default `lock:settlement_scheduler`): distributed lock key shared across
+  scheduler instances that should coordinate the same environment.
+- `SETTLEMENT_LOCK_TTL_SECONDS` (default `120`): lock TTL in seconds; should exceed worst-case
+  scheduler cycle duration with safety buffer.
+- `SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY` (default `skip_cycle`): accepted values are `skip_cycle`
+  or `run_unlocked`.
+
+**Scheduler lock behavior and operations guidance**
+
+- The settlement scheduler uses Redis lock acquisition so only one runner schedules per cycle when
+  multiple app instances are active.
+- Redis is a dependency for strict single-runner behavior. If Redis lock acquisition fails:
+  - `SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=skip_cycle` skips the cycle (safest for financial jobs).
+  - `SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked` proceeds without lock (dev/test
+    convenience, higher duplicate-risk in multi-runner deployments).
+- Alerting expectation:
+  - Treat repeated logs `Settlement scheduler lock acquisition failed.` or
+    `Settlement scheduler cycle skipped because lock backend is unavailable.` as operational alerts.
+  - Treat frequent `Settlement scheduler lock not acquired. Skipping cycle.` as signal to validate
+    runner topology and lock TTL sizing.
+- Keep lock key namespaces isolated per environment to avoid cross-environment collisions.
+
+**Lock env presets by environment (copy-ready)**
+
+```env
+# Development (recommended values)
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler:dev # Lock key namespace for local dev; avoids collisions with staging/prod
+SETTLEMENT_LOCK_TTL_SECONDS=120 # Lock auto-expiry in seconds; enough for local runs while keeping stale locks short
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked # If local Redis is unavailable, still run scheduler for easier development
+
+
+# Production (safe default, avoid duplicate runs)
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler # Redis distributed lock key; must be shared by all prod scheduler instances
+SETTLEMENT_LOCK_TTL_SECONDS=300 # Lock expiry in seconds to avoid deadlocks; should cover worst-case cycle duration with buffer
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=skip_cycle # If Redis lock cannot be acquired due to Redis outage, skip this cycle (safest for financial jobs)
+
+
+# Staging (prod-like behavior, isolated keyspace)
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler:staging # Same purpose as prod, but namespaced so staging never collides with prod
+SETTLEMENT_LOCK_TTL_SECONDS=300 # Keep prod-like TTL to validate behavior under realistic conditions
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=skip_cycle # Match production safety policy during validation
+
+
+# Testing (unit/integration convenience)
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler:test # Test-only lock namespace to isolate parallel/local test runs
+SETTLEMENT_LOCK_TTL_SECONDS=30 # Short TTL keeps tests fast and reduces stale-lock wait during repeated runs
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked # Allows tests to proceed when Redis is absent/unreliable (except lock-specific test cases)
+```
 
 **How to test payouts and what to expect**
 
@@ -1494,6 +1551,39 @@ See the dedicated operator guide for fallback payout + CSV procedures:
 4. Manual remediation path:
    - Retry failed payout(s) from admin retry endpoints.
    - Complete manual-required payouts from manual completion endpoint and verify ledger rows move
+
+**Admin/manual scheduling response outcomes (quick reference)**
+
+- **Created batch (HTTP 201)**
+
+  ```json
+  {
+    "batch": { "id": "...", "status": "scheduled" },
+    "scheduledEntries": 24,
+    "sellerCount": 3
+  }
+  ```
+
+- **Skipped batch window (HTTP 200, no work this cycle)**
+
+  ```json
+  {
+    "created": false,
+    "reason": "period_not_eligible"
+  }
+  ```
+
+- **Duplicate/deduplicated outcome (HTTP 200, safe no-op)**
+
+  ```json
+  {
+    "created": false,
+    "reason": "duplicate"
+  }
+  ```
+
+Common `created: false` reasons include `no_pending_entries`, `period_not_eligible`,
+`no_positive_payouts`, and `duplicate`.
 
 ### Stripe Connect prerequisites (seller payouts)
 
@@ -2070,11 +2160,16 @@ SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS # default 24 (grace before downgrade)
 **Settlement scheduler policy (server-side)**
 
 ```
+SETTLEMENT_SCHEDULER_ENABLED         # default true; set false to disable scheduler cron registration
 SETTLEMENT_PERIOD_DAYS               # default 15 (window size per month, in days)
 SETTLEMENT_HOLD_DAYS                 # default 0 (days after period end before eligible)
 SETTLEMENT_CRON                      # default "0 0 * * *" (daily sweep)
 SETTLEMENT_TZ                        # optional, default "UTC"
 SETTLEMENT_CURRENCY                  # optional, default "USD"
+SETTLEMENT_AUTO_EXECUTE              # default false; executes newly created batches in same cron cycle
+SETTLEMENT_LOCK_KEY                  # default "lock:settlement_scheduler" (Redis distributed lock key)
+SETTLEMENT_LOCK_TTL_SECONDS          # default 120 (lock TTL in seconds)
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY # default "skip_cycle"; allowed: skip_cycle | run_unlocked
 ```
 
 **Recommended env presets**
@@ -2087,6 +2182,10 @@ SETTLEMENT_HOLD_DAYS=3
 SETTLEMENT_CRON="0 0 * * *"      # once daily at 00:00 UTC
 SETTLEMENT_TZ="UTC"
 SETTLEMENT_CURRENCY="USD"
+SETTLEMENT_AUTO_EXECUTE=false
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler
+SETTLEMENT_LOCK_TTL_SECONDS=300
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=skip_cycle
 ```
 
 Local/manual testing (fast feedback):
@@ -2097,6 +2196,10 @@ SETTLEMENT_HOLD_DAYS=0
 SETTLEMENT_CRON="*/2 * * * *"    # every 2 minutes
 SETTLEMENT_TZ="UTC"
 SETTLEMENT_CURRENCY="USD"
+SETTLEMENT_AUTO_EXECUTE=false
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler:dev
+SETTLEMENT_LOCK_TTL_SECONDS=120
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked
 ```
 
 > For local manual verification, keep hold days at `0` and run a frequent cron cadence
@@ -2226,11 +2329,16 @@ SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS=12
 SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS=24
 
 # Settlement scheduler policy (server-side)
+SETTLEMENT_SCHEDULER_ENABLED=true
 SETTLEMENT_PERIOD_DAYS=15
 SETTLEMENT_HOLD_DAYS=3
 SETTLEMENT_CRON="0 0 * * *"
 SETTLEMENT_TZ="UTC"
 SETTLEMENT_CURRENCY="USD"
+SETTLEMENT_AUTO_EXECUTE=false
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler:dev
+SETTLEMENT_LOCK_TTL_SECONDS=120
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked
 
 # Local testing override (manual):
 # SETTLEMENT_PERIOD_DAYS=1

@@ -22,6 +22,10 @@ Entries start with `payoutStatus=pending` and move through these phases:
 2. **Scheduled**: attached to a `SettlementBatch` and frozen for payout execution.
 3. **Paid**: finalized after transfer success.
 
+Scheduler netting rule is carry-forward by design: each cycle nets all pending entries where
+`createdAt <= periodEnd`. This means pending rows from prior windows are intentionally included
+until they are scheduled/paid.
+
 ### Settlement lifecycle
 
 1. Scheduler computes next settlement period using `SETTLEMENT_PERIOD_DAYS`.
@@ -32,6 +36,11 @@ Entries start with `payoutStatus=pending` and move through these phases:
    - Stripe transfer succeeds => payout marked `paid` and entries marked `paid`.
    - Stripe account missing or invalid amount => payout marked `manual_required`.
    - Stripe transfer API error => payout marked `failed`.
+6. Duplicate-safe scheduling outcomes (manual/admin and cron):
+   - Manual/admin trigger returns HTTP 200 with `created: false` when no new batch is created.
+   - Duplicate race/idempotency outcome is `created: false, reason: 'duplicate'`.
+   - Cron logs no-op/duplicate outcomes with `No settlement batch scheduled by cron` plus `reason`
+     and `deduplicated` flags.
 
 ---
 
@@ -82,7 +91,16 @@ SETTLEMENT_HOLD_DAYS=3
 SETTLEMENT_CRON="0 0 * * *"
 SETTLEMENT_TZ="UTC"
 SETTLEMENT_CURRENCY="USD"
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler
+SETTLEMENT_LOCK_TTL_SECONDS=120
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=skip_cycle
 ```
+
+`SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY` valid values:
+
+- `skip_cycle` (default/safest): skip scheduler cycle when Redis lock backend is unavailable.
+- `run_unlocked` (dev/test convenience): continue scheduler cycle without lock when Redis is
+  unavailable.
 
 ### Production baseline example
 
@@ -106,6 +124,41 @@ SETTLEMENT_CURRENCY="USD"
 
 Use very short hold periods plus frequent scheduler intervals for local manual tests.
 
+### Lock configuration by environment
+
+```env
+# Development (recommended values)
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler:dev # Lock key namespace for local dev; avoids collisions with staging/prod
+SETTLEMENT_LOCK_TTL_SECONDS=120 # Lock auto-expiry in seconds; enough for local runs while keeping stale locks short
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked # If local Redis is unavailable, still run scheduler for easier development
+
+
+# Production (safe default, avoid duplicate runs)
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler # Redis distributed lock key; must be shared by all prod scheduler instances
+SETTLEMENT_LOCK_TTL_SECONDS=300 # Lock expiry in seconds to avoid deadlocks; should cover worst-case cycle duration with buffer
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=skip_cycle # If Redis lock cannot be acquired due to Redis outage, skip this cycle (safest for financial jobs)
+
+
+# Staging (prod-like behavior, isolated keyspace)
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler:staging # Same purpose as prod, but namespaced so staging never collides with prod
+SETTLEMENT_LOCK_TTL_SECONDS=300 # Keep prod-like TTL to validate behavior under realistic conditions
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=skip_cycle # Match production safety policy during validation
+
+
+# Testing (unit/integration convenience)
+SETTLEMENT_LOCK_KEY=lock:settlement_scheduler:test # Test-only lock namespace to isolate parallel/local test runs
+SETTLEMENT_LOCK_TTL_SECONDS=30 # Short TTL keeps tests fast and reduces stale-lock wait during repeated runs
+SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked # Allows tests to proceed when Redis is absent/unreliable (except lock-specific test cases)
+```
+
+Operational expectations:
+
+- Redis lock is required for strict single-runner behavior across multiple scheduler instances.
+- Alert if repeated lock failures appear in logs (`lock acquisition failed` or
+  `cycle skipped because lock backend is unavailable`).
+- Investigate frequent `lock not acquired` skips (runner contention, TTL too long, stuck workers, or
+  topology mismatch).
+
 ---
 
 ## 5) Local manual test guidance (fast feedback)
@@ -118,6 +171,38 @@ Use very short hold periods plus frequent scheduler intervals for local manual t
 6. Validate one of:
    - `paid` + `externalTransferId` present (Stripe happy path), or
    - `manual_required` export generated when Stripe account prerequisites are absent.
+
+### Admin scheduling API outcomes (created vs skipped vs duplicate)
+
+- **Created (HTTP 201)**
+
+  ```json
+  {
+    "batch": { "id": "...", "status": "scheduled" },
+    "scheduledEntries": 24,
+    "sellerCount": 3
+  }
+  ```
+
+- **Skipped/no-op (HTTP 200)**
+
+  ```json
+  {
+    "created": false,
+    "reason": "period_not_eligible"
+  }
+  ```
+
+- **Duplicate (HTTP 200)**
+
+  ```json
+  {
+    "created": false,
+    "reason": "duplicate"
+  }
+  ```
+
+Other common no-op reasons: `no_pending_entries` and `no_positive_payouts`.
 
 ---
 
