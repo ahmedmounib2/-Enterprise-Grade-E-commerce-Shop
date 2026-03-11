@@ -25,7 +25,7 @@
     - [Workspaces](#workspaces)
     - [Common scripts](#common-scripts)
     - [Environment references](#environment-references)
-    - [Multi-store / multi-tenant foundations (Sprint 00)](#multi-store--multi-tenant-foundations-sprint-00)
+    - [Multi-store / multi-tenant foundations](#multi-store--multi-tenant-foundations)
     - [Seller onboarding flow (design \& implementation)](#seller-onboarding-flow-design--implementation)
       - [Entry points \& UX design](#entry-points--ux-design)
       - [Data model design (Seller + Store)](#data-model-design-seller--store)
@@ -79,6 +79,7 @@
     - [Checkout (Stripe) flow — `createCheckoutSession`](#checkout-stripe-flow--createcheckoutsession)
     - [Stripe webhooks \& async handling — `stripeWebhook`](#stripe-webhooks--async-handling--stripewebhook)
     - [COD flow (Cash-on-Delivery) — `createCODOrder` \& `codCheckoutSuccess`](#cod-flow-cash-on-delivery--createcodorder--codcheckoutsuccess)
+    - [COD eligibility policy, seller financial summary, and recovery path](#cod-eligibility-policy-seller-financial-summary-and-recovery-path)
     - [Stock reservation \& restoration (variant-aware)](#stock-reservation--restoration-variant-aware)
     - [Failure \& expired session handling](#failure--expired-session-handling)
     - [Seller settlements, ledger lifecycle, and payout execution](#seller-settlements-ledger-lifecycle-and-payout-execution)
@@ -230,8 +231,12 @@ Mobile-only feature flags live in `mobile/.env.*`. To exercise the Category Tree
 until you are ready to launch in production, then flip it to `true` in `.env.production` as well
 (`.env` files on Vercel/Railway do not need this flag).
 
-### Multi-store / multi-tenant foundations (Sprint 00)
+### Multi-store / multi-tenant foundations
 
+- Multi-store support is an **optional capability**: the foundations are in place and can be
+  enabled, disabled, or paused safely through environment flags.
+- Dedicated **Seller** and **Store** models include ownership metadata and scoped indexes on
+  `sellerId` and `slug` to support tenant isolation.
 - Added dedicated **Seller** and **Store** models with ownership metadata and scoped indexes on
   `sellerId` and `slug` to support isolation.
 - Products and orders carry seller/store references plus approval, visibility, and payout status
@@ -241,14 +246,13 @@ until you are ready to launch in production, then flip it to `true` in `.env.pro
   env vars such as `MONGO_URI`).
 - Public store lookup is available at `GET /api/stores/{slug}` and only surfaces the `StorePublic`
   fields when the multi-seller flag is enabled.
-- Enable the sprint by setting `FEATURE_MULTI_SELLER=true` in the backend environment (and the
-  corresponding frontend flag if you want UI exposure) before starting the app.
-  - Seller onboarding (application + KYC docs + admin review) lives behind `FEATURE_SELLER_KYC`. Add
-    the flag in each environment so the UI and APIs stay in sync:
-  - Backend: set `FEATURE_SELLER_KYC=true` in `backend/.env` (and in Railway env vars for deployed
-    services).
-- Frontend: set `VITE_FEATURE_SELLER_KYC=true` in `frontend/.env` (and mirror the variable in Vercel
-  project settings for preview/production as needed).
+- Multi-store tenant flags:
+  - `FEATURE_MULTI_SELLER=true`
+  - `FEATURE_SELLER_KYC=true`
+  - `FEATURE_SELLER_ORDERS=true`
+- Keep backend/frontend flags aligned per environment so APIs and UI stay in sync (for example,
+  mirror KYC flags with `VITE_FEATURE_SELLER_KYC=true` in `frontend/.env` and your Vercel
+  environment settings when needed).
 
 ### Seller onboarding flow (design & implementation)
 
@@ -298,6 +302,8 @@ transitions**, and **audit-friendly data snapshots**.
    - The application can be saved as **draft** or **pending** (submit for review), which lets
      sellers progressively complete details without triggering review too early.
    - Banking payloads are encrypted and stored in `application.banking`.
+   - Payout-country validation is based on the submitted bank country (`bankCountry`), not
+     `citizenshipCountry`. This keeps KYC identity fields decoupled from payout rail eligibility.
 2. **Upload documents** — `POST /api/sellers/:id/docs`
    - Sellers upload KYC documents (IDs, registrations, etc.).
    - Each document is stored in `SellerDocument`, linked by `sellerId`. This keeps document metadata
@@ -341,12 +347,40 @@ transitions**, and **audit-friendly data snapshots**.
 
 #### Post-approval seller experience
 
-- Once `status=active` and `kyc.status=verified`, sellers can access:
-  - **Seller dashboard** for orders, store settings, and policy updates.
-  - **Store customization** (branding, policies, contact info, categories).
-  - **Order management** scoped to their products only.
-- If the store is paused or status changes, storefront visibility is updated without affecting the
-  seller’s underlying KYC verification.
+Once `status=active` and `kyc.status=verified`, seller access unlocks in phases so compliance, store
+readiness, and payout setup stay aligned:
+
+1. **Immediate dashboard access**
+   - Seller can open `/seller/dashboard` and manage store profile data, policies, and approved
+     catalog workflows.
+   - Order tools are seller-scoped (only their own `sellerId` records) and can be exposed behind
+     `FEATURE_SELLER_ORDERS=true`.
+
+2. **Required legal consents in dashboard**
+   - Before full product workflow readiness, seller must accept both Privacy Policy and Terms from
+     the seller dashboard consent gate.
+   - Consent is persisted on the store record (`privacyAccepted`, `privacyAcceptedAt`,
+     `termsAccepted`, `termsAcceptedAt`) and is designed to be idempotent (once accepted, the seller
+     is not repeatedly blocked for the same consent).
+
+3. **Store readiness checks before listing**
+   - Seller profile completion enforces core storefront requirements (store identity fields +
+     shipping/return policy content + accepted legal consents) before allowing product creation
+     flows.
+
+4. **Payout setup via Stripe external onboarding link**
+   - From the seller payment tab, the system creates a Stripe Connect onboarding link
+     (`POST /seller/connect/onboarding-link`) and redirects the seller to Stripe-hosted onboarding.
+   - Stripe returns the seller back to `/seller/dashboard?tab=payment&stripeConnectReturn=1`, where
+     the app refreshes `GET /seller/connect/status` and shows whether payouts are fully enabled or
+     still require action.
+   - If onboarding is incomplete, the payout-readiness banner remains visible with requirement hints
+     until Stripe account requirements are satisfied.
+
+5. **After onboarding is complete**
+   - Sellers continue managing products, orders, policies, and settings within their tenant scope.
+   - If a store is paused or status changes later, storefront visibility can be updated without
+     revoking historical KYC verification data.
 
 #### Operational notes
 
@@ -674,18 +708,22 @@ lists or categories.
 
 The flow is intentionally explicit to avoid ambiguous states:
 
-| Current status | Action                      | Next status | Notes                                               |
-| -------------- | --------------------------- | ----------- | --------------------------------------------------- |
-| `draft`        | Seller submits for review   | `pending`   | Locks fields requiring admin review.                |
-| `pending`      | Admin approves              | `approved`  | Product becomes eligible for storefront visibility. |
-| `pending`      | Admin rejects               | `rejected`  | Seller must edit and resubmit.                      |
-| `rejected`     | Seller edits and re-submits | `pending`   | New review cycle; rejection reason preserved.       |
-| `approved`     | Seller edits core fields    | `pending`   | Optional re-review depending on change sensitivity. |
-| `approved`     | Admin unpublishes/archives  | `hidden`    | Keeps record, removes from storefront.nsitivity.    |
-| `approved`     | Admin unpublishes/archives  | `hidden`    | Keeps record, removes from storefront.              |
+| Current status | Action                                 | Next status | Notes                                                                    |
+| -------------- | -------------------------------------- | ----------- | ------------------------------------------------------------------------ |
+| `draft`        | Seller saves without submitting        | `draft`     | Editable by seller; never visible publicly.                              |
+| `draft`        | Seller submits for review              | `pending`   | Locks fields that require moderation.                                    |
+| `pending`      | Admin approves                         | `approved`  | Eligible for storefront when visibility rules also allow it.             |
+| `pending`      | Admin rejects                          | `rejected`  | Seller receives reason and must edit before re-submit.                   |
+| `rejected`     | Seller edits and re-submits            | `pending`   | Starts a new review cycle; prior rejection context is retained.          |
+| `approved`     | Seller edits moderation-sensitive data | `pending`   | Re-review gate for core listing changes.                                 |
+| `approved`     | Admin unpublishes/archives             | `hidden`    | Listing remains in system for audit/reporting but is removed storefront. |
+| `hidden`       | Admin republishes (if policy permits)  | `approved`  | Returns to approved lifecycle without creating a new product record.     |
 
-All transitions are logged with timestamps and reviewer IDs to provide a clear audit trail for
-compliance or dispute resolution.
+Audit trail expectations:
+
+- Every moderation decision stores actor (`adminId`/seller), timestamp, and reason metadata.
+- Rejections preserve reviewer notes for seller feedback and operational follow-up.
+- Status history is retained to support disputes, compliance review, and rollback investigations.
 
 #### Visibility rules & storefront behavior
 
@@ -852,7 +890,7 @@ SUBSCRIPTION_RENEWAL_TZ="UTC"
 SUBSCRIPTION_RENEWAL_LOOKAHEAD_DAYS=0
 # Keep retries low for faster downgrade validation.
 SUBSCRIPTION_RENEWAL_MAX_RETRIES=2
-# Wait 1 minutee between retries (leave as-is for realism).
+# Wait 1 minute between retries (leave as-is for realism).
 SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS=0.016
 # Short grace period for testing downgrade enforcement ~2minutes.
 SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS=0.032
@@ -1257,6 +1295,82 @@ The webhook handler validates Stripe signatures and supports multiple events:
 - `codCheckoutSuccess` accepts `orderId`, verifies user ownership, clears cart and safety keys,
   sends confirmation email (if not sent), and returns order summary to the client.
 
+### COD eligibility policy, seller financial summary, and recovery path
+
+COD checkout now enforces a seller-level **negative outstanding ledger balance policy** before a COD
+
+- For each seller represented in the cart, backend computes:
+  - current `outstandingBalanceCents` from pending ledger entries in policy currency.
+  - projected commission impact for the attempted order.
+  - projected post-order balance (`projectedBalanceCents`).
+- COD is blocked when `projectedBalanceCents < COD_NEGATIVE_BALANCE_THRESHOLD_CENTS`.
+- When blocked, checkout returns `409` and forces a **prepaid-only recovery path** (e.g., Stripe)
+  until the seller balance recovers.
+- Automatic re-enable is implicit: once a seller's outstanding balance improves above the threshold,
+  subsequent COD checkout attempts pass again (no manual toggle required).
+
+**New COD risk env vars**
+
+- `COD_NEGATIVE_BALANCE_THRESHOLD_CENTS=-10000`
+  - Default is `-10000` (−100.00 in minor units).
+  - Parsing clamps to `<= 0` so positive values are treated as `0`.
+- `COD_BALANCE_CURRENCY`
+  - Policy currency for balance checks.
+  - Fallback chain: `COD_BALANCE_CURRENCY` → `SETTLEMENT_CURRENCY` → `USD`.
+  - Invalid/non-ISO-3 values also fall back to `USD`.
+- `COD_BLOCK_NOTIFY_COOLDOWN_HOURS=24`
+  - Cooldown window for repeat seller block-notification emails.
+  - `0` disables cooldown (notification can send on every blocked attempt).
+
+**API additions**
+
+- COD checkout rejection payload:
+
+  ```json
+  {
+    "error": "Cash on delivery is currently blocked for this seller.",
+    "code": "COD_BLOCKED_NEGATIVE_BALANCE",
+    "blockedSellers": [
+      {
+        "sellerId": "<sellerId>",
+        "balanceCents": -15000,
+        "projectedCommissionCents": 1200,
+        "projectedBalanceCents": -16200
+      }
+    ]
+  }
+  ```
+
+- Seller financial summary endpoint: `GET /api/seller/financials/summary`
+  - Returns current policy inputs/decision for seller dashboards and support tooling:
+
+  ```json
+  {
+    "data": {
+      "currency": "USD",
+      "outstandingBalanceCents": -11000,
+      "codPolicy": {
+        "negativeThresholdCents": -10000,
+        "codAllowed": false,
+        "blockedReason": "negative_balance_threshold"
+      }
+    }
+  }
+  ```
+
+**Operational notes**
+
+- Notification cooldown behavior:
+  - On first blocked attempt per seller, backend stores a cooldown key and sends email.
+  - During cooldown window, additional blocked attempts suppress repeat notifications.
+  - After TTL expiry, the next blocked attempt can notify again.
+- Monitoring/debug tips for blocked sellers:
+  - Query seller summary endpoint to confirm live balance/currency/threshold decision.
+  - Compare `blockedSellers[].projectedBalanceCents` vs threshold in checkout 409 responses.
+  - Verify env alignment (`COD_BALANCE_CURRENCY`, threshold) across deploy targets.
+  - Check cache key TTLs (`cod_block_notice:<sellerId>`) when investigating missing/duplicate
+    notifications.
+
 ---
 
 ### Stock reservation & restoration (variant-aware)
@@ -1306,21 +1420,31 @@ The payout system is implemented as a **double-entry style operational ledger** 
 - Every sale/refund/fee action emits immutable `LedgerEntry` rows (`sale`, `commission`, `refund`,
   `commission_reversal`, `adjustment`) with integer `amountCents`, currency, and idempotent
   references to the originating order/refund path.
-- Positive balances that remain `payoutStatus=pending` are candidates for settlement scheduling.
-- When a batch is scheduled, matching ledger rows are marked `scheduled` and linked by
-  `settlementBatchId`.
-- Once payout execution succeeds, rows move to `paid`; they are never recalculated retroactively.
+- Seller totals are **netted across all currently pending ledger rows in the eligible period**.
+- If a seller's net is non-positive for that run, no payout row is created for that seller and those
+  ledger rows remain `payoutStatus=pending` (carry-forward debt/offset behavior).
+- When the same seller later has enough positive entries to make the net amount positive, scheduler
+  creates a payout only for the positive net result and then marks only included rows as
+  `payoutStatus=scheduled` with `settlementBatchId`.
+- Once payout execution succeeds, scheduled rows move to `paid`; pending carry-forward rows remain
+  pending until included by a future positive-net schedule.
 
 **Settlement lifecycle**
 
-1. Cron (or admin trigger) computes the next period window (`SETTLEMENT_PERIOD_DAYS`).
+1. Scheduler computes the next period window (`SETTLEMENT_PERIOD_DAYS`).
 2. Eligibility is checked against period end + hold days (`SETTLEMENT_HOLD_DAYS`).
 3. A `SettlementBatch` is created with seller totals and entry count.
 4. One `SettlementPayout` row is created per seller for positive net amounts.
-5. Admin executes the batch:
+5. If `SETTLEMENT_AUTO_EXECUTE=true`, the cron cycle immediately executes the new batch.
+6. Admin can always execute manually via `POST /api/admin/settlements/:id/execute` (manual override
+   path remains available even when auto-execute is on).
+7. Payout outcome handling is explicit:
    - Stripe transfer success => payout `paid`, ledger rows `paid`.
    - Missing prerequisites / non-positive amount => payout `manual_required`.
-   - Stripe API error => payout `failed` (batch status updates accordingly).
+   - Non-positive payouts are never sent to Stripe transfer creation; they are short-circuited to
+     manual handling.
+
+- Stripe API / balance failures => payout `failed`.
 
 **Batch statuses (`SettlementBatch.status`)**
 
@@ -1340,6 +1464,37 @@ The payout system is implemented as a **double-entry style operational ledger** 
 See the dedicated operator guide for fallback payout + CSV procedures:
 [`docs/settlements-runbook.md`](docs/settlements-runbook.md).
 
+**Settlement/payout environment variables**
+
+- `SETTLEMENT_SCHEDULER_ENABLED` (`true` by default): disables/enables scheduler job when set to
+  `false`.
+- `SETTLEMENT_CRON` (default `0 0 * * *`): cron expression for scheduling windows.
+- `SETTLEMENT_TZ` (default `UTC`): scheduler timezone.
+- `SETTLEMENT_PERIOD_DAYS` (default `15`): settlement window size.
+- `SETTLEMENT_HOLD_DAYS` (default `0`): release delay after period end.
+- `SETTLEMENT_CURRENCY` (default `USD`): settlement currency.
+- `SETTLEMENT_AUTO_EXECUTE` (default `false`): auto-runs transfer execution for newly created cron
+  batches.
+
+**How to test payouts and what to expect**
+
+1. Keep `SETTLEMENT_AUTO_EXECUTE=false`, schedule a batch, then call
+   `POST /api/admin/settlements/:id/execute`.
+   - Expect only `status='scheduled'` payouts to be processed.
+   - Expect response fields `processed`, `paidCount`, `manualRequiredCount`, and optional
+     `manualExport` CSV data.
+2. Set `SETTLEMENT_AUTO_EXECUTE=true` and run the scheduler cycle.
+   - Expect newly created batches to execute immediately in the same cycle.
+   - Expect cron logs containing `Settlement auto-execution completed.` with counts.
+3. Validate payout outcomes:
+   - Seller missing Stripe/bank linkage => payout becomes `manual_required`.
+   - Stripe transfer error => payout becomes `failed`.
+   - Successful transfer => payout becomes `paid`, `externalTransferId` is stored, related ledger
+     rows become `paid`.
+4. Manual remediation path:
+   - Retry failed payout(s) from admin retry endpoints.
+   - Complete manual-required payouts from manual completion endpoint and verify ledger rows move
+
 ### Stripe Connect prerequisites (seller payouts)
 
 For automatic settlement transfers, each seller must have:
@@ -1354,6 +1509,9 @@ For automatic settlement transfers, each seller must have:
 
 - On first payout-method onboarding, backend creates a Stripe Connect Custom account if missing.
 - Backend attaches the submitted bank token with `accounts.createExternalAccount`.
+- `STRIPE_CONNECT_COUNTRY` controls the single-country payout rail for MVP (default: `US`).
+- On onboarding and bank updates, submitted `bankCountry` must match `STRIPE_CONNECT_COUNTRY` (after
+  ISO-2 normalization).
 - Existing external account can be replaced; previous account cleanup is attempted when Stripe
   supports it.
 - If no `stripeAccountId` exists at execution time, payout is marked `manual_required` and included
