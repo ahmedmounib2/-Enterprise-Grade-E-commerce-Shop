@@ -161,14 +161,57 @@ Operational expectations:
 
 ---
 
-## 5) Local manual test guidance (fast feedback)
+## 5) Reconciliation operations and incident triage
 
-1. Set `SETTLEMENT_PERIOD_DAYS=1`, `SETTLEMENT_HOLD_DAYS=0`, and a frequent cron (`*/1` or `*/2`).
-2. Create test orders and confirm ledger entries are generated with `payoutStatus=pending`.
-3. Wait for cron (or manually trigger settlement schedule endpoint from admin).
-4. Confirm entries move to `scheduled`, with a new `SettlementBatch` + `SettlementPayout` rows.
-5. Execute the batch from admin endpoint.
-6. Validate one of:
+### Scheduled reconciliation job
+
+A dedicated reconciliation cron validates recent settlement integrity:
+
+- Batch checks: `SettlementBatch.totalAmountCents` vs summed payout and ledger totals.
+- Payout checks: internal payout state/amount vs Stripe transfer state/amount.
+- Scan window: controlled by `SETTLEMENT_RECONCILIATION_SCAN_DAYS`.
+
+Recommended baseline:
+
+```env
+SETTLEMENT_RECONCILIATION_ENABLED=true
+SETTLEMENT_RECONCILIATION_REPORT_ROLES=admin,staff
+SETTLEMENT_RECONCILIATION_CRON=15 2 * * *
+SETTLEMENT_RECONCILIATION_TIMEZONE=UTC
+SETTLEMENT_RECONCILIATION_SCAN_DAYS=2
+```
+
+### Triage workflow for discrepancies
+
+1. Open reconciliation result from admin batch/payout reconcile endpoints.
+2. Categorize by discrepancy code (`*_mismatch`, `stripe_transfer_missing`,
+   `stripe_transfer_lookup_failed`, etc.).
+3. For Stripe lookup failures, confirm transfer id/metadata linkage and API access health.
+4. For amount/status mismatches, correlate payout row, ledger rows, and Stripe transfer timeline.
+5. For stale `processing` or in-progress payouts, avoid duplicate payout actions; use retry/manual
+   actions after confirming current provider state.
+6. Document all interventions in ops ticketing with batch/payout IDs and timestamps.
+
+### Payout reversal operator notes
+
+- Endpoint: `POST /api/admin/settlements/payouts/:payoutId/reverse`
+- Preconditions: payout exists, has `externalTransferId`, status is `paid`.
+- Success effects:
+  - payout status updates to `reversed`,
+  - `reversalId`/`reversedAt` persisted,
+  - negative ledger posting created (`type: payout_reversal`).
+
+Idempotency expectation: already-reversed payouts should return a no-op response without creating
+another reversal entry.
+
+---
+
+## 6) Local manual test guidance (fast feedback)
+
+1. Wait for cron (or manually trigger settlement schedule endpoint from admin).
+2. Confirm entries move to `scheduled`, with a new `SettlementBatch` + `SettlementPayout` rows.
+3. Execute the batch from admin endpoint.
+4. Validate one of:
    - `paid` + `externalTransferId` present (Stripe happy path), or
    - `manual_required` export generated when Stripe account prerequisites are absent.
 
@@ -206,7 +249,7 @@ Other common no-op reasons: `no_pending_entries` and `no_positive_payouts`.
 
 ---
 
-## 6) Operator fallback runbook (manual payouts + CSV export)
+## 7) Operator fallback runbook (manual payouts + CSV export)
 
 When `manual_required` payouts exist, follow this short procedure:
 

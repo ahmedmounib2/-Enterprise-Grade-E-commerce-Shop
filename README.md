@@ -83,7 +83,13 @@
     - [Stock reservation \& restoration (variant-aware)](#stock-reservation--restoration-variant-aware)
     - [Failure \& expired session handling](#failure--expired-session-handling)
     - [Seller settlements, ledger lifecycle, and payout execution](#seller-settlements-ledger-lifecycle-and-payout-execution)
-    - [Stripe Connect prerequisites (seller payouts)](#stripe-connect-prerequisites-seller-payouts)
+    - [Settlement Reconciliation \& Payout Recovery](#settlement-reconciliation--payout-recovery)
+      - [1) Reconciliation Architecture (Backend)](#1-reconciliation-architecture-backend)
+      - [2) Cron Job for Reconciliation](#2-cron-job-for-reconciliation)
+      - [3) Environment Variables](#3-environment-variables)
+      - [4) Admin Reconciliation Endpoints and UI Usage](#4-admin-reconciliation-endpoints-and-ui-usage)
+      - [5) Payout Reversals](#5-payout-reversals)
+      - [6) Runbook Linkage](#6-runbook-linkage)
   - [Products, variants \& model behavior](#products-variants--model-behavior)
   - [Dynamic categories system (tree + drag-and-drop)](#dynamic-categories-system-tree--drag-and-drop)
     - [Data model \& flags](#data-model--flags)
@@ -1585,7 +1591,200 @@ SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked # Allows tests to proceed whe
 Common `created: false` reasons include `no_pending_entries`, `period_not_eligible`,
 `no_positive_payouts`, and `duplicate`.
 
-### Stripe Connect prerequisites (seller payouts)
+### Settlement Reconciliation & Payout Recovery
+
+This sprint adds a dedicated reconciliation + recovery layer on top of settlement
+scheduling/execution so operators can continuously verify data integrity between internal records
+and Stripe.
+
+#### 1) Reconciliation Architecture (Backend)
+
+The reconciliation service runs two primary checks:
+
+- **Batch consistency checks** (`checkBatchConsistency`):
+  - Compares total `LedgerEntry.amountCents` values (including `paid` sums) against
+    `SettlementBatch` and summed `SettlementPayout` totals.
+  - Flags mismatches such as:
+    - `batch_total_vs_ledger_total_mismatch`
+    - `batch_total_vs_payout_total_mismatch`
+    - `seller_payout_mismatch`
+- **Payout-vs-Stripe checks** (`checkPayoutWithStripe`):
+  - Validates payout amount and status against Stripe transfer state.
+  - Detects missing/failed transfer lookups, amount mismatches, and status drift:
+    - `stripe_transfer_lookup_failed`
+    - `stripe_transfer_missing`
+    - `stripe_amount_mismatch`
+    - `stripe_status_mismatch`
+- **Stuck processing / in-progress recovery intent**:
+  - Payouts expose `status`, `processingAt`, `inProgress`, `inProgressAt`, `idempotencyKey`, and
+    `externalTransferId` so operators can identify stuck or partial executions and safely drive
+    retry/manual intervention paths.
+  - Admin UI highlights long-running processing rows (15+ minutes) to prompt investigation before
+    duplicate actions.
+
+**Data flow (what reconciliation traverses):**
+
+`SettlementBatch` -> `SettlementPayout` rows -> `LedgerEntry` rows (`settlementBatchId`) -> Stripe
+transfer (`externalTransferId` or payout/batch metadata lookup).
+
+**Expected outputs:**
+
+- `ok: true` means the reconciliation result is effectively **OK**.
+- `ok: false` returns discrepancy categories/codes and actionable details (`batchId`, `payoutId`,
+  expected vs actual amounts, Stripe lookup method, statuses, and timestamps) so finance/admin can
+  triage without DB inspection.
+
+#### 2) Cron Job for Reconciliation
+
+- Reconciliation cron is controlled by `startSettlementReconciliationJob` and runs on
+  `SETTLEMENT_RECONCILIATION_CRON`.
+- Every cycle computes a rolling scan window using `SETTLEMENT_RECONCILIATION_SCAN_DAYS` and scans:
+  - recent `SettlementBatch` records,
+  - recent terminal payouts (`paid`, `failed`, `manual_required`).
+- For each entity, it executes batch/payout reconciliation checks and:
+  - logs warnings for discrepancies,
+  - logs a cycle summary (`ok` vs `discrepancies`),
+  - sends a role-based reconciliation report email to users resolved from
+    `SETTLEMENT_RECONCILIATION_REPORT_ROLES`.
+
+**Where results are reported + review ownership:**
+
+- Application logs (`Settlement reconciliation cycle started/completed`, discrepancy warnings).
+- Reconciliation summary emails (via configured role recipients).
+- Expected reviewers: admin/ops/finance users mapped to report roles (`admin,staff` is the current
+  recommended baseline).
+
+**Operational cadence recommendation:**
+
+- **Development:** run every 15 minutes with 1-day scan window for fast feedback.
+- **Production:** run once daily (e.g., `15 2 * * *`) with 2-day window for late Stripe updates and
+  overnight reconciliation.
+
+#### 3) Environment Variables
+
+Copy/paste-ready reconciliation config:
+
+```env
+# settlements reconciliation config vars (recommended development values)
+SETTLEMENT_RECONCILIATION_ENABLED=true
+SETTLEMENT_RECONCILIATION_REPORT_ROLES=admin,staff
+SETTLEMENT_RECONCILIATION_CRON=*/15 * * * *
+SETTLEMENT_RECONCILIATION_TIMEZONE=UTC
+SETTLEMENT_RECONCILIATION_SCAN_DAYS=1
+
+# settlements reconciliation config vars (recommended production values)
+SETTLEMENT_RECONCILIATION_ENABLED=true
+SETTLEMENT_RECONCILIATION_REPORT_ROLES=admin,staff
+SETTLEMENT_RECONCILIATION_CRON=15 2 * * *
+SETTLEMENT_RECONCILIATION_TIMEZONE=UTC
+SETTLEMENT_RECONCILIATION_SCAN_DAYS=2
+```
+
+Variable notes:
+
+- `SETTLEMENT_RECONCILIATION_ENABLED`: enables/disables the reconciliation scheduler.
+- `SETTLEMENT_RECONCILIATION_REPORT_ROLES`: comma/semicolon-separated roles used to build recipient
+  lists from user records.
+- `SETTLEMENT_RECONCILIATION_CRON`: cron expression for cycle timing.
+- `SETTLEMENT_RECONCILIATION_TIMEZONE`: timezone applied by the cron scheduler.
+- `SETTLEMENT_RECONCILIATION_SCAN_DAYS`: retrospective window for scanned batches/payouts.
+  - Use **2 days** for faster production scans with reasonable delayed-event tolerance.
+  - Use **7 days** when delayed Stripe updates/webhook lag is common and safety coverage is favored
+    over scan cost.
+
+#### 4) Admin Reconciliation Endpoints and UI Usage
+
+**Permissions:** all `/api/admin/*` settlement reconciliation endpoints are protected by
+`protectRoute` + `restrictTo('admin')`.
+
+**Endpoints:**
+
+- `GET /api/admin/settlements/:batchId/reconcile`
+- `GET /api/admin/settlements/payouts/:payoutId/reconcile`
+
+Expected response shapes:
+
+```json
+{
+  "ok": true,
+  "batchId": "...",
+  "status": "scheduled",
+  "totals": {
+    "batchTotalAmountCents": 12345,
+    "payoutTotalAmountCents": 12345,
+    "ledgerTotalAmountCents": 12345
+  },
+  "discrepancies": [],
+  "checkedAt": "2026-01-01T00:00:00.000Z"
+}
+```
+
+```json
+{
+  "ok": false,
+  "payoutId": "...",
+  "batchId": "...",
+  "internalStatus": "paid",
+  "externalTransferId": "tr_...",
+  "lookupMethod": "externalTransferId",
+  "discrepancies": [
+    {
+      "code": "stripe_amount_mismatch",
+      "expectedAmountCents": 1000,
+      "actualAmountCents": 900
+    }
+  ],
+  "checkedAt": "2026-01-01T00:00:00.000Z"
+}
+```
+
+**Admin UI behavior:**
+
+- Batch and payout rows expose **Run Reconciliation** actions.
+- Results are attached to the row and rendered in mismatch detail tables (type/internal ID/external
+  ID/reason), making discrepancies visible inline for operations triage.
+- Stale `processing` rows are visibly flagged to nudge recovery actions (retry/manual/review) before
+  further payout operations.
+
+#### 5) Payout Reversals
+
+Reverse payout endpoint:
+
+- `POST /api/admin/settlements/payouts/:payoutId/reverse`
+
+Behavior + prerequisites:
+
+- Requires valid payout id and existing payout.
+- Requires `externalTransferId` (Stripe transfer reference).
+- Reversal is only allowed when payout status is `paid`.
+- Already reversed payouts return idempotent no-op semantics (`status: reversed`, existing
+  `reversalId` returned).
+- Service calls Stripe `transfers.createReversal(...)` and persists `reversalId`,
+  `reversalRequestedAt`, and `reversedAt`.
+
+Status transitions + ledger impact:
+
+- `paid` -> `reversed` on success.
+- Creates a negative ledger entry:
+  - `type: payout_reversal`
+  - `amountCents: -abs(original payout amount)`
+  - `referenceType: payout`, `referenceId: payoutId`
+  - idempotency key `settlement-reversal:<payoutId>`
+- This preserves auditability of reversal intent + execution without mutating historical ledger
+  rows.
+
+Operator safeguards:
+
+- UI presents a confirmation modal before issuing reversal.
+- Endpoint is admin-only.
+- Reversal flow is designed for idempotent/deduplicated retries: once reversed, subsequent calls do
+  not create additional reversal ledger effects.
+
+#### 6) Runbook Linkage
+
+For incident handling, remediation sequencing, and operator SOP details, use:
+
+- [`docs/settlements-runbook.md`](docs/settlements-runbook.md)
 
 For automatic settlement transfers, each seller must have:
 
