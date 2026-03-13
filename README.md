@@ -90,6 +90,7 @@
       - [4) Admin Reconciliation Endpoints and UI Usage](#4-admin-reconciliation-endpoints-and-ui-usage)
       - [5) Payout Reversals](#5-payout-reversals)
       - [6) Runbook Linkage](#6-runbook-linkage)
+    - [Stripe Connect prerequisites (seller payouts)](#stripe-connect-prerequisites-seller-payouts)
   - [Products, variants \& model behavior](#products-variants--model-behavior)
   - [Dynamic categories system (tree + drag-and-drop)](#dynamic-categories-system-tree--drag-and-drop)
     - [Data model \& flags](#data-model--flags)
@@ -1593,7 +1594,7 @@ Common `created: false` reasons include `no_pending_entries`, `period_not_eligib
 
 ### Settlement Reconciliation & Payout Recovery
 
-This sprint adds a dedicated reconciliation + recovery layer on top of settlement
+This section documents the dedicated reconciliation + recovery layer on top of settlement
 scheduling/execution so operators can continuously verify data integrity between internal records
 and Stripe.
 
@@ -1785,6 +1786,8 @@ Operator safeguards:
 For incident handling, remediation sequencing, and operator SOP details, use:
 
 - [`docs/settlements-runbook.md`](docs/settlements-runbook.md)
+
+### Stripe Connect prerequisites (seller payouts)
 
 For automatic settlement transfers, each seller must have:
 
