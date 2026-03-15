@@ -83,6 +83,19 @@
     - [Stock reservation \& restoration (variant-aware)](#stock-reservation--restoration-variant-aware)
     - [Failure \& expired session handling](#failure--expired-session-handling)
     - [Seller settlements, ledger lifecycle, and payout execution](#seller-settlements-ledger-lifecycle-and-payout-execution)
+    - [Reserve / Holdback Policy (implemented architecture)](#reserve--holdback-policy-implemented-architecture)
+      - [1) Policy model implemented in this repo](#1-policy-model-implemented-in-this-repo)
+      - [2) Ledger contract for reserves](#2-ledger-contract-for-reserves)
+      - [3) Risk tiers, percentage resolution, and env defaults](#3-risk-tiers-percentage-resolution-and-env-defaults)
+      - [Per-seller special agreements](#per-seller-special-agreements)
+      - [4) Reserve release cron job (design + operations)](#4-reserve-release-cron-job-design--operations)
+      - [5) Fixed reserve vs rolling reserve (when to choose each)](#5-fixed-reserve-vs-rolling-reserve-when-to-choose-each)
+      - [6) Admin reserve APIs and UI](#6-admin-reserve-apis-and-ui)
+      - [7) Manual test plan (reserve flows)](#7-manual-test-plan-reserve-flows)
+    - [Ledger Adjustment Service](#ledger-adjustment-service)
+      - [What it does](#what-it-does)
+      - [API surface](#api-surface)
+      - [Frontend admin panel](#frontend-admin-panel)
     - [Settlement Reconciliation \& Payout Recovery](#settlement-reconciliation--payout-recovery)
       - [1) Reconciliation Architecture (Backend)](#1-reconciliation-architecture-backend)
       - [2) Cron Job for Reconciliation](#2-cron-job-for-reconciliation)
@@ -1591,6 +1604,252 @@ SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked # Allows tests to proceed whe
 
 Common `created: false` reasons include `no_pending_entries`, `period_not_eligible`,
 `no_positive_payouts`, and `duplicate`.
+
+### Reserve / Holdback Policy (implemented architecture)
+
+The reserve system is designed to reduce platform exposure to post-payout refunds/disputes while
+keeping seller payouts predictable and auditable.
+
+#### 1) Policy model implemented in this repo
+
+This implementation currently uses a **fixed-percentage reserve** model at settlement time:
+
+- For each seller with positive net payable in `scheduleNextBatch`, the system computes:
+  - `reserveAmountCents = floor(netPayable * reservePercentage)`
+  - `payoutAmountCents = netPayable - reserveAmountCents`
+- A negative `LedgerEntry(type='reserve', payoutStatus='reserved')` is created for the withheld
+  amount.
+- A `SettlementPayout` is created only for `payoutAmountCents`.
+- Reserve ledger entries are intentionally not attached to a settlement batch (`settlementBatchId`
+  stays unset), preserving reserve lifecycle independence.
+
+Core files:
+
+- `backend/src/services/settlements/settlementScheduler.service.js`
+- `backend/src/services/reserves/reserve.service.js`
+- `backend/src/models/ledgerEntry.model.js`
+- `backend/src/models/seller.model.js`
+
+#### 2) Ledger contract for reserves
+
+`LedgerEntry` now includes reserve movement types:
+
+- `reserve` (negative): withheld funds
+- `reserve_release` (positive): funds released back to payout flow
+- `reserve_used` (negative): reserve consumed to offset refund/debt
+
+Reserve tracking fields:
+
+- `reserveMonth` (`YYYY-MM`)
+- `withheldAt`
+- `releaseScheduledAt`
+- `metadata` (reason, actor, tier, percentage, original months)
+- `payoutStatus='reserved'` for hold-state entries
+
+Auditability guarantee: reserve rows are immutable movement records; releases/usages add new rows
+instead of mutating historical reserve entries.
+
+#### 3) Risk tiers, percentage resolution, and env defaults
+
+Per-seller config is stored on `Seller.reserveConfig`:
+
+- `percentage`
+- `tier` (`new | established | pro | high_risk`)
+- `updatedAt`, `updatedBy`
+
+Percentage resolution order (implemented):
+
+1. Seller override (`seller.reserveConfig.percentage`)
+2. Tier env default (`RESERVE_PERCENTAGE_<TIER>`)
+3. Fallback `RESERVE_PERCENTAGE_DEFAULT` (or `0` if unset)
+
+Recommended env defaults:
+
+```env
+# Reserve policy (production)
+RESERVE_PERCENTAGE_NEW=15
+RESERVE_PERCENTAGE_ESTABLISHED=5
+RESERVE_PERCENTAGE_PRO=2
+RESERVE_PERCENTAGE_HIGH_RISK=25
+DEFAULT_RESERVE_TIER=new
+DEFAULT_RESERVE_PERCENTAGE_NEW=15
+RESERVE_MIN_HOLD_DAYS=14
+RESERVE_RELEASE_CRON="0 2 * * *"
+RESERVE_RELEASE_TZ=UTC
+RESERVE_RELEASE_JOB_ENABLED=true
+
+
+# Reserve policy (dev/test fast cycle)
+RESERVE_PERCENTAGE_NEW=10
+RESERVE_PERCENTAGE_ESTABLISHED=5
+RESERVE_PERCENTAGE_PRO=2
+RESERVE_PERCENTAGE_HIGH_RISK=20
+DEFAULT_RESERVE_TIER=new
+DEFAULT_RESERVE_PERCENTAGE_NEW=10
+
+# Make reserves releasable quickly
+RESERVE_MIN_HOLD_DAYS=0
+
+# Run release job every 2 minutes
+RESERVE_RELEASE_CRON="*/2 * * * *"
+RESERVE_RELEASE_TZ=UTC
+RESERVE_RELEASE_JOB_ENABLED=true
+
+```
+
+#### Per-seller special agreements
+
+When operations/legal approves a special reserve arrangement for a specific seller, use **Admin →
+Reserves** and follow this workflow so pricing logic and audits stay consistent:
+
+1. Open the seller in the reserves tab and choose the reserve tier (`new`, `established`, `pro`,
+   `high_risk`). This tier maps to the configured environment defaults (`RESERVE_PERCENTAGE_<TIER>`)
+   and is the recommended option when the seller should follow policy baseline.
+2. Decide how percentage is applied in UI:
+   - **Use tier default**: keep percentage aligned to the selected tier's configured env value.
+   - **Custom override**: choose custom and set a seller-specific percentage in the same reserves
+     tab when a negotiated exception is approved.
+3. Record a clear business reason in the admin action reason field (for example:
+   `signed_enterprise_addendum_q3` or `temporary_chargeback_ramp_down`) so finance/support can trace
+   why the override exists.
+
+Runtime resolution still follows the documented order (seller override first, then tier env
+default), so UI choices are deterministic and auditable.
+
+#### 4) Reserve release cron job (design + operations)
+
+A dedicated daily cron job (`backend/src/jobs/reserveRelease.js`) executes `runReserveReleaseJob()`.
+
+Eligibility logic used by the job:
+
+- `type='reserve'`
+- `payoutStatus='reserved'`
+- `releaseScheduledAt <= now`
+- `reserveMonth != currentMonth`
+
+Processing behavior:
+
+- Groups eligible reserves by seller/currency/month set
+- Creates `reserve_release` entries as `payoutStatus='pending'` so normal settlements can pick them
+  up
+- If seller has negative pending non-reserve balance, reserves are applied via `reserve_used`
+  instead of releasing
+
+Operational notes:
+
+- Start from `backend/src/server.js` through `startReserveReleaseJob()`.
+- Invalid cron expression logs warning and skips job registration.
+- Job is independent from settlement scheduler cadence.
+
+#### 5) Fixed reserve vs rolling reserve (when to choose each)
+
+**Implemented here: Fixed reserve (recommended baseline)**
+
+- Each settlement withholds a deterministic percentage of that period's payable amount.
+- Simpler to explain to sellers/admins and easier to audit from ledger rows.
+- Best when you want transparent policy and straightforward monthly release accounting.
+
+**Alternative: Rolling reserve (not currently implemented)**
+
+- Holds a moving window of recent payouts (e.g., 10% of last 90 days) and continuously recalculates
+  target reserve.
+- Better for highly volatile risk profiles or long-tail dispute windows.
+- More complex reconciliation, seller communication, and accounting treatment.
+
+Choose rolling when risk volatility materially changes within the hold horizon; otherwise fixed is
+usually easier operationally.
+
+#### 6) Admin reserve APIs and UI
+
+Backend endpoints (`/api/admin/reserves`):
+
+- `GET /summary`
+- `GET /sellers/:sellerId`
+- `POST /release`
+- `POST /increase`
+- `POST /update-config`
+
+Frontend admin UI:
+
+- `frontend/src/components/AdminReservesPanel.jsx`
+- `frontend/src/stores/useAdminReservesStore.js`
+- Admin tab mounted in `frontend/src/pages/AdminPage.jsx`.
+
+Manual overrides require reason fields and capture actor metadata for audit trails.
+
+**Audit model:** reserve audit is designed as immutable movement + action history.
+
+- Financial movement audit: ledger rows (`reserve`, `reserve_release`, `reserve_used`) are append-
+  only records, so historical reserve activity is preserved instead of rewritten.
+- Admin action audit: each manual reserves action (`update-config`, `release`, `increase`) stores
+  actor identity, reason text, selected tier, effective percentage, and operation timestamp.
+- Visibility in UI: in **Admin → Reserves**, open seller details and inspect the audit/history rows
+  to review who changed what, why it was changed, and which tier/custom percentage was applied.
+- Operational intent: finance/compliance can reconstruct both policy intent (tier/env baseline vs
+  custom override) and monetary effect (ledger movements) without mutating prior records.
+
+#### 7) Manual test plan (reserve flows)
+
+1. Configure reserve env vars (`RESERVE_PERCENTAGE_*`, `RESERVE_MIN_HOLD_DAYS`) and run backend.
+2. Ensure a seller has positive pending ledger net.
+3. Trigger scheduler (`POST /api/admin/settlements/schedule`).
+4. Verify new `reserve` ledger row exists and payout amount is net of reserve.
+5. Move time forward (or seed old `releaseScheduledAt`) and run reserve release cycle.
+6. Verify `reserve_release` appears as `payoutStatus='pending'`.
+7. Trigger next settlement schedule and confirm released amount is included in payable pipeline.
+8. Simulate refund after payout and verify `reserve_used` is created before remaining debt carry.
+9. Use admin reserve endpoints to test manual release/increase/update-config with audit metadata.
+
+Operator checklist (quick):
+
+- update config (tier env default or custom value in Admin → Reserves)
+- verify audit row (actor, reason, tier, percentage, timestamp)
+
+---
+
+### Ledger Adjustment Service
+
+This section is about a dedicated admin adjustment service for non-order financial corrections.
+
+#### What it does
+
+`createAdjustment({ sellerId, amountCents, currency, reason, actor })` in
+`backend/src/services/ledger/adjustment.service.js` creates immutable
+`LedgerEntry(type='adjustment')` rows for manual corrections (credits/debits).
+
+Key behavior:
+
+- Validates `sellerId`, integer/non-zero `amountCents`, and non-empty `reason`
+- Resolves currency fallback in this order:
+  1. explicit `currency` argument
+  2. `PLATFORM_CURRENCY`
+  3. `SETTLEMENT_CURRENCY`
+  4. `USD`
+- Uses non-order references (`referenceType='adjustment'`, `reference.orderId=null`)
+- Persists `reason` and `actor` for audit/filtering
+
+#### API surface
+
+Admin endpoints:
+
+- `POST /api/admin/ledger/adjustments` – create adjustment
+- `GET /api/admin/ledger/adjustments` – list/filter adjustments (seller/date/reason/pagination)
+
+Controller: `backend/src/controllers/ledger.controller.js` Route wiring:
+
+#### Frontend admin panel
+
+- Store: `frontend/src/stores/useAdminAdjustmentsStore.js`
+- UI: `frontend/src/components/AdminAdjustmentsPanel.jsx`
+- Mounted in Admin tabs via `frontend/src/pages/AdminPage.jsx`
+
+Supported workflows:
+
+- Create debit/credit adjustments per seller
+- Filter history by seller, date range, reason
+- Review paginated, audit-oriented adjustment history
+
+---
 
 ### Settlement Reconciliation & Payout Recovery
 
