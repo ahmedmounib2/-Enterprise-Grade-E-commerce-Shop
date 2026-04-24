@@ -89,7 +89,8 @@ Automatic settlement payout requires seller-level prerequisites:
 SETTLEMENT_PERIOD_DAYS=15
 SETTLEMENT_HOLD_DAYS=3
 SETTLEMENT_CRON="0 0 * * *"
-SETTLEMENT_TZ="UTC"
+SETTLEMENT_TZ="Africa/Cairo"  # display formatting only; boundaries remain UTC
+SETTLEMENT_SCHEDULER_TZ="UTC"
 SETTLEMENT_CURRENCY="USD"
 SETTLEMENT_LOCK_KEY=lock:settlement_scheduler
 SETTLEMENT_LOCK_TTL_SECONDS=120
@@ -108,7 +109,8 @@ SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=skip_cycle
 SETTLEMENT_PERIOD_DAYS=15
 SETTLEMENT_HOLD_DAYS=3
 SETTLEMENT_CRON="0 0 * * *"   # daily
-SETTLEMENT_TZ="UTC"
+SETTLEMENT_TZ="Africa/Cairo"  # display formatting only; boundaries remain UTC
+SETTLEMENT_SCHEDULER_TZ="UTC"
 SETTLEMENT_CURRENCY="USD"
 ```
 
@@ -118,11 +120,16 @@ SETTLEMENT_CURRENCY="USD"
 SETTLEMENT_PERIOD_DAYS=1
 SETTLEMENT_HOLD_DAYS=0
 SETTLEMENT_CRON="*/2 * * * *" # every 2 min
-SETTLEMENT_TZ="UTC"
+SETTLEMENT_TZ="Africa/Cairo"  # display formatting only; boundaries remain UTC
+SETTLEMENT_SCHEDULER_TZ="UTC"
 SETTLEMENT_CURRENCY="USD"
 ```
 
 Use very short hold periods plus frequent scheduler intervals for local manual tests.
+
+Migration note: `SETTLEMENT_TZ` is display-only metadata for UI consumers. Use
+`SETTLEMENT_SCHEDULER_TZ` to control cron execution timezone. Settlement period boundaries remain
+UTC.
 
 ### Lock configuration by environment
 
@@ -180,6 +187,112 @@ SETTLEMENT_RECONCILIATION_CRON=15 2 * * *
 SETTLEMENT_RECONCILIATION_TIMEZONE=UTC
 SETTLEMENT_RECONCILIATION_SCAN_DAYS=2
 ```
+
+### COD payout reconciliation job
+
+Purpose:
+
+- scans stale COD refund records that are still `in_progress`
+- fetches provider payout status (`CHIMONEY_PAYOUT_STATUS_PATH`)
+- marks records completed on terminal success
+- marks unresolved items for manual review with explicit failure codes
+
+Required config:
+
+- `COD_PAYOUT_ADAPTER` (`COD_PAYOUT_PROVIDER` is still accepted as fallback alias)
+- `CHIMONEY_API_KEY`
+- `CHIMONEY_BASE_URL` (use `https://api-sandbox.chimoney.io` for local/dev/testing environments)
+- `CHIMONEY_WEBHOOK_SECRET`
+- `CHIMONEY_PAYOUT_STATUS_PATH`
+- `COD_PAYOUT_RECONCILIATION_ENABLED`
+- `COD_PAYOUT_RECONCILIATION_CRON`
+- `COD_PAYOUT_RECONCILIATION_TIMEZONE`
+- `COD_PAYOUT_RECONCILIATION_AGE_MINUTES`
+
+Auth/header expectations:
+
+- Chimoney requests use `X-API-KEY: <CHIMONEY_API_KEY>`.
+- Webhook reconciliation/matching depends on `idempotencyKey` first, with `providerRefundId`
+  fallback.
+
+Dev/local recommended values:
+
+```env
+COD_PAYOUT_RECONCILIATION_ENABLED=true
+COD_PAYOUT_RECONCILIATION_CRON=*/1 * * * *
+COD_PAYOUT_RECONCILIATION_TIMEZONE=UTC
+COD_PAYOUT_RECONCILIATION_AGE_MINUTES=1
+CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}
+```
+
+Production safe values:
+
+```env
+COD_PAYOUT_RECONCILIATION_ENABLED=true
+COD_PAYOUT_RECONCILIATION_CRON=*/20 * * * *
+COD_PAYOUT_RECONCILIATION_TIMEZONE=UTC
+COD_PAYOUT_RECONCILIATION_AGE_MINUTES=45
+CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}
+```
+
+How to test:
+
+1. Seed an order refund record with `provider=cod_payout`, `providerStatus=in_progress`, and stale
+   `updatedAt`.
+2. Run one reconciliation cycle.
+3. Verify status changed to `completed` or `failed` with `reconciliation_*` failure codes.
+4. Confirm seller hold transition matches final refund status.
+
+Operational notes:
+
+- COD refund records use fixed category `provider=cod_payout` for payout-provider attempts.
+- Failed payout-provider states keep orders in `pending_refund` until webhook/reconciliation/manual
+  review resolves the case.
+- Provider metadata should remain sanitized (no raw account numbers; no raw webhook body unless
+  explicit debug storage is enabled).
+
+### COD refund error-rate alerting and dashboarding
+
+The COD refund workflow emits `cod_refund.execution.failure_by_error_code` with dimensions:
+
+- `provider`
+- `countryCode`
+- `paymentMethod`
+- `errorCode`
+- `providerMessage` (best-effort; useful for drill-down)
+
+The Chimoney adapter also emits `cod_payout.provider_error_code.count` with the same dimensions for
+provider-side error attribution before workflow persistence.
+
+Recommended alert baselines (rolling window):
+
+- `errorCode=beneficiary_validation_failed`: alert when count >= 5 in 15 minutes (per
+  `provider,countryCode`) because this often indicates onboarding/rules drift.
+- `errorCode=provider_invalid_request`: alert when count >= 8 in 10 minutes (per
+  `provider,paymentMethod`) because this usually means payload mapping regression or provider API
+  contract changes.
+- `errorCode=country_or_currency_missing`: alert when count >= 3 in 10 minutes (per
+  `provider,countryCode`) because this suggests config/data quality issues that will keep failing
+  until corrected.
+- Any repeated same `errorCode` + `providerMessage` pair >= 10 in 30 minutes should page ops for
+  manual intervention and temporary payout gating.
+
+Dashboard panel recommendation (Datadog/Grafana/New Relic equivalent):
+
+- Panel title: `COD Refund Failures by Error Code + Provider Message`
+- Query:
+  - metric: `cod_refund.execution.failure_by_error_code`
+  - filter: `provider:*`
+  - group by: `errorCode,providerMessage,provider`
+  - visualization: stacked time-series + companion table sorted by 1h count descending
+- Add template filters: `provider`, `countryCode`, `paymentMethod` to narrow corridors quickly.
+
+Troubleshooting stuck pending refunds:
+
+1. Check webhook delivery and ensure the event carries at least one matching key (`idempotencyKey`
+   or `providerRefundId`).
+2. Run/inspect reconciliation output for stale `in_progress` records.
+3. If unresolved, keep payout hold active and route to manual review before any new payout attempt.
 
 ### Triage workflow for discrepancies
 

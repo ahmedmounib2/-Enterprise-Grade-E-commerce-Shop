@@ -1,4 +1,4 @@
-# AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop
+# AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop (This repo only have documentation mirroring the project docs that lives in a separate private repo)
 
 > Production-ready, enterprise-grade e-commerce storefront (React + Vite frontend, Node.js + Express
 > backend) with:
@@ -15,7 +15,7 @@
 
 ## Table of contents
 
-- [AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop](#ahmedmonib-e-shop--enterprise-grade-e-commerce-shop)
+- [AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop (This repo only have documentation mirroring the project docs that lives in a separate private repo)](#ahmedmonib-e-shop--enterprise-grade-e-commerce-shop-this-repo-only-have-documentation-mirroring-the-project-docs-that-lives-in-a-separate-private-repo)
   - [Table of contents](#table-of-contents)
   - [Maintainer context](#maintainer-context)
   - [One-line pitch](#one-line-pitch)
@@ -26,6 +26,7 @@
     - [Common scripts](#common-scripts)
     - [Environment references](#environment-references)
     - [Multi-store / multi-tenant foundations](#multi-store--multi-tenant-foundations)
+    - [Platform admin store \& seller-dashboard context](#platform-admin-store--seller-dashboard-context)
     - [Seller onboarding flow (design \& implementation)](#seller-onboarding-flow-design--implementation)
       - [Entry points \& UX design](#entry-points--ux-design)
       - [Data model design (Seller + Store)](#data-model-design-seller--store)
@@ -63,6 +64,12 @@
     - [Mobile Category Tree v2 (dynamic categories)](#mobile-category-tree-v2-dynamic-categories)
     - [DaisyUI theming (web + mobile)](#daisyui-theming-web--mobile)
     - [Wishlist DTO \& API contract](#wishlist-dto--api-contract)
+    - [Public Store APIs](#public-store-apis)
+      - [`GET /api/public/store-details/:slug`](#get-apipublicstore-detailsslug)
+      - [`GET /api/public/stores/:id`](#get-apipublicstoresid)
+      - [`GET /api/public/stores/search`](#get-apipublicstoressearch)
+      - [Product payload note (`sellerSummary`)](#product-payload-note-sellersummary)
+      - [Frontend integration notes](#frontend-integration-notes)
   - [Deployment surfaces \& release workflow](#deployment-surfaces--release-workflow)
     - [Frontend (Vercel)](#frontend-vercel)
     - [Backend (Railway Docker image)](#backend-railway-docker-image)
@@ -80,9 +87,53 @@
     - [Stripe webhooks \& async handling — `stripeWebhook`](#stripe-webhooks--async-handling--stripewebhook)
     - [COD flow (Cash-on-Delivery) — `createCODOrder` \& `codCheckoutSuccess`](#cod-flow-cash-on-delivery--createcodorder--codcheckoutsuccess)
     - [COD eligibility policy, seller financial summary, and recovery path](#cod-eligibility-policy-seller-financial-summary-and-recovery-path)
+    - [Return request + COD refund workflow](#return-request--cod-refund-workflow)
+    - [Provider architecture \& adapter contract (COD payouts)](#provider-architecture--adapter-contract-cod-payouts)
+      - [Adapter input contract](#adapter-input-contract)
+      - [Adapter output contract](#adapter-output-contract)
+      - [Error handling notes (adapter layer)](#error-handling-notes-adapter-layer)
+      - [Design goals](#design-goals)
+      - [Runtime architecture (modules and responsibilities)](#runtime-architecture-modules-and-responsibilities)
+      - [End-to-end lifecycle (happy path)](#end-to-end-lifecycle-happy-path)
+      - [COD refund lifecycle (state-focused)](#cod-refund-lifecycle-state-focused)
+      - [State model and transitions](#state-model-and-transitions)
+      - [Data model mapping (what lives where)](#data-model-mapping-what-lives-where)
+      - [Failure handling strategy](#failure-handling-strategy)
+      - [Transaction boundaries and consistency model](#transaction-boundaries-and-consistency-model)
+      - [Observability model](#observability-model)
+      - [Runtime tuning envs and design impact](#runtime-tuning-envs-and-design-impact)
+      - [Security model](#security-model)
+    - [Extending to a new provider (implementation checklist)](#extending-to-a-new-provider-implementation-checklist)
+      - [Idempotency behavior (safe retries)](#idempotency-behavior-safe-retries)
+      - [How to detect stuck refunds / payouts](#how-to-detect-stuck-refunds--payouts)
+      - [Safe stuck-refund retry procedure (runbook condensed)](#safe-stuck-refund-retry-procedure-runbook-condensed)
+      - [Chimoney sandbox/config expectations](#chimoney-sandboxconfig-expectations)
+      - [Chimoney webhook endpoint setup (sandbox dashboard)](#chimoney-webhook-endpoint-setup-sandbox-dashboard)
+    - [Cron jobs added for COD payout resiliency](#cron-jobs-added-for-cod-payout-resiliency)
+      - [1) COD payout reconciliation cron](#1-cod-payout-reconciliation-cron)
+      - [2) COD refund details purge cron](#2-cod-refund-details-purge-cron)
+    - [Key rotation \& webhook replay procedures](#key-rotation--webhook-replay-procedures)
+      - [Rotate Chimoney API key safely](#rotate-chimoney-api-key-safely)
+      - [Rotate Chimoney webhook secret safely](#rotate-chimoney-webhook-secret-safely)
+      - [Replay webhook (admin/on-call detailed)](#replay-webhook-adminon-call-detailed)
+      - [Troubleshooting: stuck pending refunds](#troubleshooting-stuck-pending-refunds)
+      - [COD refund record API example (sanitized fields)](#cod-refund-record-api-example-sanitized-fields)
     - [Stock reservation \& restoration (variant-aware)](#stock-reservation--restoration-variant-aware)
     - [Failure \& expired session handling](#failure--expired-session-handling)
     - [Seller settlements, ledger lifecycle, and payout execution](#seller-settlements-ledger-lifecycle-and-payout-execution)
+    - [Admin marketplace financials API (`/api/admin/platform-financials/*`)](#admin-marketplace-financials-api-apiadminplatform-financials)
+      - [`GET /api/admin/platform-financials/summary`](#get-apiadminplatform-financialssummary)
+      - [`GET /api/admin/platform-financials/ledger`](#get-apiadminplatform-financialsledger)
+      - [`GET /api/admin/platform-financials/liabilities`](#get-apiadminplatform-financialsliabilities)
+    - [Seller financial summary behavior updates](#seller-financial-summary-behavior-updates)
+    - [Frontend financial documentation updates](#frontend-financial-documentation-updates)
+      - [Seller dashboard financials scoping](#seller-dashboard-financials-scoping)
+      - [Operator rows in seller ledger](#operator-rows-in-seller-ledger)
+      - [Admin marketplace financials scope switcher](#admin-marketplace-financials-scope-switcher)
+      - [UI diagram (scope flow)](#ui-diagram-scope-flow)
+    - [Release notes — accounting and financial UI refactor](#release-notes--accounting-and-financial-ui-refactor)
+      - [Consolidated changes in this release](#consolidated-changes-in-this-release)
+      - [Frontend action required (short checklist)](#frontend-action-required-short-checklist)
     - [Reserve / Holdback Policy (implemented architecture)](#reserve--holdback-policy-implemented-architecture)
       - [1) Policy model implemented in this repo](#1-policy-model-implemented-in-this-repo)
       - [2) Ledger contract for reserves](#2-ledger-contract-for-reserves)
@@ -91,6 +142,11 @@
       - [4) Reserve release cron job (design + operations)](#4-reserve-release-cron-job-design--operations)
       - [5) Fixed reserve vs rolling reserve (when to choose each)](#5-fixed-reserve-vs-rolling-reserve-when-to-choose-each)
       - [6) Admin reserve APIs and UI](#6-admin-reserve-apis-and-ui)
+        - [`GET /api/admin/reserves/summary`](#get-apiadminreservessummary)
+        - [`GET /api/admin/reserves/sellers/:sellerId`](#get-apiadminreservessellerssellerid)
+        - [`POST /api/admin/reserves/release`](#post-apiadminreservesrelease)
+        - [`POST /api/admin/reserves/increase`](#post-apiadminreservesincrease)
+        - [`POST /api/admin/reserves/update-config`](#post-apiadminreservesupdate-config)
       - [7) Manual test plan (reserve flows)](#7-manual-test-plan-reserve-flows)
     - [Ledger Adjustment Service](#ledger-adjustment-service)
       - [What it does](#what-it-does)
@@ -124,6 +180,7 @@
   - [Security \& observability](#security--observability)
   - [Testing \& CI](#testing--ci)
     - [How to run tests](#how-to-run-tests)
+    - [How to test the COD refund purge cron job](#how-to-test-the-cod-refund-purge-cron-job)
     - [Test status](#test-status)
   - [How to run locally (no Docker)](#how-to-run-locally-no-docker)
     - [Local HTTPS for development (optional but recommended)](#local-https-for-development-optional-but-recommended)
@@ -273,6 +330,43 @@ until you are ready to launch in production, then flip it to `true` in `.env.pro
 - Keep backend/frontend flags aligned per environment so APIs and UI stay in sync (for example,
   mirror KYC flags with `VITE_FEATURE_SELLER_KYC=true` in `frontend/.env` and your Vercel
   environment settings when needed).
+
+### Platform admin store & seller-dashboard context
+
+The platform (main website) storefront is provisioned as a normal `Seller` + `Store` pair so
+first-party products and payouts use the same architecture as marketplace sellers.
+
+- **Idempotent ensure at server startup**
+  - On backend startup, `ensureAdminStore` ensures platform records exist.
+  - If platform seller/store already exist, they are updated safely; if missing, they are created.
+- **Provisioning defaults**
+  - Seller slug defaults to `admin` (override-aware by env conventions in code paths).
+  - Seller is ensured as `status: active` and `kyc.status: verified`.
+  - Store slug defaults to `admin-store`.
+  - Store name is configurable with `ADMIN_STORE_NAME` (fallback: `Admin Store`).
+- **Admin/staff seller-dashboard behavior**
+  - `requireSeller` maps `admin`/`staff` users to platform seller context (`req.seller` and
+    `req.context.sellerId`) so `/api/seller/*` routes are seller-scoped to the platform store.
+  - Seller Orders routes allow `seller`, `admin`, and `staff` roles while still enforcing seller
+    scope through `req.context.sellerId`.
+- **Platform product behavior**
+  - Products created in platform seller context are created live (`approvalStatus=approved`,
+    `visibility=visible`, `hidden=false`).
+  - Platform seller context bypasses Free/Pro product count and featured-item caps.
+  - Admin product edits no longer overwrite ownership (`sellerId` / `storeId`) on existing products.
+- **Store access behavior**
+  - Protected `GET /api/stores/:id` supports authenticated admin/staff (or owner) retrieval.
+  - Public `GET /api/stores/:slug` eligibility rules remain unchanged for regular sellers
+    (`status=active` + `kyc.status=verified`).
+- **Financials scope for platform seller dashboard**
+  - Platform seller financial summary/ledger on seller dashboard is scoped to platform-owned orders
+    only (entries tied to orders containing platform-seller items), avoiding marketplace-wide
+    liability noise.
+- **Related env vars**
+  - `PLATFORM_SELLER_ID`
+  - `PLATFORM_SELLER_SLUG` (optional fallback behavior in code)
+  - `ADMIN_STORE_ID`
+  - `ADMIN_STORE_NAME`
 
 ### Seller onboarding flow (design & implementation)
 
@@ -1013,6 +1107,65 @@ Key implementation files:
 All three surfaces share the same shape, so adding wishlist toggles or badges in any client only
 requires UI work—the network contract and cached data stay in sync automatically.
 
+### Public Store APIs
+
+Use these endpoints for customer-facing storefront discovery and public seller identity surfaces.
+
+#### `GET /api/public/store-details/:slug`
+
+Returns full public storefront details for a specific store slug, including approved branding and
+profile fields plus storefront policy content (for example banner assets, About/profile metadata,
+and policy blocks used on public store pages and checkout policy display).
+
+#### `GET /api/public/stores/:id`
+
+Returns a minimal store summary payload intended for lightweight cards, references, and seller
+identity snippets:
+
+- `id`
+- `slug`
+- `name`
+- `logoUrl`
+- `description`
+
+#### `GET /api/public/stores/search`
+
+Primary endpoint for storefront and store discovery search.
+
+**Query params**
+
+- `q` — search keyword text
+- `limit` — page size
+- `page` — 1-based page index
+
+**Response shape**
+
+```json
+{
+  "data": ["stores"],
+  "meta": {
+    "page": 1,
+    "limit": 12,
+    "total": 120,
+    "totalPages": 10
+  }
+}
+```
+
+#### Product payload note (`sellerSummary`)
+
+Public product payloads now include `sellerSummary` so storefront, listing, and PDP experiences can
+render public seller identity consistently without an additional lookup in common UI paths.
+
+#### Frontend integration notes
+
+- For store discovery and storefront search, use `GET /api/public/stores/search` (not legacy search
+  routes/response conventions).
+- Search response parsing should read:
+  - `response.data.data` for stores
+  - `response.data.meta.total` for total count
+- This replaces legacy key paths such as `stores`, `results`, or `count`.
+
 ---
 
 ## Deployment surfaces & release workflow
@@ -1362,23 +1515,647 @@ COD checkout now enforces a seller-level **negative outstanding ledger balance p
   ```
 
 - Seller financial summary endpoint: `GET /api/seller/financials/summary`
-  - Returns current policy inputs/decision for seller dashboards and support tooling:
+- Returns current policy inputs/decision, reserve status, and seller-scoped liabilities summary:
+
+```json
+{
+  "data": {
+    "currency": "USD",
+    "outstandingBalanceCents": -11000,
+    "liabilitiesSummary": {
+      "taxCents": 1300,
+      "shippingCents": 450,
+      "subscriptionFeesCents": 999,
+      "totalLiabilitiesCents": 2749
+    },
+    "reserve": {
+      "byCurrency": [
+        {
+          "currency": "USD",
+          "balanceCents": 2500,
+          "nextReleaseDate": "2026-04-01T00:00:00.000Z"
+        }
+      ],
+      "percentage": 15,
+      "tier": "new"
+    },
+    "codPolicy": {
+      "negativeThresholdCents": -10000,
+      "codAllowed": false,
+      "blockedReason": "negative_balance_threshold"
+    }
+  }
+}
+```
+
+### Return request + COD refund workflow
+
+endpoints.
+
+**Customer return request endpoint**
+
+- `POST /api/orders/:orderId/return-request`
+- Requires authenticated order owner (or admin).
+- Validates:
+  - order is currently `delivered`
+  - order is within return window (`ORDER_RETURN_WINDOW_DAYS`, default 14)
+  - prepaid orders must have `deliveryLedgerPostedAt`
+  - `reasonKey` must map to an active `ReturnReason`
+  - evidence upload is required when `requiresEvidence=true` on the reason
+  - COD orders must include `codRefund.method` + `codRefund.details` matching required fields.
+    Primary source: dynamic beneficiary rules endpoint
+    (`GET /api/cod-refund-config/beneficiary-rules/:countryCode`). Fallback only: env-based
+    `COD_BANK_FIELDS` / `COD_WALLET_FIELDS` when provider rules are unavailable.
+- Side effects:
+  - snapshots reason metadata into `order.returnRequest` (`label`, `refundShipping`,
+    `requiresEvidence`, `evidenceTypes`)
+  - stores audit actor metadata (`requestedAt`, `requestedByUserId`, `requestedByRole`)
+  - updates `order.status = pending_refund`
+  - for COD orders, applies seller payout hold (`seller.payoutHold=true`)
+
+**Seller/Admin refund decision endpoints**
+
+- Seller:
+  - `POST /api/seller/orders/:id/refund/approve`
+  - `POST /api/seller/orders/:id/refund/reject`
+- Admin:
+  - `POST /api/admin/orders/:id/refund/approve`
+  - `POST /api/admin/orders/:id/refund/reject`
+- Approve flow (COD):
+  - ensures return request and non-expired payout details exist
+  - computes refund plan from `refundPlan.service`
+  - creates refund record (`provider='cod_payout'`, `status='requested'`)
+  - executes payout adapter (`COD_PAYOUT_ADAPTER`; `COD_PAYOUT_PROVIDER` is still accepted as a
+    fallback alias for backward compatibility)
+
+For return reasons with `refundShipping=true` (for example, "Wrong item received" and "Defective
+item"), COD approval computes refund components for merchandise, tax, and shipping. For reasons such
+as "Buyer changed mind", shipping is excluded from the refund. COD payout submission in this flow
+follows the current `/payouts/bank` contract (`banks[]` with `countryToSend`, `account_bank`,
+`account_number`, `valueInUSD`, plus country-specific `fullname`/`account_name`) and does not use
+legacy beneficiary payload shapes.
+
+- emits structured provider lifecycle logs and monitoring counters (attempt/success/failure)
+- on immediate provider success: marks refund record completed, updates order to `refunded`,
+  releases payout hold
+- on async provider result: keeps `pending_refund` while record is `in_progress`/`pending` until
+  webhook or reconciliation converges it
+- on provider failure: marks refund record failed, keeps order in `pending_refund`, and keeps payout
+  hold active
+
+- moves order to `refund_rejected`
+- releases payout hold releases payout hold
+- no rejection ledger rows are created
+
+**Security & retention for COD payout details**
+
+- COD payout details are stored encrypted (`codRefund.detailsEncrypted`) with masked summary fields
+  (`detailsLast4`, `detailsSummary`).
+- Decryption supports key-rotation fallback (`COD_REFUND_DETAILS_ENCRYPTION_KEYS`).
+- Access to decrypted data is audit-logged to `CodRefundAccessAudit`.
+- Encrypted details are purged once stable beneficiary metadata and `detailsLast4` are persisted.
+- On refund completion, details expiry is refreshed from completion timestamp
+  (`refundCompletedAt + COD_REFUND_DETAILS_TTL_DAYS`).
+- A scheduled purge job clears expired encrypted details while retaining redacted summary metadata.
+
+**COD payout reconciliation cron (stuck payout detector)**
+
+- Purpose: detect stale COD payouts, poll provider status, auto-complete safe cases, and flag manual
+  review failures.
+- Local/dev recommended values:
+  - `COD_PAYOUT_RECONCILIATION_ENABLED=true`
+  - `COD_PAYOUT_RECONCILIATION_CRON=*/1 * * * *`
+  - `COD_PAYOUT_RECONCILIATION_TIMEZONE=UTC`
+  - `COD_PAYOUT_RECONCILIATION_AGE_MINUTES=1`
+  - `CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}`
+- Production safe values:
+  - `COD_PAYOUT_RECONCILIATION_ENABLED=true`
+  - `COD_PAYOUT_RECONCILIATION_CRON=*/20 * * * *`
+  - `COD_PAYOUT_RECONCILIATION_TIMEZONE=UTC`
+  - `COD_PAYOUT_RECONCILIATION_AGE_MINUTES=45`
+  - `CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}`
+- Quick test: create stale in-progress COD refund record, run job, verify either `completed` or
+  `reconciliation_*` failure code and matching logs.
+
+**Stuck refund detection + safe retry**
+
+1. Find refund by `orderId`, `idempotencyKey`, and `providerRefundId`.
+2. Confirm provider-side status before any retry.
+3. If provider succeeded, replay webhook or run reconciliation (avoid new payout request).
+4. If provider failed, keep payout hold active and create a new approval attempt with a new
+   idempotency key after fixing beneficiary data.
+
+**API key / webhook secret rotation**
+
+1. Generate new `CHIMONEY_API_KEY` and `CHIMONEY_WEBHOOK_SECRET`.
+2. Update secrets and deploy.
+3. Replay a recent webhook to validate verification and processing.
+4. Remove old credentials and monitor for 401 webhook failures.
+
+**Webhook replay instructions (admin/on-call)**
+
+1. Re-send original payload to `POST /api/chimoney/webhook`.
+2. Pass `x-chimoney-webhook-secret` with active secret.
+3. Confirm response has `received: true`.
+4. Verify matching via idempotency key (fallback provider refund id), and confirm order transition.
+
+### Provider architecture & adapter contract (COD payouts)
+
+This project uses a provider-router + adapter pattern for COD payout execution:
+
+- **Router service:** `backend/src/services/payments/codPayoutProvider.service.js`
+  - Reads active adapter id from `COD_PAYOUT_ADAPTER`.
+  - Backward compatibility: falls back to `COD_PAYOUT_PROVIDER` when `COD_PAYOUT_ADAPTER` is unset.
+  - Selects adapter from `COD_PAYOUT_ADAPTERS`.
+  - Enforces normalized output shape (`ok`, `status`, `provider`, `idempotencyKey`, optional
+    `providerRefundId`, `errorCode`, `errorMessage`, `metadata`).
+  - Emits provider selection and outcome metrics/logs.
+- **Adapter registry:** `backend/src/services/payments/providers/index.js`
+  - Registers named adapters (`chimoney`, `manual`, `disabled`).
+  - Ensures adapter return statuses map to allowed statuses:
+    - `pending`
+    - `completed`
+    - `failed`
+- **Provider adapter implementation:** `backend/src/services/payments/providers/chimoney.adapter.js`
+  - Handles provider-specific HTTP calls, retries, validation, quote handling, beneficiary reuse,
+    idempotent payout submission, and response mapping.
+
+#### Adapter input contract
+
+All COD payout adapters are called with:
+
+```ts
+{
+  order: OrderDocumentLike,
+  amountCents: number,
+  method: string,               // currently bank_transfer
+  details: Record<string, any>, // decrypted payout details
+  idempotencyKey: string
+}
+```
+
+For `method='bank_transfer'`, adapters should expect and validate these `details` keys before
+provider calls:
+
+- `countryToSend` (destination country code used to derive provider payout rails/rules).
+- `account_bank` (provider bank identifier / bank code).
+- `account_number` (beneficiary account number).
+- Payer/account holder name key (country-specific rule):
+  - `fullname` is required for US (`countryToSend='US'`).
+  - `account_name` is required for NG (`countryToSend='NG'`).
+
+`valueInUSD` is the canonical payout value sent to the provider request builder. COD adapters do
+**not** send a root-level `currency` field in the payout body; FX/currency handling is delegated to
+provider-specific quote/bank routing logic that derives from destination/bank context.
+
+For bank payout submission, adapters should send payloads shaped like:
+
+```ts
+{
+  banks: [
+    {
+      // bankPayout
+      id: string,
+      countryToSend: string,
+      account_bank: string,
+      account_number: string,
+      valueInUSD: number,
+      // plus country-specific name key: fullname (US) or account_name (NG)
+    },
+  ];
+}
+```
+
+This payload is posted to `/payouts/bank`.
+
+#### Adapter output contract
+
+All adapters must return normalized results:
+
+```ts
+{
+  ok: boolean,
+  status: 'pending' | 'completed' | 'failed',
+  providerRefundId?: string,
+  errorCode?: string,
+  errorMessage?: string,
+  metadata?: {
+    rawResponse?: Record<string, any>
+    [key: string]: any
+  }
+}
+```
+
+Normalization rules:
+
+- `status` must always be one of `completed | pending | failed` (provider-native states are mapped
+  into this set).
+- `providerRefundId` should carry the provider's canonical transfer/payout identifier whenever
+  available.
+- `metadata.rawResponse` should retain a sanitized provider response envelope for investigations,
+  replay debugging, and reconciliation support.
+
+#### Error handling notes (adapter layer)
+
+- Use `redactPii(...)` before persisting/logging provider request/response fragments.
+- Parse provider error payloads defensively (nested/message/code variants) and map to stable
+  `errorCode` + `errorMessage` values exposed by the normalized adapter contract.
+- When provider parsing is ambiguous, keep the best-effort normalized fields but include sanitized
+  `metadata.rawResponse` to preserve forensic context without leaking sensitive details.
+
+#### Design goals
+
+The COD provider adapter layer is designed around these goals:
+
+1. **Provider-agnostic orchestration** Order/refund workflow code should not depend on
+   Chimoney-specific payload formats.
+2. **Deterministic idempotency** A single business refund attempt should map to a stable idempotency
+   key and never create duplicate payout side effects during retries/replays.
+3. **Auditability & operability** Every critical transition should be traceable through structured
+   logs + metrics using `orderId`, `idempotencyKey`, `providerRefundId`, and `refundRecordId`.
+4. **Progressive consistency** In-flight payouts may remain `pending`/`in_progress` and later
+   converge via webhook or reconciliation cron without forcing unsafe synchronous assumptions.
+5. **Least retention of sensitive data** Encrypted payout details are retained only while necessary
+   and purged once stable provider identity metadata is present.
+
+#### Runtime architecture (modules and responsibilities)
+
+- `services/refunds/codRefundWorkflow.service.js`
+  - orchestrates approval execution lifecycle,
+  - manages refund record transitions (`requested → in_progress → completed|failed`),
+  - coordinates seller payout hold release and order transition.
+- `services/payments/codPayoutProvider.service.js`
+  - provider router + result normalizer,
+  - emits provider-selection and provider-outcome observability.
+- `services/payments/providers/chimoney.adapter.js`
+  - Chimoney-specific implementation (validation, beneficiary, quote, payout request, retry,
+    idempotency replay mapping).
+- `services/payments/chimoneyWebhook.service.js`
+  - authoritative async status convergence from provider callbacks.
+- `jobs/codPayoutReconciliation.js`
+  - stale in-progress recovery path when webhook flow is delayed/missed.
+- `utils/codRefund.js`
+  - secure detail encryption/decryption, validation enrichment, and persistence helpers.
+
+#### End-to-end lifecycle (happy path)
+
+1. Customer submits return request with COD payout destination details.
+2. Details are encrypted and stored in `order.codRefund.detailsEncrypted` plus masked metadata.
+3. Admin/seller approves refund:
+   - workflow computes refund plan and marks matching record `in_progress`,
+   - calls provider router with deterministic idempotency key.
+4. Adapter sends payout request to provider and returns normalized result.
+5. Webhook / reconciliation finalizes provider status:
+   - updates refund record + order status,
+   - releases seller payout hold transactionally,
+   - triggers accounting/order financial hooks.
+6. Encrypted details are purged once stable beneficiary metadata + last4 are available.
+
+#### COD refund lifecycle (state-focused)
+
+1. Return request sets `order.status='pending_refund'` and appends a `refundRecords[]` row with:
+   - `provider='cod_payout'` (fixed internal category for COD payouts),
+   - `status='requested'`.
+2. Approval transitions that record to execution:
+   - usually `status='in_progress'`, `providerStatus='in_progress'` at dispatch time,
+   - then provider-normalized `providerStatus` may be `pending`, `completed`, or `failed`.
+3. Finalization:
+   - success path converges to `refundRecords[].status='completed'` and `order.status='refunded'`,
+   - failed provider path keeps `order.status='pending_refund'` for manual review/remediation.
+
+#### State model and transitions
+
+**Refund record statuses**
+
+- `requested` → created/queued for execution.
+- `in_progress` → execution started; awaiting terminal provider state.
+- `completed` → provider terminal success.
+- `failed` → provider terminal failure/manual review required.
+
+**Provider statuses (normalized)**
+
+- `pending`
+- `completed`
+- `failed`
+
+**Order statuses in COD refund context**
+
+- `pending_refund` while unresolved
+- `refunded` on terminal success
+- remains/returns `pending_refund` on failure paths requiring intervention
+
+#### Data model mapping (what lives where)
+
+- `order.refundRecords[]`
+  - per-attempt immutable history and transition metadata
+  - key fields: `provider`, `idempotencyKey`, `providerRefundId`, `providerStatus`, `failureCode`,
+    `failureMessage`, `providerMetadata`
+- `order.codRefund`
+  - destination method + encrypted payload + masked summary
+  - security fields: `detailsEncrypted`, `detailsLast4`, `detailsSummary`, `detailsExpiresAt`
+- `seller.payoutHold*`
+  - temporary hold controls while refund payout is unresolved
+
+#### Failure handling strategy
+
+- **Synchronous provider failure** (adapter returns `ok=false`)
+  - mark record failed with failure metadata
+  - keep payout hold active
+- **Webhook missing or delayed**
+  - reconciliation cron scans stale `in_progress` records
+  - attempts provider status lookup and converges to completed/manual-review failure
+- **Idempotent replay**
+  - duplicate execution attempts short-circuit by record state + idempotency key checks
+  - provider `409` conflict is mapped to replay, not treated as a second payout
+- **Unknown provider status**
+  - normalized to `pending` to avoid premature terminal failure assumptions
+
+#### Transaction boundaries and consistency model
+
+The system uses DB session/transaction boundaries in terminal completion paths where these updates
+must be consistent together:
+
+- order/refund record terminal status update
+- seller payout hold release
+
+This avoids partial updates such as “order marked refunded but hold not released” (or vice versa).
+
+#### Observability model
+
+Metrics emitted (via monitoring abstraction):
+
+- provider selection attempt/failure
+- provider HTTP attempt/failure
+- execution success/failure
+- webhook receive/process success/failure
+- reconciliation attempt/success/failure
+- reconciliation pending-age bucket counters
+
+Structured logs include correlation keys:
+
+- `orderId`
+- `idempotencyKey`
+- `providerRefundId`
+- `refundRecordId`
+
+#### Runtime tuning envs and design impact
+
+These env vars tune adapter/reconciliation runtime behavior without changing business state-machine
+logic (`requested → in_progress → completed|failed`): the architecture remains router
+(`codPayoutProvider`) → provider adapter (`chimoney.adapter`) → async convergence via
+webhook/reconciliation. Field requirements follow **dynamic provider beneficiary rules first**, with
+env-based `COD_BANK_FIELDS` / `COD_WALLET_FIELDS` as fallback when dynamic rules are unavailable.
+
+- `CHIMONEY_TIMEOUT_MS`
+  - design impact: limits per-request provider wait budget before failing fast.
+- `CHIMONEY_MAX_RETRIES`
+  - design impact: controls retry depth for retryable provider/network failures.
+- `CHIMONEY_RETRY_BASE_DELAY_MS`
+  - design impact: controls retry pacing/backoff pressure on provider/API.
+- `CHIMONEY_SOURCE_CURRENCY`
+  - design impact: overrides quote source currency when provider quote generation requires explicit
+    source-currency control.
+- `COD_REFUND_CHIMONEY_WEBHOOK_STORE_RAW_DEBUG`
+  - design impact: diagnostic visibility toggle; should remain disabled in production except short
+    incident windows due to sensitive payload retention risk.
+
+#### Security model
+
+- COD payout details encrypted at rest.
+- Key-rotation supported via primary + fallback key list.
+- Decryption access is audit logged.
+- Encrypted payload purged when no longer required for processing.
+- Provider metadata is redacted by default:
+  - no raw account numbers are stored,
+  - no raw webhook body is persisted unless explicit debug flag is enabled.
+
+### Extending to a new provider (implementation checklist)
+
+1. Add adapter module under `services/payments/providers/`.
+2. Implement required input/output contract and status normalization.
+3. Register adapter in provider index map.
+4. Ensure idempotency header/body mapping for provider API.
+5. Emit structured logs + monitoring metrics with standard correlation IDs.
+6. Add tests:
+   - success/failure mapping,
+   - retry and replay behavior,
+   - idempotency/duplicate handling.
+7. Update README env vars + runbook sections for provider-specific setup.
+
+#### Idempotency behavior (safe retries)
+
+- A refund record carries `idempotencyKey`.
+- Approval short-circuits if record is already in-progress/completed or already has
+  `providerRefundId`.
+- Chimoney payout requests forward idempotency via:
+  - HTTP header: `Idempotency-Key`
+  - payload reference field: `reference`
+- If Chimoney responds with `409` duplicate-idempotency conflict, adapter treats it as replay and
+  maps to a non-fatal response with provider metadata (`replay: true`).
+- **Operational rule:** retry using the **same** idempotency key for the same business attempt; only
+  generate a new key when intentionally creating a new payout attempt after confirmed failure.
+
+#### How to detect stuck refunds / payouts
+
+Use all three signals together:
+
+1. **Order/refund state**
+   - `order.status = pending_refund`
+   - latest `refundRecords[].provider = cod_payout`
+   - latest `refundRecords[].providerStatus = in_progress` or `pending`
+2. **Age threshold**
+   - record `updatedAt` older than `COD_PAYOUT_RECONCILIATION_AGE_MINUTES`
+3. **Reconciliation outputs**
+   - manual-review failure codes:
+     - `reconciliation_manual_review_required`
+     - `reconciliation_unresolved_manual_review`
+     - `reconciliation_status_fetch_failed`
+
+Also inspect structured logs with `orderId`, `idempotencyKey`, `providerRefundId`, `refundRecordId`.
+
+#### Safe stuck-refund retry procedure (runbook condensed)
+
+1. Find the current attempt by `idempotencyKey` and `providerRefundId`.
+2. Confirm provider-side truth (dashboard/API/webhook deliveries).
+3. If provider already succeeded:
+   - replay webhook event OR run reconciliation cycle,
+   - do **not** create a second payout request.
+4. If provider definitively failed:
+   - keep seller payout hold active until resolved,
+   - correct beneficiary/bank payload issue,
+   - create a new attempt with a new idempotency key.
+5. Verify final order transition + seller hold release + refund record terminal state.
+
+#### Chimoney sandbox/config expectations
+
+- `CHIMONEY_BASE_URL` must point to the correct environment (use `https://api-sandbox.chimoney.io`
+  for testing/sandbox, and production host only in production).
+- `CHIMONEY_API_KEY` must match the same environment as `CHIMONEY_BASE_URL`.
+- Chimoney API calls use `X-API-KEY: <CHIMONEY_API_KEY>` header authentication.
+- `CHIMONEY_WEBHOOK_SECRET` is required for secure webhook verification.
+- `CHIMONEY_PAYOUT_STATUS_PATH` controls reconciliation lookup endpoint and should include
+  `{payoutId}` token.
+
+#### Chimoney webhook endpoint setup (sandbox dashboard)
+
+When creating the webhook endpoint in Chimoney dashboard, use your backend public URL with:
+
+- Preferred endpoint URL:
+  - `https://<your-backend-domain>/api/chimoney/webhook`
+- Optional path-secret style endpoint URL (if you prefer URL secret matching):
+  - `https://<your-backend-domain>/api/chimoney/webhook/<CHIMONEY_WEBHOOK_SECRET>`
+
+Both routes are supported by backend routing:
+
+- `POST /api/chimoney/webhook`
+- `POST /api/chimoney/webhook/:webhookSecret`
+
+Subscribe to these events (the ones currently processed by backend):
+
+- `payout.bank.initiated`
+- `payout.bank.completed`
+- `payout.bank.failed`
+
+If extra events are sent, they are accepted but ignored as `unsupported_event_type`.
+
+For local testing via tunnel (ngrok/Cloudflare Tunnel), set endpoint URL to your temporary HTTPS URL
+plus `/api/chimoney/webhook`, then replay a sample event and confirm `received: true`.
+
+Example sandbox-style config:
+
+```env
+COD_PAYOUT_ADAPTER=chimoney
+# Backward compatibility: COD_PAYOUT_PROVIDER is still accepted as fallback if ADAPTER is unset.
+CHIMONEY_BASE_URL=https://api-sandbox.chimoney.io
+CHIMONEY_API_KEY=chimoney_sandbox_key
+CHIMONEY_WEBHOOK_SECRET=chimoney_sandbox_webhook_secret
+CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}
+```
+
+### Cron jobs added for COD payout resiliency
+
+#### 1) COD payout reconciliation cron
+
+- **Scheduler env vars**
+  - `COD_PAYOUT_RECONCILIATION_ENABLED`
+  - `COD_PAYOUT_RECONCILIATION_CRON`
+  - `COD_PAYOUT_RECONCILIATION_TIMEZONE`
+  - `COD_PAYOUT_RECONCILIATION_AGE_MINUTES`
+- **Purpose**
+  - Finds stale in-progress COD payout records.
+  - Fetches provider payout status.
+  - Auto-completes safe terminal-success cases.
+  - Marks unresolved/error cases for manual review.
+- **How to test**
+  1. Create COD refund in progress.
+  2. Set record `updatedAt` old enough to be stale.
+  3. Run cycle manually or wait for cron trigger.
+  4. Verify transition + metrics/log output + failure code or completion.
+
+#### 2) COD refund details purge cron
+
+- **Scheduler env vars**
+  - `COD_REFUND_PURGE_CRON`
+  - `COD_REFUND_PURGE_TZ`
+- **Purpose**
+  - Purges expired encrypted COD payout payloads.
+  - Preserves redacted metadata (`detailsSummary`, `detailsLast4`) for support trails.
+- **How to test**
+  1. Seed order with `codRefund.detailsEncrypted` set and expired `detailsExpiresAt`.
+  2. Run purge job.
+  3. Verify encrypted payload is null and status marked expired while summaries remain.
+
+### Key rotation & webhook replay procedures
+
+#### Rotate Chimoney API key safely
+
+1. Create new API key in Chimoney console (same environment).
+2. Update secret manager (`CHIMONEY_API_KEY`).
+3. Deploy and validate outbound provider calls.
+4. Reconcile one in-progress payout to ensure status lookup still works.
+5. Revoke old key after verification window.
+
+#### Rotate Chimoney webhook secret safely
+
+1. Generate new webhook secret in Chimoney.
+2. Update `CHIMONEY_WEBHOOK_SECRET`.
+3. Replay a known webhook payload against `/api/chimoney/webhook`.
+4. Confirm request is accepted and matched to refund record.
+5. Remove old webhook secret in provider console.
+
+#### Replay webhook (admin/on-call detailed)
+
+1. Capture original payload + event metadata from provider dashboard.
+2. `POST /api/chimoney/webhook` with payload and `x-chimoney-webhook-secret: <active-secret>`.
+3. Confirm 2xx response and `received: true`.
+4. Validate matching path:
+   - first by `idempotencyKey`
+   - fallback by `providerRefundId`
+5. Confirm order/refund transitions and seller payout-hold state.
+
+#### Troubleshooting: stuck pending refunds
+
+If an order stays in `pending_refund` longer than expected:
+
+1. Confirm webhook delivery and matching keys (`idempotencyKey` first, then `providerRefundId`).
+2. Run/verify COD payout reconciliation for stale `in_progress` records.
+3. If still unresolved, keep payout hold active and perform manual review before any new payout
+   attempt.
+
+#### COD refund record API example (sanitized fields)
+
+```json
+{
+  "provider": "cod_payout",
+  "providerName": "chimoney",
+  "providerStatus": "pending",
+  "status": "in_progress",
+  "idempotencyKey": "cod_refund:orderId:recordIndex:1299",
+  "providerRefundId": "pay_123",
+  "providerMetadata": {
+    "chimoney": {
+      "eventType": "payout.bank.initiated",
+      "providerRefundId": "pay_123",
+      "status": "pending",
+      "idempotencyKey": "cod_refund:orderId:recordIndex:1299",
+      "bank_name": "Example Bank",
+      "account_last4": "1234"
+    },
+    "payload": {
+      "payoutId": "pay_123",
+      "status": "INPROCESS",
+      "reference": "cod_refund:orderId:recordIndex:1299"
+    }
+  }
+}
+```
+
+**Settlement hold enforcement**
+
+- Settlement scheduler excludes sellers with `payoutHold=true` from scheduled payouts until the
+  related refund is resolved.
+
+- Seller liabilities endpoint: `GET /api/seller/financials/liabilities`
+  - Seller-authenticated dashboard endpoint for liability-only payloads.
 
   ```json
   {
     "data": {
       "currency": "USD",
-      "outstandingBalanceCents": -11000,
-      "codPolicy": {
-        "negativeThresholdCents": -10000,
-        "codAllowed": false,
-        "blockedReason": "negative_balance_threshold"
+      "liabilitiesSummary": {
+        "taxCents": 1300,
+        "shippingCents": 450,
+        "subscriptionFeesCents": 999,
+        "totalLiabilitiesCents": 2749
       }
     }
   }
   ```
 
-**Operational notes**
+- Liability-account env vars used by ledger mapping:
+  - `PLATFORM_SELLER_ID`: seller id of the platform liability ledger account (tax flows).
+  - `SHIPPING_SELLER_ID`: seller id of the shipping liability ledger account (shipping flows).
+    **Operational notes**
 
 - Notification cooldown behavior:
   - On first blocked attempt per seller, backend stores a cooldown key and sends email.
@@ -1436,6 +2213,81 @@ COD checkout now enforces a seller-level **negative outstanding ledger balance p
 ### Seller settlements, ledger lifecycle, and payout execution
 
 The payout system is implemented as a **double-entry style operational ledger** at seller level:
+
+**Ledger dimensions (authoritative contract)**
+
+- `accountingScope`: `merchant | platform`
+  - `merchant`: merchant-facing economic activity (sale/commission/refund/tax/shipping/etc.)
+  - `platform`: marketplace-operator activity (platform fee, processor fee, recovery, disbursement
+    mirrors)
+- `entrySide`: `merchant | operator`
+  - `merchant`: merchant-side row
+  - `operator`: operator-side mirror/offset row
+- `merchantSellerId`: merchant identity anchor when `sellerId` is a platform/operator ledger account
+  (required for platform-store and mirrored operator flows)
+- `counterpartyRole`: `merchant | platform | shipping | processor` (required for fee/recovery/
+  liability rows; may be `null` only for generic manual adjustments)
+
+These fields allow deterministic filtering for platform-store flows where merchant and operator rows
+coexist for related events.
+
+**Field-level schema notes**
+
+- `LedgerEntry.accountingScope` (`merchant | platform`)
+  - Required on writes; drives admin scope switch behavior and seller dashboard merchant-only
+    totals.
+- `LedgerEntry.entrySide` (`merchant | operator`)
+  - Required on writes; distinguishes business-facing rows from platform offset rows.
+- `LedgerEntry.merchantSellerId` (`ObjectId|null`)
+  - Required when `sellerId` points to a platform/operator account but the row belongs to a specific
+    merchant for UI and aggregation rollups.
+- `LedgerEntry.counterpartyRole` (`merchant | platform | shipping | processor | null`)
+  - Required for fee/recovery/liability diagnostics; `null` is reserved for generic adjustments.
+- Reserve fields on `LedgerEntry` (used by reserve APIs and jobs):
+  - `reserveMonth` (`YYYY-MM`) — accounting bucket for grouped release decisions.
+  - `withheldAt` (`ISO datetime`) — when reserve was originally held.
+  - `releaseScheduledAt` (`ISO datetime`) — earliest eligible release timestamp.
+  - `metadata.tier`, `metadata.percentage`, `metadata.reason`, `metadata.actor` — policy intent +
+    audit context required by admin reserves UI.
+- Order/COD refund fields now treated as UI contract fields:
+  - `order.codRefund.status` (`pending | processing | completed | failed | expired`) for state
+    chips.
+  - `order.codRefund.failureCode` / `order.codRefund.failureMessage` for actionable support copy.
+  - `order.codRefund.providerStatus`, `order.codRefund.providerRefundId` for reconciliation
+    drilldown.
+  - `order.codRefund.detailsSummary`, `order.codRefund.detailsLast4` for redacted evidence after
+    encrypted payload purge.
+
+**Idempotency + replay protection**
+
+- Ledger deduplication is `idempotencyKey`-centric.
+- Ledger writes rely on `idempotencyKey` as the single replay-protection contract across merchant
+  and operator scoped rows.
+
+**Outstanding-balance scoping behavior**
+
+Outstanding balance services accept optional:
+
+- `referenceOrderIds` to constrain aggregation to specific orders
+- `scope` (`merchant | platform | all`) to constrain by accounting scope
+
+This is used by platform-store seller dashboard flows so merchant-only balances are computed from
+platform-owned merchant rows.
+
+**Processor-fee recovery (canonical behavior)**
+
+- Canonical baseline key: `processor_fee_recovery:<orderId>`
+- If later events report a different recovered amount, the service writes delta rows using
+  `processor_fee_recovery:<orderId>:delta:<targetAmountCents>`
+- Exact same-amount replay is a no-op
+
+**Delivery ledger posting behavior (prepaid + COD)**
+
+- Delivery posting is idempotent using deterministic keys and `deliveryLedgerPostedAt`.
+- Prepaid paths write merchant rows and operator mirror rows with explicit scope/side metadata.
+- COD paths write seller-side delivery rows plus COD reimbursement/disbursement/refund rows.
+- Successful posting stamps `deliveryLedgerPostedAt`, which is also used by refund/eligibility
+  logic.
 
 - Every sale/refund/fee action emits immutable `LedgerEntry` rows (`sale`, `commission`, `refund`,
   `commission_reversal`, `adjustment`) with integer `amountCents`, currency, and idempotent
@@ -1498,7 +2350,10 @@ See the dedicated operator guide for fallback payout + CSV procedures:
 - `SETTLEMENT_SCHEDULER_ENABLED` (`true` by default): disables/enables scheduler job when set to
   `false`.
 - `SETTLEMENT_CRON` (default `0 0 * * *`): cron expression for scheduling windows.
-- `SETTLEMENT_TZ` (default `UTC`): scheduler timezone.
+- `SETTLEMENT_TZ` (default `UTC`): settlement display timezone metadata for UI rendering only. It
+  does not change UTC settlement boundary calculation or UTC persistence (does not control cron
+  boundary logic).
+- `SETTLEMENT_SCHEDULER_TZ` (default `UTC`): scheduler timezone for cron registration.
 - `SETTLEMENT_PERIOD_DAYS` (default `15`): settlement window size.
 - `SETTLEMENT_HOLD_DAYS` (default `0`): release delay after period end.
 - `SETTLEMENT_CURRENCY` (default `USD`): settlement currency.
@@ -1510,6 +2365,15 @@ See the dedicated operator guide for fallback payout + CSV procedures:
   scheduler cycle duration with safety buffer.
 - `SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY` (default `skip_cycle`): accepted values are `skip_cycle`
   or `run_unlocked`.
+
+**Settlement Timezone Policy**
+
+- Settlement periods are always computed on UTC boundaries (`00:00:00` start through UTC day-end)
+  and stored in UTC fields.
+- Sellers in non-UTC locales will still see UTC-aligned settlement periods; period boundaries do not
+  shift to local midnights.
+- `SETTLEMENT_TZ` only affects admin/UI date formatting (UTC -> display timezone conversion). It is
+  never used for settlement boundary calculation or persistence.
 
 **Scheduler lock behavior and operations guidance**
 
@@ -1604,6 +2468,211 @@ SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked # Allows tests to proceed whe
 
 Common `created: false` reasons include `no_pending_entries`, `period_not_eligible`,
 `no_positive_payouts`, and `duplicate`.
+
+### Admin marketplace financials API (`/api/admin/platform-financials/*`)
+
+Authorization for all routes below: `protectRoute` + `restrictTo('admin', 'staff')`.
+
+#### `GET /api/admin/platform-financials/summary`
+
+**Required query params**
+
+- `scope`: `marketplace | platform_store | seller`
+- `sellerId`: required when `scope=seller`
+
+**Optional query params**
+
+- `from`, `to` (ISO date/datetime)
+- `type` (ledger type filter)
+- `payoutStatus` (`pending|scheduled|paid|reserved`)
+- `orderId`
+- `page`, `limit`
+
+**Response shape**
+
+- `data.totals`: total entries/net/credit/debit/outstanding amounts
+- `data.marketplaceMetrics`: GMV, platform fee revenue, processor fee cost/recovery, liabilities,
+  payouts breakdown, reserve metrics, subscription fee receivables
+- `data.byType[]`, `data.byPayoutStatus[]`
+- `meta.generatedAt`
+- `filters` echo envelope
+
+#### `GET /api/admin/platform-financials/ledger`
+
+Same filters as summary.
+
+**Response shape**
+
+- `data[]`: ledger rows
+  - `id, sellerId, accountingScope, entrySide, merchantSellerId, counterpartyRole, type, amountCents, currency, payoutStatus, reason, actor, reference, reserveMonth, withheldAt, releaseScheduledAt, createdAt`
+- `meta`: pagination (`page, limit, total, totalPages, hasNextPage, hasPrevPage`)
+- `filters`: normalized filter envelope
+
+#### `GET /api/admin/platform-financials/liabilities`
+
+Same filters as summary/ledger; liability rows are constrained to liability types
+(`tax/tax_refund/shipping_fee/shipping_refund/reserve/reserve_used/cod_refund_*`).
+
+**Response shape**
+
+- `data.summary`
+  - `totalLiabilityAmountCents`
+  - `outstandingLiabilityAmountCents`
+  - `entryCount`
+- `data.items[]`
+  - grouped by `type + payoutStatus`
+  - `type, payoutStatus, totalAmountCents, entryCount, lastCreatedAt`
+- `meta` + `filters`
+
+### Seller financial summary behavior updates
+
+Endpoint: `GET /api/seller/financials/summary`
+
+- For normal sellers, summary reflects the seller's rows in requested/default scope.
+- For platform-store seller context (admin acting as platform seller), default scope is
+  merchant-only and summary is restricted to platform-owned order IDs.
+
+**New merchant subtotal fields in summary**
+
+- `merchantGrossCents`
+- `merchantTaxCents`
+- `merchantShippingCents`
+- `merchantCommissionCents`
+- `merchantNetCents`
+- `merchantOutstandingBalanceCents`
+
+These are derived from unpaid merchant-side settlement types and are intended as seller-operator
+readable business totals.
+
+**Exact formulas (cents, aligned to current backend implementation)**
+
+- Settlement balance = `merchantOutstandingBalanceCents` (same value currently returned as
+  `outstandingBalanceCents` in summary response).
+- Net proceeds before processor fees = `merchantNetCents` where
+  `merchantNetCents = merchantGrossCents + merchantTaxCents + merchantShippingCents + merchantCommissionCents`.
+- Deductions total = sum of values in `deductionTotalsCents` (currently seeded with `commission`,
+  `processing_fee`, `cod_refund_reimbursement`, plus any additional deduction keys returned by API).
+- Sign convention: positive amounts increase seller receivable; negative amounts reduce it.
+
+**Outstanding balance interpretation**
+
+- `outstandingBalanceCents` / `merchantOutstandingBalanceCents` are unsettled ledger totals for
+  included types and scope, not "cash available now".
+- Positive values generally indicate net receivable; negative values indicate net owed/offset state.
+- COD policy consumes this scoped value against `negativeThresholdCents`.
+
+### Frontend financial documentation updates
+
+#### Seller dashboard financials scoping
+
+- Seller financial summary (`/seller/financials/summary`) is consumed as merchant subtotals + COD
+  policy block.
+- For platform-store seller context, backend defaults scope to merchant and limits rows to
+  platform-owned orders, so dashboard cards align with seller ledger merchant view.
+- Dashboard card formulas should be applied in cents exactly as returned:
+  - Settlement balance = `merchantOutstandingBalanceCents` (`outstandingBalanceCents` alias).
+  - Net proceeds before processor fees = `merchantNetCents`, with
+    `merchantNetCents = merchantGrossCents + merchantTaxCents + merchantShippingCents + merchantCommissionCents`.
+  - Deductions total = sum of `deductionTotalsCents` values (`commission`, `processing_fee`,
+    `cod_refund_reimbursement`, plus any additional deduction keys returned by API).
+  - Sign convention: positive amounts increase seller receivable; negative amounts reduce it.
+
+#### Operator rows in seller ledger
+
+- Default seller ledger view is merchant-oriented.
+- Operator mirror rows can be included for debugging/audit using `includeOperatorRows=true` in
+  seller ledger queries.
+- When included, descriptions are prefixed/labeled as platform-side offset entries to avoid
+  confusion with merchant sales activity.
+
+#### Admin marketplace financials scope switcher
+
+`AdminMarketplaceFinancialsPanel` supports three modes:
+
+1. `marketplace`: aggregate all sellers/scopes
+2. `platform_store`: platform store merchant scope (platform-owned orders)
+3. `seller`: single seller (requires seller selector)
+
+The panel re-fetches summary, ledger, and liabilities whenever scope (or seller in seller mode)
+changes.
+
+#### UI diagram (scope flow)
+
+```text
+Admin Marketplace Financials
+┌─────────────────────────────────────────────────────────────┐
+│ Scope: [ marketplace | platform_store | seller ]           │
+│                     └─ seller => requires sellerId         │
+├─────────────────────────────────────────────────────────────┤
+│ Summary cards (scope-aware)                                │
+│ Ledger table (scope + filters)                             │
+│ Liabilities breakdown (scope + filters)                    │
+└─────────────────────────────────────────────────────────────┘
+
+Seller Dashboard > Financials
+┌─────────────────────────────────────────────────────────────┐
+│ Summary cards (merchant subtotals + outstanding + COD)     │
+│ Reserve card                                                │
+│ Tabs: Ledger | Payouts | Liabilities                        │
+│ Ledger default: merchant rows                               │
+│ Optional: include operator rows (platform offset labeled)   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Release notes — accounting and financial UI refactor
+
+#### Consolidated changes in this release
+
+**1) Schema / data-contract changes**
+
+- Ledger rows now explicitly rely on:
+  - `accountingScope`, `entrySide`, `merchantSellerId`, `counterpartyRole`.
+- Reserve lifecycle fields are first-class API/UI contract fields:
+  - `reserveMonth`, `withheldAt`, `releaseScheduledAt`, and reserve `metadata` audit keys.
+- COD refund UI now depends on status/failure metadata:
+  - `codRefund.status`, `codRefund.failureCode`, `codRefund.failureMessage`,
+    `codRefund.providerStatus`, `codRefund.providerRefundId`, and redacted detail helpers
+    (`detailsSummary`, `detailsLast4`).
+- Ledger replay safety is idempotency-key based across all ledger write paths.
+
+**2) New / updated admin routes**
+
+- Reserve operations under `/api/admin/reserves/*`:
+  - `GET /summary`
+  - `GET /sellers/:sellerId`
+  - `POST /release`
+  - `POST /increase`
+  - `POST /update-config`
+- Marketplace financials under `/api/admin/platform-financials/*`:
+  - `GET /summary`
+  - `GET /ledger`
+  - `GET /liabilities`
+
+**3) Frontend adjustments included**
+
+- Scope-switch behavior standardized (`marketplace | platform_store | seller`) with seller-required
+  fetch gating in seller mode.
+- Liabilities rendering now consumes grouped liability summaries returned by admin liabilities API.
+- Reserve audit/history rendering consumes actor/reason/tier/percentage/timestamp fields from
+  reserve action metadata.
+- Summary cards map directly to server totals/merchant subtotals without recomputing scope client-
+  side.
+
+#### Frontend action required (short checklist)
+
+- Consume and persist these response keys in admin + seller financial views:
+  - `accountingScope`, `entrySide`, `merchantSellerId`, `counterpartyRole`
+  - `reserveMonth`, `withheldAt`, `releaseScheduledAt`, `metadata.{tier,percentage,reason,actor}`
+  - `codRefund.status`, `codRefund.failureCode`, `codRefund.failureMessage`,
+    `codRefund.providerStatus`, `codRefund.providerRefundId`, `codRefund.detailsSummary`,
+    `codRefund.detailsLast4`
+- Backward compatibility behavior:
+  - If `accountingScope` is missing, treat row as `merchant` for seller dashboard display.
+  - If `entrySide` is missing, render as `merchant` and hide operator badge.
+  - If reserve audit metadata is missing, show `"system"` actor and `"not_provided"` reason
+    fallback.
+  - If COD failure fields are missing, keep a generic failure message and avoid hard-failing status
+    UI.
 
 ### Reserve / Holdback Policy (implemented architecture)
 
@@ -1768,6 +2837,224 @@ Backend endpoints (`/api/admin/reserves`):
 - `POST /release`
 - `POST /increase`
 - `POST /update-config`
+
+Authorization for all routes below: `protectRoute` + `restrictTo('admin', 'staff')`.
+
+##### `GET /api/admin/reserves/summary`
+
+**Request**
+
+```http
+GET /api/admin/reserves/summary?range=30d&currency=USD HTTP/1.1
+Authorization: Bearer <ADMIN_OR_STAFF_TOKEN>
+Accept: application/json
+```
+
+**Response (HTTP 200)**
+
+```json
+{
+  "success": true,
+  "data": {
+    "totals": {
+      "currency": "USD",
+      "reservedAmountCents": 1842500,
+      "releasableAmountCents": 392000,
+      "usedAmountCents": 118000,
+      "sellerCount": 42
+    },
+    "byTier": [
+      { "tier": "new", "reservedAmountCents": 962000, "sellerCount": 17 },
+      { "tier": "established", "reservedAmountCents": 580500, "sellerCount": 14 },
+      { "tier": "pro", "reservedAmountCents": 199000, "sellerCount": 8 },
+      { "tier": "high_risk", "reservedAmountCents": 101000, "sellerCount": 3 }
+    ],
+    "generatedAt": "2026-04-21T10:40:12.201Z"
+  }
+}
+```
+
+##### `GET /api/admin/reserves/sellers/:sellerId`
+
+**Request**
+
+```http
+GET /api/admin/reserves/sellers/664f0cc0f9e53a001f8ab123?limit=10&page=1 HTTP/1.1
+Authorization: Bearer <ADMIN_OR_STAFF_TOKEN>
+Accept: application/json
+```
+
+**Response (HTTP 200)**
+
+```json
+{
+  "success": true,
+  "data": {
+    "seller": {
+      "_id": "664f0cc0f9e53a001f8ab123",
+      "shopName": "Acme Gadgets",
+      "reserveConfig": {
+        "tier": "established",
+        "percentage": 5,
+        "updatedAt": "2026-04-10T12:15:40.000Z",
+        "updatedBy": "664eff40d9c53a001f8aa9a2"
+      }
+    },
+    "summary": {
+      "currency": "USD",
+      "currentlyReservedCents": 156400,
+      "releasableCents": 23000,
+      "usedCents": 9000
+    },
+    "ledger": [
+      {
+        "_id": "66500152bc41cc001fbbe771",
+        "type": "reserve",
+        "amountCents": -6400,
+        "payoutStatus": "reserved",
+        "reserveMonth": "2026-03",
+        "withheldAt": "2026-03-31T23:59:40.000Z",
+        "releaseScheduledAt": "2026-04-14T00:00:00.000Z",
+        "metadata": {
+          "tier": "established",
+          "percentage": 5,
+          "reason": "scheduled_settlement_withhold",
+          "actor": "system"
+        }
+      }
+    ]
+  },
+  "meta": {
+    "page": 1,
+    "limit": 10,
+    "total": 37,
+    "totalPages": 4
+  }
+}
+```
+
+##### `POST /api/admin/reserves/release`
+
+**Request**
+
+```http
+POST /api/admin/reserves/release HTTP/1.1
+Authorization: Bearer <ADMIN_OR_STAFF_TOKEN>
+Content-Type: application/json
+
+{
+  "sellerId": "664f0cc0f9e53a001f8ab123",
+  "amountCents": 20000,
+  "currency": "USD",
+  "reason": "manual_partial_release_after_chargeback_window"
+}
+```
+
+**Response (HTTP 200)**
+
+```json
+{
+  "success": true,
+  "message": "Reserve released successfully.",
+  "data": {
+    "sellerId": "664f0cc0f9e53a001f8ab123",
+    "releasedAmountCents": 20000,
+    "currency": "USD",
+    "ledgerEntry": {
+      "_id": "66500217bc41cc001fbbe9e0",
+      "type": "reserve_release",
+      "amountCents": 20000,
+      "payoutStatus": "pending",
+      "metadata": {
+        "reason": "manual_partial_release_after_chargeback_window",
+        "actor": "admin:664eff40d9c53a001f8aa9a2"
+      }
+    }
+  }
+}
+```
+
+##### `POST /api/admin/reserves/increase`
+
+**Request**
+
+```http
+POST /api/admin/reserves/increase HTTP/1.1
+Authorization: Bearer <ADMIN_OR_STAFF_TOKEN>
+Content-Type: application/json
+
+{
+  "sellerId": "664f0cc0f9e53a001f8ab123",
+  "amountCents": 15000,
+  "currency": "USD",
+  "reason": "temporary_risk_buffer_for_open_dispute"
+}
+```
+
+**Response (HTTP 200)**
+
+```json
+{
+  "success": true,
+  "message": "Reserve increased successfully.",
+  "data": {
+    "sellerId": "664f0cc0f9e53a001f8ab123",
+    "increasedAmountCents": 15000,
+    "currency": "USD",
+    "ledgerEntry": {
+      "_id": "66500265bc41cc001fbbea40",
+      "type": "reserve",
+      "amountCents": -15000,
+      "payoutStatus": "reserved",
+      "metadata": {
+        "reason": "temporary_risk_buffer_for_open_dispute",
+        "actor": "admin:664eff40d9c53a001f8aa9a2",
+        "source": "manual_increase"
+      }
+    }
+  }
+}
+```
+
+##### `POST /api/admin/reserves/update-config`
+
+**Request**
+
+```http
+POST /api/admin/reserves/update-config HTTP/1.1
+Authorization: Bearer <ADMIN_OR_STAFF_TOKEN>
+Content-Type: application/json
+
+{
+  "sellerId": "664f0cc0f9e53a001f8ab123",
+  "tier": "high_risk",
+  "percentage": 18,
+  "reason": "chargeback_spike_q2_review"
+}
+```
+
+**Response (HTTP 200)**
+
+```json
+{
+  "success": true,
+  "message": "Reserve config updated.",
+  "data": {
+    "sellerId": "664f0cc0f9e53a001f8ab123",
+    "reserveConfig": {
+      "tier": "high_risk",
+      "percentage": 18,
+      "updatedAt": "2026-04-21T10:44:51.328Z",
+      "updatedBy": "664eff40d9c53a001f8aa9a2"
+    },
+    "audit": {
+      "action": "update-config",
+      "reason": "chargeback_spike_q2_review",
+      "actor": "admin:664eff40d9c53a001f8aa9a2"
+    }
+  }
+}
+```
 
 Frontend admin UI:
 
@@ -2396,6 +3683,43 @@ refreshes the 30-day window.
 > (MongoMemoryServer) and a mocked Redis in CI. Ensure the test environment can start the in-memory
 > Mongo (no other DB required for tests).
 
+### How to test the COD refund purge cron job
+
+You can test both the **pure purge function** and the **scheduled cron execution**:
+
+1. **Unit test the purge behavior**
+
+   ```bash
+   npm run -w backend test -- src/tests/jobs/codRefundDetailsPurge.job.spec.js
+   ```
+
+2. **Manual dev verification (without waiting for real cron)**
+   - Start backend with a fast cron expression:
+
+     ```bash
+     COD_REFUND_PURGE_CRON="* * * * *" COD_REFUND_PURGE_TZ="UTC" npm run -w backend dev
+     ```
+
+   - Recommended cron values by environment:
+     - **Production:** `COD_REFUND_PURGE_CRON="15 3 * * *"` and `COD_REFUND_PURGE_TZ="UTC"` (once
+       daily during off-peak hours).
+     - **Development/QA:** `COD_REFUND_PURGE_CRON="* * * * *"` and `COD_REFUND_PURGE_TZ="UTC"`
+       (every minute for fast validation).
+
+   - Seed a test order with:
+     - `codRefund.detailsEncrypted` set
+     - `codRefund.detailsExpiresAt` in the past
+   - Wait up to 1 minute and verify:
+     - `codRefund.detailsEncrypted === null`
+     - `codRefund.status === 'expired'`
+     - `codRefund.detailsSummary` / `detailsLast4` remain available
+
+3. **Operational check in logs**
+   - Look for:
+     - `COD refund details purge job started`
+     - `COD refund details purge cycle completed` with `purgedCount` -
+       `COD refund details purge cycle completed` with `purgedCount`
+
 ### Test status
 
 - **Coverage:** Backend test coverage: ~89% (unit + integration). Full test suite includes
@@ -2606,6 +3930,193 @@ SENTRY_DSN
 SENTRY_RELEASE
 ```
 
+**Payment provider + COD refund/payout policy**
+
+```env
+PAYMENT_PROVIDER=stripe
+STRIPE_PERCENT_FEE=2.9
+STRIPE_FIXED_FEE_CENTS=30
+STRIPE_FEE_SOURCE=balance_transaction
+COD_REFUND_METHOD=bank_transfer
+
+# Prefer COD_PAYOUT_ADAPTER.
+# Backward compatibility: COD_PAYOUT_PROVIDER is accepted as a fallback alias
+# only when COD_PAYOUT_ADAPTER is unset.
+
+COD_PAYOUT_ADAPTER=chimoney
+COD_PAYOUT_PROVIDER=
+
+# Chimoney environment alignment
+# Sandbox:    CHIMONEY_BASE_URL=https://api-sandbox.chimoney.io with sandbox API key
+# Production: CHIMONEY_BASE_URL=https://api.chimoney.io with production API key
+CHIMONEY_BASE_URL=https://api-sandbox.chimoney.io
+CHIMONEY_API_KEY=replace-with-chimoney-api-key
+CHIMONEY_WEBHOOK_SECRET=replace-with-chimoney-webhook-secret
+CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}
+COD_REFUND_DETAILS_TTL_DAYS=14
+ORDER_RETURN_WINDOW_DAYS=14
+COD_REFUND_DETAILS_ENCRYPTION_KEY=replace-with-strong-secret
+COD_REFUND_DETAILS_ENCRYPTION_KEYS=active-key,previous-key
+COD_REFUND_DEFAULT_CURRENCY=USD
+COD_BANK_FIELDS=countryCode,accountHolderName,accountNumber,routingNumber,bankCode/bankId,fullName,accountHolderAddress1,accountHolderCity,accountHolderRegion,accountHolderPostal,bankName,bankAddressLine1,bankCity,bankRegion,bankPostal
+COD_WALLET_FIELDS=walletProvider,walletId
+COD_REFUND_PURGE_CRON=15 3 * * *
+COD_REFUND_PURGE_TZ=UTC
+
+# Reconciliation cron
+COD_PAYOUT_RECONCILIATION_ENABLED=true
+COD_PAYOUT_RECONCILIATION_CRON=*/20 * * * *
+COD_PAYOUT_RECONCILIATION_TIMEZONE=UTC
+COD_PAYOUT_RECONCILIATION_AGE_MINUTES=45
+
+# Purge cron
+COD_REFUND_PURGE_CRON=15 3 * * *
+COD_REFUND_PURGE_TZ=UTC
+# Production recommended: COD_REFUND_PURGE_CRON=15 3 * * * / COD_REFUND_PURGE_TZ=UTC
+# Development/testing recommended: COD_REFUND_PURGE_CRON=* * * * * / COD_REFUND_PURGE_TZ=UTC
+```
+
+These are optional tuning/debug vars used by the Chimoney adapter, webhook processor, and
+Production:
+
+- `COD_REFUND_PURGE_CRON` / `COD_REFUND_PURGE_TZ` and all Chimoney tuning vars above are
+  **optional** (the app has internal defaults), but are recommended to set explicitly for rs above
+  are **optional** (the app has internal defaults), but are recommended to set explicitly for
+  predictable operations.
+- Core COD settings (adapter/currency/encryption + return/refund policy vars) remain the mandatory
+  setup surface for production readiness.
+
+**Purge + optional Chimoney tuning vars (split by environment)**
+
+Production:
+
+```env
+COD_REFUND_PURGE_CRON=15 3 * * *
+COD_REFUND_PURGE_TZ=UTC
+CHIMONEY_TIMEOUT_MS=12000
+CHIMONEY_MAX_RETRIES=3
+CHIMONEY_RETRY_BASE_DELAY_MS=500
+CHIMONEY_SOURCE_CURRENCY=USD
+COD_REFUND_CHIMONEY_WEBHOOK_STORE_RAW_DEBUG=false
+```
+
+Development/testing:
+
+```env
+COD_REFUND_PURGE_CRON=* * * * *
+COD_REFUND_PURGE_TZ=UTC
+CHIMONEY_TIMEOUT_MS=8000
+CHIMONEY_MAX_RETRIES=1
+CHIMONEY_RETRY_BASE_DELAY_MS=200
+CHIMONEY_SOURCE_CURRENCY=USD
+COD_REFUND_CHIMONEY_WEBHOOK_STORE_RAW_DEBUG=true
+```
+
+**Production vs development guidance for the keys above**
+
+- **Production**
+  - Keep `PAYMENT_PROVIDER=stripe`.
+  - Keep Stripe defaults (`STRIPE_PERCENT_FEE=2.9`, `STRIPE_FIXED_FEE_CENTS=30`) unless your Stripe
+    contract differs.
+  - Keep `STRIPE_FEE_SOURCE=balance_transaction` to favor settled Stripe balance transaction data.
+  - Use your real payout adapter ID for `COD_PAYOUT_ADAPTER` (or keep `manual` if refunds are
+    operationally handled).
+  - Legacy compatibility: `COD_PAYOUT_PROVIDER` is still read as a fallback alias if
+    `COD_PAYOUT_ADAPTER` is unset.
+  - Keep `ORDER_RETURN_WINDOW_DAYS=14` unless your customer policy differs.
+  - Keep `COD_REFUND_DETAILS_TTL_DAYS=14` (or your compliance SLA value).
+  - Set `COD_REFUND_DETAILS_ENCRYPTION_KEY` to a strong random secret (required).
+  - Set `COD_REFUND_DETAILS_ENCRYPTION_KEYS` with at least two values during key rotation:
+    `new_active_key,previous_key`.
+  - Keep `COD_REFUND_PURGE_CRON="15 3 * * *"` (daily low-traffic sweep at 03:15 UTC is a safe
+    default).
+  - Keep `COD_REFUND_PURGE_TZ=UTC` unless your operations team has a required timezone.
+    - Use the **production baseline block below** and pair production `CHIMONEY_BASE_URL` with
+      production `CHIMONEY_API_KEY`.
+- **Development**
+  - Keep `PAYMENT_PROVIDER=stripe` (unless testing a mocked provider).
+  - Keep the same Stripe fee defaults so local calculations match production expectations.
+  - Keep `STRIPE_FEE_SOURCE=balance_transaction`.
+  - Keep `COD_PAYOUT_ADAPTER=manual` unless you have a dedicated sandbox bank adapter.
+  - Keep `ORDER_RETURN_WINDOW_DAYS=14` for realistic behavior, or shorten for edge-case testing.
+  - You may shorten `COD_REFUND_DETAILS_TTL_DAYS` (for example `1`) for faster expiry-path testing.
+  - Set `COD_REFUND_DETAILS_ENCRYPTION_KEY` (required outside `NODE_ENV=test`); for local dev this
+    can be a stable non-production secret.
+  - Set `COD_REFUND_DETAILS_ENCRYPTION_KEYS` to the same value as primary unless you're testing key
+    rotation.
+  - For quick local purge verification use `COD_REFUND_PURGE_CRON="* * * * *"` (every minute).
+  - Keep `COD_REFUND_PURGE_TZ=UTC` for deterministic tests.
+  - Use the **development/testing baseline block below** and keep sandbox `CHIMONEY_BASE_URL` paired
+    with sandbox `CHIMONEY_API_KEY`.
+
+Recommended COD baseline for **production**:
+
+```env
+COD_PAYOUT_ADAPTER=chimoney
+# Optional backward-compat alias only; safe to leave unset when ADAPTER is set.
+# COD_PAYOUT_PROVIDER=chimoney
+COD_REFUND_DETAILS_TTL_DAYS=14
+ORDER_RETURN_WINDOW_DAYS=14
+COD_REFUND_DETAILS_ENCRYPTION_KEY=replace-with-strong-secret
+COD_REFUND_DETAILS_ENCRYPTION_KEYS=active-key,previous-key
+COD_REFUND_DEFAULT_CURRENCY=USD
+COD_BANK_FIELDS=countryCode,accountHolderName,accountNumber,routingNumber,bankCode/bankId,fullName,accountHolderAddress1,accountHolderCity,accountHolderRegion,accountHolderPostal,bankName,bankAddressLine1,bankCity,bankRegion,bankPostal
+COD_WALLET_FIELDS=walletProvider,walletId
+COD_REFUND_PURGE_CRON=15 3 * * *
+COD_REFUND_PURGE_TZ=UTC
+```
+
+Recommended COD baseline for **development/testing**:
+
+```env
+COD_PAYOUT_ADAPTER=chimoney
+# Optional backward-compat alias only; safe to leave unset when ADAPTER is set.
+# COD_PAYOUT_PROVIDER=chimoney
+COD_REFUND_DETAILS_TTL_DAYS=1
+ORDER_RETURN_WINDOW_DAYS=14
+COD_REFUND_DETAILS_ENCRYPTION_KEY=dev_cod_refund_primary_key
+COD_REFUND_DETAILS_ENCRYPTION_KEYS=dev_cod_refund_primary_key
+COD_REFUND_DEFAULT_CURRENCY=USD
+COD_BANK_FIELDS=countryCode,accountHolderName,accountNumber,routingNumber,bankCode/bankId,fullName,accountHolderAddress1,accountHolderCity,accountHolderRegion,accountHolderPostal,bankName,bankAddressLine1,bankCity,bankRegion,bankPostal
+COD_WALLET_FIELDS=walletProvider,walletId
+COD_REFUND_PURGE_CRON=* * * * *
+COD_REFUND_PURGE_TZ=UTC
+```
+
+- These values are fallback **field-name schema keys** for customer payout details.
+- Primary source is the dynamic beneficiary rules endpoint
+  (`GET /api/cod-refund-config/beneficiary-rules/:countryCode`).
+- Use `COD_BANK_FIELDS` / `COD_WALLET_FIELDS` only when dynamic provider rules are unavailable.
+- Do **not** place platform bank credentials in these vars.
+- Currency is controlled by `COD_REFUND_DEFAULT_CURRENCY`.
+
+**Encryption key notes (`COD_REFUND_DETAILS_ENCRYPTION_KEY` / `...KEYS`)**
+
+- `COD_REFUND_DETAILS_ENCRYPTION_KEY` is the required **primary** key used for new encryption.
+- `COD_REFUND_DETAILS_ENCRYPTION_KEYS` is an optional comma-separated rotation list used for
+  decryption compatibility.
+- In non-test environments, the backend now fails fast at startup if no COD refund key material is
+  configured.
+- `APP_SECRET`, `JWT_SECRET`, and hardcoded dev fallbacks are **not** used for COD refund encryption
+  anymore.
+- Encryption uses the primary key (`COD_REFUND_DETAILS_ENCRYPTION_KEY`), and decryption attempts all
+  configured rotation keys.
+- Rotation example:
+  1. Current: `COD_REFUND_DETAILS_ENCRYPTION_KEY=old_key`
+  2. Deploy with:
+     - `COD_REFUND_DETAILS_ENCRYPTION_KEY=new_key`
+     - `COD_REFUND_DETAILS_ENCRYPTION_KEYS=new_key,old_key`
+  3. New writes use `new_key`, old data remains decryptable
+  4. After migration window, remove `old_key`
+
+**Using Stripe sandbox (Test mode) for development**
+
+- In Stripe Dashboard, toggle **Test mode** and copy: `STRIPE_SECRET_KEY` (starts with
+  `sk_test_...`) and `STRIPE_WEBHOOK_SECRET` (`whsec_...`) from your test webhook endpoint.
+- Keep `STRIPE_FEE_SOURCE=balance_transaction` so fee numbers come from Stripe balance transaction
+  records when available.
+- `PAYMENT_PROVIDER`/Stripe keys control card payments; COD refund destination fields are still your
+
 **Subscription renewal policy (server-side)**
 
 ```
@@ -2625,13 +4136,22 @@ SETTLEMENT_SCHEDULER_ENABLED         # default true; set false to disable schedu
 SETTLEMENT_PERIOD_DAYS               # default 15 (window size per month, in days)
 SETTLEMENT_HOLD_DAYS                 # default 0 (days after period end before eligible)
 SETTLEMENT_CRON                      # default "0 0 * * *" (daily sweep)
-SETTLEMENT_TZ                        # optional, default "UTC"
+SETTLEMENT_TZ                        # optional, default "UTC"; admin/UI display formatting only
+SETTLEMENT_SCHEDULER_TZ              # optional, default "UTC"; cron scheduler timezone
 SETTLEMENT_CURRENCY                  # optional, default "USD"
 SETTLEMENT_AUTO_EXECUTE              # default false; executes newly created batches in same cron cycle
 SETTLEMENT_LOCK_KEY                  # default "lock:settlement_scheduler" (Redis distributed lock key)
 SETTLEMENT_LOCK_TTL_SECONDS          # default 120 (lock TTL in seconds)
 SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY # default "skip_cycle"; allowed: skip_cycle | run_unlocked
 ```
+
+**Settlement Timezone Policy**
+
+- Settlement boundaries are fixed to UTC midnight/UTC day-end and persisted in UTC.
+- Sellers across timezones see the same UTC-aligned settlement periods.
+- `SETTLEMENT_TZ` is display-only for admin/UI conversion and does not affect boundary calculation
+  \_TZ` is display-only for admin/UI conversion and does not affect boundary calculation or database
+  persistence.
 
 **Recommended env presets**
 
@@ -2641,7 +4161,8 @@ Production-like:
 SETTLEMENT_PERIOD_DAYS=15
 SETTLEMENT_HOLD_DAYS=3
 SETTLEMENT_CRON="0 0 * * *"      # once daily at 00:00 UTC
-SETTLEMENT_TZ="UTC"
+SETTLEMENT_TZ="Africa/Cairo"  # display formatting only; boundaries remain UTC
+SETTLEMENT_SCHEDULER_TZ="UTC"
 SETTLEMENT_CURRENCY="USD"
 SETTLEMENT_AUTO_EXECUTE=false
 SETTLEMENT_LOCK_KEY=lock:settlement_scheduler
@@ -2655,7 +4176,8 @@ Local/manual testing (fast feedback):
 SETTLEMENT_PERIOD_DAYS=1
 SETTLEMENT_HOLD_DAYS=0
 SETTLEMENT_CRON="*/2 * * * *"    # every 2 minutes
-SETTLEMENT_TZ="UTC"
+SETTLEMENT_TZ="Africa/Cairo"  # display formatting only; boundaries remain UTC
+SETTLEMENT_SCHEDULER_TZ="UTC"
 SETTLEMENT_CURRENCY="USD"
 SETTLEMENT_AUTO_EXECUTE=false
 SETTLEMENT_LOCK_KEY=lock:settlement_scheduler:dev
@@ -2665,6 +4187,15 @@ SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked
 
 > For local manual verification, keep hold days at `0` and run a frequent cron cadence
 > (`*/1`-`*/5 * * * *`) so batches become eligible quickly.
+
+**Migration note (timezone behavior change)**
+
+- `SETTLEMENT_TZ` is now treated as **display metadata only** for admin/UI rendering (UTC conversion
+  for display).
+- Cron scheduling timezone control moved to `SETTLEMENT_SCHEDULER_TZ` (default `UTC`).
+- Settlement period calculations (`periodStart` / `periodEnd`) remain UTC-only.
+- If an existing deployment previously relied on `SETTLEMENT_TZ` to shift cron execution windows,
+  set `SETTLEMENT_SCHEDULER_TZ` to the prior value to preserve behavior.
 
 **Social logins & callbacks**
 
@@ -2780,6 +4311,25 @@ STRIPE_WEBHOOK_SECRET=
 # Optional fallback only; FeeConfig in DB takes precedence
 STRIPE_PRO_PRICE_ID=
 
+# Payment provider + COD policy
+PAYMENT_PROVIDER=stripe
+STRIPE_PERCENT_FEE=2.9
+STRIPE_FIXED_FEE_CENTS=30
+STRIPE_FEE_SOURCE=balance_transaction
+COD_REFUND_METHOD=bank_transfer
+COD_PAYOUT_ADAPTER=chimoney
+# Optional backward-compat alias only; safe to leave unset when ADAPTER is set.
+# COD_PAYOUT_PROVIDER=chimoney
+COD_REFUND_DETAILS_TTL_DAYS=1
+ORDER_RETURN_WINDOW_DAYS=14
+COD_REFUND_DETAILS_ENCRYPTION_KEY=dev_cod_refund_primary_key
+COD_REFUND_DETAILS_ENCRYPTION_KEYS=dev_cod_refund_primary_key
+COD_REFUND_DEFAULT_CURRENCY=USD
+COD_BANK_FIELDS=countryCode,accountHolderName,accountNumber,routingNumber,bankCode/bankId,fullName,accountHolderAddress1,accountHolderCity,accountHolderRegion,accountHolderPostal,bankName,bankAddressLine1,bankCity,bankRegion,bankPostal
+COD_WALLET_FIELDS=walletProvider,walletId
+COD_REFUND_PURGE_CRON=* * * * *
+COD_REFUND_PURGE_TZ=UTC
+
 # Subscription renewal policy (server-side)
 SUBSCRIPTION_RENEWAL_ENABLED=true
 SUBSCRIPTION_RENEWAL_CRON="0 * * * *"
@@ -2794,7 +4344,8 @@ SETTLEMENT_SCHEDULER_ENABLED=true
 SETTLEMENT_PERIOD_DAYS=15
 SETTLEMENT_HOLD_DAYS=3
 SETTLEMENT_CRON="0 0 * * *"
-SETTLEMENT_TZ="UTC"
+SETTLEMENT_TZ="Africa/Cairo"  # display formatting only; boundaries remain UTC
+SETTLEMENT_SCHEDULER_TZ="UTC"
 SETTLEMENT_CURRENCY="USD"
 SETTLEMENT_AUTO_EXECUTE=false
 SETTLEMENT_LOCK_KEY=lock:settlement_scheduler:dev
