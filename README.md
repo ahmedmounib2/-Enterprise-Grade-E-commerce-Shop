@@ -1,4 +1,4 @@
-# AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop (This repo only have documentation mirroring the project docs that lives in a separate private repo)
+# AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop
 
 > Production-ready, enterprise-grade e-commerce storefront (React + Vite frontend, Node.js + Express
 > backend) with:
@@ -15,7 +15,7 @@
 
 ## Table of contents
 
-- [AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop (This repo only have documentation mirroring the project docs that lives in a separate private repo)](#ahmedmonib-e-shop--enterprise-grade-e-commerce-shop-this-repo-only-have-documentation-mirroring-the-project-docs-that-lives-in-a-separate-private-repo)
+- [AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop](#ahmedmonib-e-shop--enterprise-grade-e-commerce-shop)
   - [Table of contents](#table-of-contents)
   - [Maintainer context](#maintainer-context)
   - [One-line pitch](#one-line-pitch)
@@ -159,6 +159,17 @@
       - [4) Admin Reconciliation Endpoints and UI Usage](#4-admin-reconciliation-endpoints-and-ui-usage)
       - [5) Payout Reversals](#5-payout-reversals)
       - [6) Runbook Linkage](#6-runbook-linkage)
+    - [Settlement Payout Retry \& Cron Operations](#settlement-payout-retry--cron-operations)
+      - [1) What changed](#1-what-changed)
+        - [`executeStripePayout` retry behavior](#executestripepayout-retry-behavior)
+        - [`reverseStripePayout` idempotency and retry behavior](#reversestripepayout-idempotency-and-retry-behavior)
+        - [`SettlementPayout` schema/index hardening](#settlementpayout-schemaindex-hardening)
+        - [New payout retry cron job](#new-payout-retry-cron-job)
+        - [Job-health monitoring](#job-health-monitoring)
+      - [2) Environment variables reference](#2-environment-variables-reference)
+      - [3) Recommended value profiles](#3-recommended-value-profiles)
+      - [4) Runbook / troubleshooting](#4-runbook--troubleshooting)
+      - [5) Validation checklist (post-deploy)](#5-validation-checklist-post-deploy)
     - [Stripe Connect prerequisites (seller payouts)](#stripe-connect-prerequisites-seller-payouts)
   - [Products, variants \& model behavior](#products-variants--model-behavior)
   - [Dynamic categories system (tree + drag-and-drop)](#dynamic-categories-system-tree--drag-and-drop)
@@ -281,6 +292,7 @@ Additional workspace scripts:
 
 ```bash
 npm -w backend test             # backend Jest suite
+npm -w backend run migrate:settlement-payout-indexes # migrate settlement payout externalTransferId unique partial index
 npm -w frontend run build       # production build for Vercel
 npm -w mobile run android       # rebuild/install the custom dev client (native changes)
 npm -w mobile run start:local   # Metro bound to localhost (Android emulator)
@@ -3332,6 +3344,150 @@ Operator safeguards:
 For incident handling, remediation sequencing, and operator SOP details, use:
 
 - [`docs/settlements-runbook.md`](docs/settlements-runbook.md)
+
+### Settlement Payout Retry & Cron Operations
+
+This section captures the payout resiliency behavior added in Tasks 8–14 and how to operate it
+safely.
+
+#### 1) What changed
+
+##### `executeStripePayout` retry behavior
+
+- **Retryable Stripe/transient classes:** transfer retries are attempted for transient connectivity
+  and throttling failures (`api_connection_error`, `rate_limit_error`) and timeout-style transport
+  failures (`etimedout`, `timeout`, `timed_out`, `request_timeout`, `ecconnaborted`, `econnaborted`,
+  `econnreset`, or timeout-like error messages).
+- **Exponential backoff sequence:** retries use `100ms -> 500ms -> 2000ms` delays, giving up after
+  the final attempt.
+- **Idempotency reuse across attempts:** the same payout idempotency key is reused for all attempts
+  (`payout.idempotencyKey` if present, otherwise `settlement:<batchId>:<sellerId>:<currency>`),
+  preventing duplicate transfers when Stripe eventually accepts a retried request.
+- **Terminal behavior after max retries:** when attempts are exhausted, payout is persisted as
+  `failed` with enriched `methodSnapshot.retry` context (`attemptCount`, per-attempt history,
+  `retriesExhausted`, and final Stripe error metadata including request id). A reconciliation alert
+  payload is also emitted with `payoutFailureContext` so operators can triage from logs/email
+  without DB forensics.
+
+##### `reverseStripePayout` idempotency and retry behavior
+
+- **Skip if already reversed:** if reversal evidence already exists (`reversalId` or
+  `methodSnapshot.reversal.id`), reversal is treated as idempotent no-op completion and the payout
+  is normalized to `status: reversed` without creating duplicate financial effects.
+- **Reversal idempotency key format:** Stripe reversal calls use `settlement-reversal:<payoutId>`.
+- **Retry + escalation:** reversal calls share the same transient retry strategy/backoff as
+  execution (`100ms -> 500ms -> 2000ms`). If retries exhaust, the service logs a structured failure,
+  returns `failureContext`, and sends reconciliation-report alerts so operations can manually
+  investigate/resolve.
+
+##### `SettlementPayout` schema/index hardening
+
+- Added `retryCount` (non-negative, indexed) to track payout retry lifecycle.
+- Added unique partial index for `externalTransferId` so any non-empty transfer id is globally
+  unique.
+- `methodSnapshot` now explicitly documents canonical execution audit fields:
+  - `methodSnapshot.executedAt`
+  - `methodSnapshot.idempotencyKey`
+
+##### New payout retry cron job
+
+- **Selection criteria:** cron scans payouts where `status = failed` and
+  `retryCount < SETTLEMENT_PAYOUT_RETRY_MAX_RETRIES`.
+- **Success path:** on successful retry, payout is confirmed `paid` and `retryCount` is reset to
+  `0`.
+- **Failure path:** unsuccessful attempts increment `retryCount`; once threshold is reached, payout
+  transitions to `manual_required` and emits an operator alert.
+
+##### Job-health monitoring
+
+- **Stale scheduler detection:** job-health raises alerts if `settlement_scheduler` has not
+  completed inside `JOB_HEALTH_SCHEDULER_STALE_HOURS`.
+- **Payout retry failure-rate alerts:** payout retry runs are windowed and failure-rate alerts are
+  triggered when configured minimum-run and threshold conditions are met.
+
+#### 2) Environment variables reference
+
+| Variable                                   | Purpose                                                                          | Accepted format / range                                                                   | Operational effect                                                                                                           |
+| ------------------------------------------ | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `SETTLEMENT_PAYOUT_RETRY_ENABLED`          | Enables/disables payout retry cron scheduling.                                   | Boolean-like (`true/false`, `1/0`, `yes/no`, `on/off`).                                   | `false` disables automatic recovery, so failed payouts remain failed/manual until operators act.                             |
+| `SETTLEMENT_PAYOUT_RETRY_CRON`             | Cron cadence for retry cycles.                                                   | Valid cron expression (node-cron syntax).                                                 | Faster cadence reduces time-to-recovery but increases Stripe/API pressure and log volume.                                    |
+| `SETTLEMENT_PAYOUT_RETRY_MAX_RETRIES`      | Max failed retry attempts before escalation.                                     | Positive integer (`>=1`).                                                                 | Lower values escalate to `manual_required` faster; higher values increase auto-retry persistence before manual intervention. |
+| `SETTLEMENT_SCHEDULER_TZ`                  | Timezone used by settlement-related cron jobs.                                   | Valid IANA timezone (e.g., `UTC`, `America/New_York`). Invalid values fall back to `UTC`. | Controls when cron expressions fire in wall-clock terms; mismatches can cause off-hours execution.                           |
+| `JOB_HEALTH_SCHEDULER_STALE_HOURS`         | Staleness threshold for scheduler-health alerting.                               | Positive integer hours.                                                                   | Lower values alert sooner for stuck schedulers; overly low values can create noisy false positives.                          |
+| `JOB_HEALTH_PAYOUT_FAILURE_RATE_THRESHOLD` | Failure-rate alert threshold for payout retry job.                               | Decimal between `0` and `1` inclusive.                                                    | Lower thresholds make alerting more sensitive to degradation; higher thresholds reduce alert frequency.                      |
+| `JOB_HEALTH_PAYOUT_FAILURE_WINDOW_RUNS`    | Number of latest runs evaluated for payout failure rate.                         | Positive integer.                                                                         | Smaller windows react quickly to spikes; larger windows smooth volatility and react slower.                                  |
+| `JOB_HEALTH_PAYOUT_FAILURE_MIN_RUNS`       | Minimum runs required before failure-rate alerts can trigger.                    | Positive integer.                                                                         | Prevents early noisy alerts on low sample sizes; too high can delay real incident detection.                                 |
+| `SETTLEMENT_RECONCILIATION_REPORT_EMAILS`  | Explicit recipient list for reconciliation/retry/reversal failure notifications. | Comma/semicolon separated email list.                                                     | Empty value suppresses direct email notifications; configured value provides immediate operator visibility.                  |
+
+#### 3) Recommended value profiles
+
+**Development / testing profile** (fast feedback, aggressive retry testing)
+
+```env
+# Settlement payout retry behavior (dev): fast loops + quick escalation for test cycles
+SETTLEMENT_PAYOUT_RETRY_ENABLED=true
+SETTLEMENT_PAYOUT_RETRY_CRON=*/5 * * * *                 # run every 5 minutes for rapid feedback
+SETTLEMENT_PAYOUT_RETRY_MAX_RETRIES=2                    # intentionally low for quicker manual_required testing
+SETTLEMENT_SCHEDULER_TZ=UTC                              # stable scheduler timing across developer machines/CI
+
+# Job-health sensitivity (dev): detect regressions quickly
+JOB_HEALTH_SCHEDULER_STALE_HOURS=2                       # flag scheduler stalls quickly while testing
+JOB_HEALTH_PAYOUT_FAILURE_RATE_THRESHOLD=0.20            # alert when >=20% of recent runs fail
+JOB_HEALTH_PAYOUT_FAILURE_WINDOW_RUNS=6                  # evaluate small window for fast signal
+JOB_HEALTH_PAYOUT_FAILURE_MIN_RUNS=3                     # allow alerting after limited warmup
+
+# Alert routing (dev/test inboxes)
+SETTLEMENT_RECONCILIATION_REPORT_EMAILS=devops@example.com,qa@example.com
+```
+
+**Production profile** (safe cadence, stable alerting)
+
+```env
+# Settlement payout retry behavior (prod): balanced recovery and API stability
+SETTLEMENT_PAYOUT_RETRY_ENABLED=true
+SETTLEMENT_PAYOUT_RETRY_CRON=30 * * * *                 # run hourly at minute 30
+SETTLEMENT_PAYOUT_RETRY_MAX_RETRIES=3                   # recommended production default
+SETTLEMENT_SCHEDULER_TZ=UTC                             # predictable cross-region scheduling baseline
+
+# Job-health sensitivity (prod): stable signal, lower alert noise
+JOB_HEALTH_SCHEDULER_STALE_HOURS=24                     # alert if scheduler misses a full-day completion window
+JOB_HEALTH_PAYOUT_FAILURE_RATE_THRESHOLD=0.30           # alert when >=30% failure rate across evaluation window
+JOB_HEALTH_PAYOUT_FAILURE_WINDOW_RUNS=20                # smooth short spikes via wider run window
+JOB_HEALTH_PAYOUT_FAILURE_MIN_RUNS=5                    # require enough samples before paging
+
+# Alert routing (ops/on-call)
+SETTLEMENT_RECONCILIATION_REPORT_EMAILS=finance-ops@example.com,oncall@example.com
+```
+
+**Why dev uses `2` retries while production uses `3`:** development optimizes for rapid failure-path
+validation and faster operator handoff testing, while production keeps one extra retry attempt to
+absorb transient Stripe/network instability and reduce unnecessary manual escalations.
+
+#### 4) Runbook / troubleshooting
+
+- **Detect stuck scheduler:** monitor job-health for stale `settlement_scheduler` completion age
+  breaching `JOB_HEALTH_SCHEDULER_STALE_HOURS`, and corroborate with missing settlement/retry cycle
+  logs.
+- **Detect rising retry failure rate:** watch payout retry job-health `alerts.payoutFailureRate` and
+  threshold-breach logs; rising trend usually indicates Stripe dependency, connectivity, or
+  account-state issues.
+- **When to manually intervene (`manual_required`):** intervene when payouts cross retry threshold,
+  have persistent linkage/configuration failures, or repeated Stripe hard errors; use admin
+  reconciliation + manual completion/export workflow.
+- **Temporary incident tuning:** during active incidents, you can (a) shorten
+  `SETTLEMENT_PAYOUT_RETRY_CRON` for tighter retry loops, (b) increase/decrease
+  `SETTLEMENT_PAYOUT_RETRY_MAX_RETRIES` based on whether you prefer auto-recovery vs explicit manual
+  control, and (c) relax/tighten job-health thresholds to match incident noise tolerance. Revert to
+  baseline values after stabilization.
+
+#### 5) Validation checklist (post-deploy)
+
+- [ ] Confirm payout retry cron is enabled and scheduled (`SETTLEMENT_PAYOUT_RETRY_ENABLED=true`,
+      schedule log emitted).
+- [ ] Confirm `SettlementPayout` indexes are present (including unique partial `externalTransferId`)
+      via migration/check.
+- [ ] Confirm job-health records/metrics are updating for `settlement_scheduler` and `payout_retry`.
+- [ ] Confirm alert channel/email recipients receive a controlled test notification.
 
 ### Stripe Connect prerequisites (seller payouts)
 
