@@ -61,6 +61,30 @@
       - [Pro Plan subscription purchase flow (Stripe Checkout)](#pro-plan-subscription-purchase-flow-stripe-checkout)
       - [Subscription renewal \& expiration handling](#subscription-renewal--expiration-handling)
       - [Admin/operations notes](#adminoperations-notes)
+  - [Subscription Billing Ledger](#subscription-billing-ledger)
+    - [Architecture \& Design](#architecture--design)
+      - [1) Separation from settlement payouts](#1-separation-from-settlement-payouts)
+      - [2) End-to-end flow](#2-end-to-end-flow)
+      - [3) Idempotency design (`stripeInvoiceId`)](#3-idempotency-design-stripeinvoiceid)
+    - [Data Model Specification (`sellerBilling.model.js`)](#data-model-specification-sellerbillingmodeljs)
+    - [API Specification](#api-specification)
+      - [Seller billing history](#seller-billing-history)
+      - [Admin billing history](#admin-billing-history)
+    - [Webhook Handling Behavior](#webhook-handling-behavior)
+      - [Event filtering and processing](#event-filtering-and-processing)
+      - [Duplicate replay behavior and idempotent outcomes](#duplicate-replay-behavior-and-idempotent-outcomes)
+      - [Failure handling and logging](#failure-handling-and-logging)
+    - [Frontend Design](#frontend-design)
+      - [Seller dashboard IA change](#seller-dashboard-ia-change)
+      - [Billing History tab behavior](#billing-history-tab-behavior)
+      - [UI state handling](#ui-state-handling)
+      - [Explicit separation note](#explicit-separation-note)
+    - [Settlement Isolation Guarantees](#settlement-isolation-guarantees)
+    - [Test Coverage Matrix](#test-coverage-matrix)
+    - [Backward Compatibility / Rollout Notes](#backward-compatibility--rollout-notes)
+      - [Existing sellers with no billing records](#existing-sellers-with-no-billing-records)
+      - [Index rollout considerations](#index-rollout-considerations)
+      - [Post-deploy operational verification checklist](#post-deploy-operational-verification-checklist)
     - [Mobile Category Tree v2 (dynamic categories)](#mobile-category-tree-v2-dynamic-categories)
     - [DaisyUI theming (web + mobile)](#daisyui-theming-web--mobile)
     - [Wishlist DTO \& API contract](#wishlist-dto--api-contract)
@@ -1038,6 +1062,233 @@ seller’s plan expires between renewal sweeps.
 
 These changes are stored in the database and take effect immediately without requiring a deploy or
 environment variable updates (except the optional Stripe price fallback).
+
+## Subscription Billing Ledger
+
+### Architecture & Design
+
+#### 1) Separation from settlement payouts
+
+Subscription billing ledger records are stored in a dedicated `SellerBilling` collection, not in
+settlement payout entities (`SettlementBatch`, `SettlementPayout`) and not as payout ledger rows.
+This keeps subscription invoice history conceptually and operationally separate from settlement
+payout execution.
+
+#### 2) End-to-end flow
+
+1. Stripe sends `invoice.payment_succeeded` webhook event.
+2. Webhook handler validates invoice identity and linkage (`customer` and/or `subscription`).
+3. Handler resolves seller by Stripe linkage IDs.
+4. Handler maps Stripe invoice into normalized billing row fields (`amountCents`, `currency`,
+   `date`, `status`, `description`, `stripeInvoiceId`).
+5. Service persists into `SellerBilling` via idempotent insert semantics.
+6. Seller query API (`/api/seller/billing-history`) returns seller-only rows with pagination
+   metadata.
+7. Admin/staff query API (`/api/admin/platform-financials/billing-history`) returns global or
+   seller-filtered rows.
+8. Frontend seller dashboard `Billing History` tab fetches and renders rows with
+   loading/empty/error/pagination states.
+
+#### 3) Idempotency design (`stripeInvoiceId`)
+
+- `stripeInvoiceId` is a required field and has a unique index.
+- First delivery inserts the row.
+- Replay delivery of the same invoice triggers duplicate key (`code 11000`) and is translated into a
+  non-fatal duplicate outcome.
+- Webhook still returns `200 { received: true }` for duplicates to avoid Stripe retry storms.
+
+### Data Model Specification (`sellerBilling.model.js`)
+
+Collection: `SellerBilling`
+
+Fields:
+
+- `sellerId` (`ObjectId`, required, indexed)
+  - Reference: `Seller`
+  - Must be present for every row.
+- `amountCents` (`Number`, required)
+  - Stored in minor units (cents).
+  - Service normalizes values by numeric cast + rounding.
+- `currency` (`String`, required, trimmed, uppercased)
+  - Required currency code, normalized by schema/service.
+- `date` (`Date`, required, default `Date.now`)
+  - Invoice event date (or current time fallback).
+- `stripeInvoiceId` (`String`, required, trimmed)
+  - Canonical Stripe invoice identifier.
+  - Global unique index enforces idempotency.
+- `status` (`String`, required, enum)
+  - Allowed: `draft`, `open`, `paid`, `void`, `uncollectible`, `payment_failed`.
+- `description` (`String`, optional, trimmed, default `null`)
+  - Human-readable invoice context.
+
+Indexes:
+
+1. `sellerBillingSchema.index({ sellerId: 1, date: -1, _id: -1 })`
+   - Supports seller/admin history pagination with stable reverse-chronological sort.
+2. `sellerBillingSchema.index({ stripeInvoiceId: 1 }, { unique: true })`
+   - Enforces webhook idempotency by invoice ID.
+
+Pagination and sorting approach:
+
+- Query params `page` and `limit` are parsed as positive integers.
+- `limit` is capped at `100`.
+- Server computes `skip = (page - 1) * limit`.
+- Sort order is deterministic: `{ date: -1, _id: -1 }` (stable even when timestamps tie).
+- Response metadata includes `page`, `limit`, `total`, `totalPages`.
+
+### API Specification
+
+#### Seller billing history
+
+- **Method/Path:** `GET /api/seller/billing-history`
+- **AuthN/AuthZ:** authenticated seller route (`protectRoute` + `requireSeller`).
+- **Query params:**
+  - `page` (optional, positive int, default `1`)
+  - `limit` (optional, positive int, default `20`, max `100`)
+- **Success response (200):**
+
+```json
+{
+  "items": [
+    {
+      "id": "<billing_row_id>",
+      "sellerId": "<seller_id>",
+      "recordType": "subscription_invoice",
+      "amountCents": 2500,
+      "currency": "USD",
+      "date": "2026-01-01T10:00:00.000Z",
+      "stripeInvoiceId": "in_001",
+      "status": "paid",
+      "billingStatus": "paid",
+      "settlementPayoutStatus": null,
+      "description": "Pro monthly subscription"
+    }
+  ],
+  "page": 1,
+  "limit": 20,
+  "total": 17,
+  "totalPages": 1
+}
+```
+
+- **Error responses:**
+  - `403 { "message": "Seller account required" }` when seller context is missing.
+  - `500` delegated to error middleware for unexpected failures.
+
+#### Admin billing history
+
+- **Method/Path:** `GET /api/admin/platform-financials/billing-history`
+- **AuthN/AuthZ:** authenticated `admin` or `staff` (`protectRoute` +
+  `restrictTo('admin', 'staff')`).
+- **Query params:**
+  - `sellerId` (optional, ObjectId string)
+  - `page` (optional, positive int, default `1`)
+  - `limit` (optional, positive int, default `20`, max `100`)
+- **Success response (200):** same schema as seller endpoint.
+- **Error responses:**
+  - `400 { "message": "Invalid sellerId" }` when provided sellerId is not a valid ObjectId.
+  - `500` delegated to error middleware for unexpected failures.
+
+### Webhook Handling Behavior
+
+#### Event filtering and processing
+
+- Only the Stripe `invoice.payment_succeeded` event path creates subscription billing rows in
+  Task 15.
+- Processing prerequisites:
+  - valid invoice ID (`invoice.id`)
+  - at least one seller-linkage identifier (`invoice.customer` or `invoice.subscription`)
+  - seller lookup success
+- If any prerequisite is missing, handler logs a warning and acknowledges with success
+  (`{ received: true }`).
+
+#### Duplicate replay behavior and idempotent outcomes
+
+- Duplicate webhook deliveries for the same invoice reuse the same `stripeInvoiceId`.
+- Unique index rejects second insert; service returns `{ recorded: false, duplicate: true }`.
+- Handler logs informational duplicate message and still returns `200`, achieving idempotent side
+  effects.
+
+#### Failure handling and logging
+
+- Non-fatal validation misses are logged as `warn` and acknowledged.
+- Persistence/processing exceptions are logged as `error` with event and Stripe linkage context.
+- Even processing failures currently acknowledge webhook receipt (`200`) to avoid uncontrolled retry
+  loops; errors remain observable through logs.
+
+### Frontend Design
+
+#### Seller dashboard IA change
+
+A dedicated seller-dashboard tab was added:
+
+- Tab label: **Billing History**
+- Panel: `SellerBillingHistoryPanel`
+- Data source: `/api/seller/billing-history`
+
+#### Billing History tab behavior
+
+- Shows invoice-focused table columns: date, amount, currency, Stripe invoice ID, status badge,
+  description.
+- The subtitle explicitly communicates separation from payouts: invoices are “separately from
+  settlement payouts.”
+
+#### UI state handling
+
+- **Loading:** initial skeleton/notice while first page is fetched.
+- **Empty:** “No invoices found yet.”
+- **Error:** visible inline error banner using API/store error message.
+- **Pagination:** previous/next controls + `Page X of Y` summary using API metadata.
+
+#### Explicit separation note
+
+This tab is invoice history only; settlement payouts remain under the existing settlement/financial
+views and are not merged into this table.
+
+### Settlement Isolation Guarantees
+
+- Settlement payout scheduling/execution calculations remain based on settlement ledger and payout
+  entities, not `SellerBilling` rows.
+- Subscription invoice rows contribute to liabilities visibility (`subscription_fees`) but are not
+  transformed into settlement payout rows.
+- Therefore, subscription billing records do **not** mutate settlement batch payable computation or
+  payout transfer execution paths.
+
+### Test Coverage Matrix
+
+| Requirement                      | Concrete tests                                                                                                                                                                                                                                                                                                  |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Idempotency by `stripeInvoiceId` | `backend/src/tests/services/sellerBilling.service.spec.js` verifies duplicate-key handling (`code=11000`) returns `{ recorded:false, duplicate:true }`; `backend/src/tests/controllers/payment.webhook.controller.spec.js` verifies replay of same Stripe invoice is acknowledged and reprocessed idempotently. |
+| Pagination correctness           | `backend/src/tests/controllers/billing.history.controller.spec.js` verifies deterministic pagination metadata and stable sort contract; `backend/src/tests/routes/billing-history.pagination.route.spec.js` verifies route-level `page/limit/total/totalPages` response behavior for seller/admin endpoints.    |
+| Settlement balances unaffected   | `backend/src/tests/services/sellerBilling.service.spec.js` and liabilities integration in `backend/src/services/ledger/liabilities.service.js` keep subscription dues scoped to outstanding billing statuses only, leaving settlement payout status accounting untouched.                                       |
+| Webhook integration behavior     | `backend/src/tests/controllers/payment.webhook.controller.spec.js` validates `invoice.payment_succeeded` ingestion, seller linkage checks, duplicate replay behavior, and missing-linkage acknowledgement semantics.                                                                                            |
+
+### Backward Compatibility / Rollout Notes
+
+#### Existing sellers with no billing records
+
+- Seller billing endpoint returns empty `items` with deterministic metadata (`total=0`,
+  `totalPages=1`) and frontend displays empty state.
+- No data migration is required for historical sellers to continue operating.
+
+#### Index rollout considerations
+
+- `stripeInvoiceId` unique index must be created before relying on hard idempotency guarantees.
+- If legacy duplicates somehow exist, index build will fail; deduplicate by invoice ID before
+  enforcing uniqueness.
+- Build index during low-traffic window if collection is large.
+
+#### Post-deploy operational verification checklist
+
+1. Confirm unique index exists on `stripeInvoiceId`.
+2. Send/observe a real or staged `invoice.payment_succeeded` event and verify one `SellerBilling`
+   row is created.
+3. Replay same event and verify no second row is created; logs should indicate duplicate replay
+   ignored.
+4. Verify seller endpoint pagination and UI tab rendering for both non-empty and empty sellers.
+5. Verify admin endpoint with/without `sellerId` filter.
+6. Verify settlement payout scheduling/execution outputs are unchanged for same ledger period
+   inputs.
 
 ### Mobile Category Tree v2 (dynamic categories)
 
@@ -3347,8 +3598,7 @@ For incident handling, remediation sequencing, and operator SOP details, use:
 
 ### Settlement Payout Retry & Cron Operations
 
-This section captures the payout resiliency behavior added in Tasks 8–14 and how to operate it
-safely.
+This section captures the payout resiliency behavior and how to operate it safely.
 
 #### 1) What changed
 
