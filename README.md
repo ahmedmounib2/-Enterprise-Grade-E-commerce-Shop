@@ -2395,8 +2395,116 @@ If an order stays in `pending_refund` longer than expected:
 
 **Settlement hold enforcement**
 
+- `payoutHold` is a seller-level settlement safety switch. When `true`, future scheduled settlement
+  payouts are paused for that seller, but the seller storefront and normal order operations remain
+  active.
 - Settlement scheduler excludes sellers with `payoutHold=true` from scheduled payouts until the
   related refund is resolved.
+
+**Admin operations: set / unset payout hold**
+
+- API endpoint: `POST /api/admin/sellers/:id/payout-hold` (admin-only).
+- Request body:
+
+  ```json
+  {
+    "enabled": true,
+    "reason": "Risk review pending",
+    "until": "2026-06-01T00:00:00.000Z"
+  }
+  ```
+
+  Notes:
+  - `enabled` (boolean) is required.
+  - `reason` is required when `enabled=true`.
+  - `until` is optional and must be a valid date when provided.
+
+- Example enable response (`200`): returns updated `Seller` document with hold state + history.
+
+  ```json
+  {
+    "_id": "664f0cc0f9e53a001f8ab123",
+    "payoutHold": true,
+    "payoutHoldReason": "Risk review pending",
+    "payoutHoldSetAt": "2026-05-03T12:00:00.000Z",
+    "payoutHoldHistory": [
+      {
+        "setAt": "2026-05-03T12:00:00.000Z",
+        "enabled": true,
+        "reason": "Risk review pending",
+        "until": "2026-06-01T00:00:00.000Z",
+        "adminId": "664f0aa1f9e53a001f8ab111"
+      }
+    ]
+  }
+  ```
+
+- Example unset request:
+
+  ```json
+  {
+    "enabled": false,
+    "reason": "Refund issue resolved"
+  }
+  ```
+
+- Example unset response (`200`):
+
+  ```json
+  {
+    "_id": "664f0cc0f9e53a001f8ab123",
+    "payoutHold": false,
+    "payoutHoldReason": null,
+    "payoutHoldSetAt": null,
+    "payoutHoldHistory": [
+      {
+        "setAt": "2026-05-01T09:00:00.000Z",
+        "enabled": true,
+        "reason": "cod_refund_pending",
+        "adminId": "664f0aa1f9e53a001f8ab111"
+      },
+      {
+        "setAt": "2026-05-03T12:10:00.000Z",
+        "clearedAt": "2026-05-03T12:10:00.000Z",
+        "enabled": false,
+        "reason": "Refund issue resolved",
+        "adminId": "664f0aa1f9e53a001f8ab111"
+      }
+    ]
+  }
+  ```
+
+- Admin UI path: **Admin → Sellers → Seller details/actions → Payout hold**.
+  - Enable hold: set `enabled=true` and provide reason (optional date window via `until`).
+  - Clear hold: set `enabled=false`; current hold fields are reset and an audit row is appended.
+
+**Scheduler behavior with held sellers**
+
+- In settlement scheduling, the system computes positive seller payouts, then filters out sellers
+  where `payoutHold=true`.
+- Held sellers are ignored only for payout batch inclusion; their eligible ledger entries remain
+  pending and can be picked up in later runs after hold removal.
+- The hold is re-evaluated each scheduler run, so once unset, the seller is eligible again
+  automatically.
+
+**`payoutHoldHistory` structure (Seller model)**
+
+Each history item records one hold toggle event:
+
+- `setAt` (`Date`, default now): when the event was recorded.
+- `clearedAt` (`Date|null`): populated for clear/unset events.
+- `enabled` (`Boolean`, required): target state from this action.
+- `until` (`Date|null`): optional operator-provided hold-until marker.
+- `reason` (`String|null`): hold rationale.
+- `adminId` (`ObjectId|null`): admin actor.
+
+Validation errors (API):
+
+- `400` invalid seller id.
+- `400` `enabled` not boolean.
+- `400` missing reason while enabling hold.
+- `400` invalid `until` date.
+- `404` seller not found.
 
 - Seller liabilities endpoint: `GET /api/seller/financials/liabilities`
   - Seller-authenticated dashboard endpoint for liability-only payloads.
@@ -2604,9 +2712,27 @@ platform-owned merchant rows.
 - `failed`: Stripe transfer attempt failed.
 - `manual_required`: cannot auto-pay (for example, missing Stripe account); export CSV and process
   manually.
+- `retryable`: payout was reversed from a prior paid transfer and is ready for controlled
+  re-execution using a regenerated idempotency key.
 
-See the dedicated operator guide for fallback payout + CSV procedures:
-[`docs/settlements-runbook.md`](docs/settlements-runbook.md).
+**Reversal + retry semantics**
+
+- Reversal endpoint transitions a paid payout to `retryable` and persists reversal metadata
+  (`reversalId`, `reversedAt`, actor) for auditability.
+- Reversal and retry flows regenerate payout idempotency keys (`...:retry:<n>:<timestamp>`) so each
+  retry execution has a distinct transfer domain while retaining linkage through
+  `previousPayoutId`/`nextPayoutId`.
+- Repeating reversal requests is idempotent: no duplicate status transition and no duplicate
+  `payout_reversal` ledger rows.
+
+**Retry ledger entry (`payout_execution`) and reconciliation math**
+
+- A successful re-execution of a retryable payout creates a ledger entry type `payout_execution`.
+- Reconciliation for a reversed + re-executed payout should satisfy:
+  `payout_reversal (-P) + payout_execution (+P) = 0` net delta relative to baseline paid settlement,
+  while preserving the full correction history.
+- See the dedicated operator guide for fallback payout + CSV procedures:
+  [`docs/settlements-runbook.md`](docs/settlements-runbook.md).
 
 **Settlement/payout environment variables**
 

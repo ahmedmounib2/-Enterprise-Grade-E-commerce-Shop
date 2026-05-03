@@ -21,6 +21,8 @@ Entries start with `payoutStatus=pending` and move through these phases:
 1. **Pending**: eligible for upcoming settlement periods.
 2. **Scheduled**: attached to a `SettlementBatch` and frozen for payout execution.
 3. **Paid**: finalized after transfer success.
+4. **Retryable**: a previously paid payout was reversed and is queued for re-execution with a
+   regenerated payout idempotency key.
 
 Scheduler netting rule is carry-forward by design: each cycle nets all pending entries where
 `createdAt <= periodEnd`. This means pending rows from prior windows are intentionally included
@@ -59,6 +61,7 @@ until they are scheduled/paid.
 - `paid`: transfer succeeded (`externalTransferId` populated).
 - `failed`: transfer attempt failed.
 - `manual_required`: auto payout blocked; manual operator flow required.
+- `retryable`: paid transfer was reversed and is eligible for a controlled re-execution.
 
 ---
 
@@ -310,12 +313,15 @@ Troubleshooting stuck pending refunds:
 - Endpoint: `POST /api/admin/settlements/payouts/:payoutId/reverse`
 - Preconditions: payout exists, has `externalTransferId`, status is `paid`.
 - Success effects:
-  - payout status updates to `reversed`,
-  - `reversalId`/`reversedAt` persisted,
-  - negative ledger posting created (`type: payout_reversal`).
+- payout status transitions to `retryable` (not terminal `reversed`),
+  - reversal metadata is persisted under `reversalInfo` (`reversalId`, `reversedAt`, actor),
+  - payout idempotency key is regenerated to a `...:retry:<n>:<timestamp>` key for the next
+    execution attempt,
+  - negative ledger posting is upserted (`type: payout_reversal`, key:
 
-Idempotency expectation: already-reversed payouts should return a no-op response without creating
-another reversal entry.
+Idempotency expectation: repeating the same reversal request does not create duplicate transitions
+and does not create duplicate `payout_reversal` rows. If the payout is already `retryable` for the
+same reversal key, the API returns a no-op success payload.
 
 ---
 
@@ -392,3 +398,20 @@ When `manual_required` payouts exist, follow this short procedure:
 
 - `missing_stripe_account_id`
 - `non_positive_amount`
+
+### Re-execution ledger semantics (`payout_execution`)
+
+When a `retryable` payout is executed successfully, the system creates a new payout row linked by
+`previousPayoutId` and writes an idempotent ledger entry of type `payout_execution`.
+
+Reconciliation math for reversed/re-executed payouts:
+
+- Original payout economic effect: `+P` (already reflected by prior paid settlement state).
+- Reversal entry: `-P` (`payout_reversal`).
+- Re-execution entry: `+P` (`payout_execution`).
+- Net replay-safe effect across reversal + re-execution: `(-P) + (+P) = 0` delta against the
+  already-booked baseline, while preserving a complete audit trail.
+
+Operationally, this means you should expect exactly one `payout_reversal` row per reversed payout
+idempotency domain and at most one successful `payout_execution` row per successful retry payout
+execution attempt key.
