@@ -313,15 +313,35 @@ Troubleshooting stuck pending refunds:
 - Endpoint: `POST /api/admin/settlements/payouts/:payoutId/reverse`
 - Preconditions: payout exists, has `externalTransferId`, status is `paid`.
 - Success effects:
-- payout status transitions to `retryable` (not terminal `reversed`),
+  - payout status transitions to `retryable` (not terminal `reversed`),
   - reversal metadata is persisted under `reversalInfo` (`reversalId`, `reversedAt`, actor),
   - payout idempotency key is regenerated to a `...:retry:<n>:<timestamp>` key for the next
     execution attempt,
-  - negative ledger posting is upserted (`type: payout_reversal`, key:
+  - negative ledger posting is upserted (`type: payout_reversal`, key is payout+reversal scoped).
 
 Idempotency expectation: repeating the same reversal request does not create duplicate transitions
 and does not create duplicate `payout_reversal` rows. If the payout is already `retryable` for the
 same reversal key, the API returns a no-op success payload.
+
+### Retry endpoints (operator usage quick reference)
+
+- **Batch retry** — `POST /api/admin/settlements/payouts/retry`
+  - Use when multiple payouts need replay after provider/API incidents or after large reversal
+    waves.
+  - Eligible statuses: `failed` and `retryable`.
+  - Typical transition on success: `failed|retryable` -> `processing` -> `paid` (or
+    `manual_required` if prerequisites are missing).
+
+- **Single payout retry (if enabled in your deployment)** —
+  `POST /api/admin/settlements/payouts/:payoutId/retry`
+  - Use for targeted replay of one seller/payout after validating provider state.
+  - Eligible statuses: `failed` and `retryable` (same eligibility as batch retry).
+  - Typical transition on success: `failed|retryable` -> `processing` -> `paid` (or
+    `manual_required`).
+
+- **When to choose batch vs single**
+  - Choose **batch** for queue-level recovery and consistent replay across many payouts.
+  - Choose **single** for surgical retries where broad reprocessing is unnecessary or risky.
 
 ---
 

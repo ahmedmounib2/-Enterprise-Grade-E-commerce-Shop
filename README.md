@@ -2698,22 +2698,54 @@ platform-owned merchant rows.
 
 - Stripe API / balance failures => payout `failed`.
 
+**Settlement amount semantics**
+
+- `grossEligibleAmountCents`: total eligible ledger value before reserve withholding.
+- `reserveWithheldAmountCents`: reserve/holdback value withheld for risk policy.
+- `netPayoutAmountCents`: payout-intended net after reserve withholding.
+- Net equation: `netPayoutAmountCents = grossEligibleAmountCents - reserveWithheldAmountCents`.
+
 **Batch statuses (`SettlementBatch.status`)**
 
 - `calculated`: reserved for pre-scheduled calculation states.
 - `scheduled`: payouts are queued and awaiting execution.
 - `paid`: all payouts in the batch are terminally paid.
-- `failed`: at least one payout failed and needs operator intervention.
+- `partial`: mixed outcome where at least one payout is paid and one remains unresolved.
+- `failed`: unresolved failures/manual-required outcomes need operator intervention.
+- `skipped_no_positive_payouts`: scheduling pass found no positive seller net payouts.
 
-**Payout statuses (`SettlementPayout.status`)**
+**Why batch `retryable` is not the primary status**
+
+`retryable` is a payout-level recovery state, not a batch-level lifecycle summary. A single batch
+can contain `paid`, `failed`, `manual_required`, and `retryable` payouts simultaneously. The batch
+status remains the primary operational summary (`scheduled`/`paid`/`partial`/`failed`/`skipped...`).
+Use `hasRetryablePayouts` as the explicit signal for retry actionability.
+
+**`hasRetryablePayouts` indicator**
+
+- `hasRetryablePayouts=true` means one or more payouts in the batch are currently retryable.
+- It unlocks retry-focused actions without changing the primary batch status semantics. **Payout
+  statuses (`SettlementPayout.status`)**
 
 - `scheduled`: ready to execute.
 - `paid`: transfer completed (`externalTransferId` recorded).
 - `failed`: Stripe transfer attempt failed.
 - `manual_required`: cannot auto-pay (for example, missing Stripe account); export CSV and process
-  manually.
-- `retryable`: payout was reversed from a prior paid transfer and is ready for controlled
-  re-execution using a regenerated idempotency key.
+  manually. **Manual payout approval + CSV export workflow**
+
+1. Execute/sweep payouts and isolate `manual_required` records.
+2. Export manual payout CSV for treasury/off-platform transfer operations.
+3. Perform payout outside automated rails.
+4. Approve manually with transaction reference + notes.
+5. Recompute batch status; batches return to `paid` when all unresolved payouts are settled.
+
+re-execution using a regenerated idempotency key.
+
+**Reversal scopes**
+
+- Per-seller reverse: reverse one paid payout.
+- Selected bulk reverse: reverse a selected set of payout IDs.
+- Full batch reverse: reverse all eligible paid payouts in a batch. -
 
 **Reversal + retry semantics**
 
@@ -2921,14 +2953,38 @@ Endpoint: `GET /api/seller/financials/summary`
 - For platform-store seller context (admin acting as platform seller), default scope is
   merchant-only and summary is restricted to platform-owned order IDs.
 
-**New merchant subtotal fields in summary**
+**Response DTO (summary `data` object)**
 
-- `merchantGrossCents`
-- `merchantTaxCents`
-- `merchantShippingCents`
-- `merchantCommissionCents`
-- `merchantNetCents`
-- `merchantOutstandingBalanceCents`
+- `currency`: currency code used for all cents fields (for example `USD`).
+- `outstandingBalanceCents`: **legacy compatibility field** backward-compatible alias for unsettled
+  settlement balance.
+- `merchantOutstandingBalanceCents`: unsettled payout balance for seller-facing consumers.
+- `settlementOutstandingBalanceCents`: unsettled settlement balance alias; same cents value as
+  `outstandingBalanceCents` today for compatibility.
+- `subscriptionOutstandingDuesCents`: unpaid subscription dues included in liabilities.
+- `merchantGrossCents`: merchandise-sale gross amount from merchant settlement mix.
+- `merchantTaxCents`: tax component in merchant settlement mix.
+- `merchantShippingCents`: shipping component in merchant settlement mix.
+- `merchantCommissionCents`: commission effect (typically negative) in merchant settlement mix.
+- `merchantNetCents`: net before processor fees (`gross + tax + shipping + commission`).
+- `customerPaidTotalCents`: total paid by customer (`merchandise + pass-through tax + shipping`).
+- `merchandiseSubtotalCents`: merchandise subtotal before pass-through tax/shipping.
+- `passThroughTaxCollectedCents`: tax pass-through total added using absolute values of tax rows
+  (for example `abs(tax) + abs(tax_refund)`).
+- `passThroughShippingCollectedCents`: shipping pass-through total added using absolute values of
+  shipping rows (for example `abs(shipping_fee) + abs(shipping_refund)`).
+- `settlementPayableBeforeReserveCents`: net seller-settlement amount before reserve withholding
+  (this is the reserve-calculation base, not pass-through customer collections).
+- `reserveWithheldCents`: reserve amount currently withheld.
+- `availablePayoutNowCents`: payable now after reserve withholding.
+- `liabilitiesSummary`: grouped liabilities totals returned by liabilities summarizer.
+- `deductionTotalsCents`: grouped deduction totals keyed by deduction type.
+- `reserve.byCurrency[]`: reserve amounts grouped by currency.
+- `reserve.percentage`: configured reserve percentage for seller.
+- `reserve.tier`: reserve tier label (for example `new`, `standard`).
+- `codPolicy.negativeThresholdCents`: COD block threshold.
+- `codPolicy.codAllowed`: whether COD is currently allowed.
+- `codPolicy.blockedReason`: non-null only when COD is blocked.
 
 These are derived from unpaid merchant-side settlement types and are intended as seller-operator
 readable business totals.
@@ -2936,7 +2992,10 @@ readable business totals.
 **Exact formulas (cents, aligned to current backend implementation)**
 
 - Settlement balance = `merchantOutstandingBalanceCents` (same value currently returned as
-  `outstandingBalanceCents` in summary response).
+  `outstandingBalanceCents` in summary response; legacy semantics are intentionally preserved).
+- `settlementPayableBeforeReserveCents` = payout-eligible net base used to calculate reserve
+  withholding.
+- `availablePayoutNowCents = settlementPayableBeforeReserveCents - reserveWithheldCents`.
 - Net proceeds before processor fees = `merchantNetCents` where
   `merchantNetCents = merchantGrossCents + merchantTaxCents + merchantShippingCents + merchantCommissionCents`.
 - Deductions total = sum of values in `deductionTotalsCents` (currently seeded with `commission`,
@@ -2945,10 +3004,15 @@ readable business totals.
 
 **Outstanding balance interpretation**
 
-- `outstandingBalanceCents` / `merchantOutstandingBalanceCents` are unsettled ledger totals for
-  included types and scope, not "cash available now".
+- `outstandingBalanceCents` / `merchantOutstandingBalanceCents` /
+  `settlementOutstandingBalanceCents` are unsettled ledger totals for included types and scope, not
+  "cash available now".
 - Positive values generally indicate net receivable; negative values indicate net owed/offset state.
 - COD policy consumes this scoped value against `negativeThresholdCents`.
+- Backward compatibility: legacy consumers of `outstandingBalanceCents`,
+  `merchantOutstandingBalanceCents`, and `settlementOutstandingBalanceCents` continue to receive the
+  same unsettled payout-balance meaning; reserve-aware cash availability should use
+  `availablePayoutNowCents`.
 
 ### Frontend financial documentation updates
 
@@ -3529,9 +3593,12 @@ Supported workflows:
 
 ### Settlement Reconciliation & Payout Recovery
 
-This section documents the dedicated reconciliation + recovery layer on top of settlement
-scheduling/execution so operators can continuously verify data integrity between internal records
-and Stripe.
+**Reconciliation response types**
+
+- `none`: no discrepancy detected.
+- `reserve_discrepancy`: gross mismatch explained by reserve withholding math while net payout
+  remains consistent.
+- `hard_mismatch`: material state/amount mismatch requiring operator investigation. and Stripe.
 
 #### 1) Reconciliation Architecture (Backend)
 

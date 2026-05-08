@@ -69,6 +69,9 @@ Rollback: use the Vercel dashboard to promote the previous successful deployment
    - Stripe webhook deliveries to ensure no events fail.
    - Settlement scheduler health: verify cron cadence, new batch creation, and payout
      execution/manual fallback queue metrics after release.
+   - Any newly added MongoDB indexes: on large collections, index builds can increase CPU/IO and
+     temporarily slow writes. Prefer rolling out during lower traffic windows and monitor Mongo
+     operations until the build completes.
 5. If an issue arises, redeploy the previous container image from the Railway "Deployments" tab or
    roll back the Git commit triggering the automated build.
 
@@ -123,3 +126,12 @@ previous working commit.
 
 Keep this runbook updated when tooling or procedures change so on-call responders have accurate,
 actionable documentation during incidents.
+
+## Settlement retry operator note
+
+- Reversed settlement payouts are moved to `retryable` and are reprocessed through the same retry
+  lane as failed payouts.
+- Batch retry endpoint accepts both `failed` and `retryable` payouts; if your environment has a
+  single-payout retry endpoint, it also accepts both statuses.
+- Expected post-retry progression is `failed|retryable` -> `processing` -> `paid` (or
+  `manual_required` when payout prerequisites are still missing).
