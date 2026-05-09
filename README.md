@@ -28,6 +28,7 @@
     - [Multi-store / multi-tenant foundations](#multi-store--multi-tenant-foundations)
     - [Platform admin store \& seller-dashboard context](#platform-admin-store--seller-dashboard-context)
     - [Seller onboarding flow (design \& implementation)](#seller-onboarding-flow-design--implementation)
+      - [Onboarding approval and product-readiness flowchart](#onboarding-approval-and-product-readiness-flowchart)
       - [Entry points \& UX design](#entry-points--ux-design)
       - [Data model design (Seller + Store)](#data-model-design-seller--store)
       - [API flow (step-by-step)](#api-flow-step-by-step)
@@ -37,16 +38,19 @@
       - [Operational notes](#operational-notes)
       - [Seller bank-update review lifecycle (pending/approved/rejected + seller cancel)](#seller-bank-update-review-lifecycle-pendingapprovedrejected--seller-cancel)
       - [Seller dashboard behavior for bank-update reviews](#seller-dashboard-behavior-for-bank-update-reviews)
+      - [Bank-update review lifecycle flowchart](#bank-update-review-lifecycle-flowchart)
       - [Backend contract for bank-update records](#backend-contract-for-bank-update-records)
       - [Bank-update API routes (seller + admin)](#bank-update-api-routes-seller--admin)
     - [Seller store settings, storefront policies, and admin review flow](#seller-store-settings-storefront-policies-and-admin-review-flow)
       - [Seller settings: editable fields \& review gates](#seller-settings-editable-fields--review-gates)
       - [What happens when a seller updates policies or branding](#what-happens-when-a-seller-updates-policies-or-branding)
+      - [Policy update + immutable order snapshot flowchart](#policy-update--immutable-order-snapshot-flowchart)
       - [Admin review workflow (store profile + policy updates)](#admin-review-workflow-store-profile--policy-updates)
       - [Storefront policy rendering (public store page + checkout)](#storefront-policy-rendering-public-store-page--checkout)
       - [Pause store (Hide All) behavior](#pause-store-hide-all-behavior)
     - [Seller product creation \& admin moderation (end-to-end)](#seller-product-creation--admin-moderation-end-to-end)
       - [Flow overview (from seller draft to storefront)](#flow-overview-from-seller-draft-to-storefront)
+      - [Product creation + moderation pipeline flowchart](#product-creation--moderation-pipeline-flowchart)
       - [Data model \& status fields (seller-aware products)](#data-model--status-fields-seller-aware-products)
       - [Seller experience (create, save draft, submit)](#seller-experience-create-save-draft-submit)
       - [Backend pipeline (validation, images, ownership)](#backend-pipeline-validation-images-ownership)
@@ -145,6 +149,9 @@
     - [Stock reservation \& restoration (variant-aware)](#stock-reservation--restoration-variant-aware)
     - [Failure \& expired session handling](#failure--expired-session-handling)
     - [Seller settlements, ledger lifecycle, and payout execution](#seller-settlements-ledger-lifecycle-and-payout-execution)
+      - [System relationship diagram (simplified)](#system-relationship-diagram-simplified)
+      - [Settlement and payout flow](#settlement-and-payout-flow)
+      - [Ledger lifecycle narrative (delivery -\> payout -\> reserve release)](#ledger-lifecycle-narrative-delivery---payout---reserve-release)
       - [Seller ledger exports (CSV + PDF) and filter](#seller-ledger-exports-csv--pdf-and-filter)
         - [Export data shape](#export-data-shape)
         - [Amount formatting fix](#amount-formatting-fix)
@@ -416,6 +423,34 @@ frontend entry points, backend application APIs, KYC administration, and post-ap
 provisioning. The implementation focuses on three priorities: **secure ownership**, **clear state
 transitions**, and **audit-friendly data snapshots**.
 
+#### Onboarding approval and product-readiness flowchart
+
+```mermaid
+flowchart TD
+  Start["User wants to become seller"] --> PreApply["Open /seller/pre-apply"]
+  PreApply --> Apply["Submit /api/sellers/apply (draft or pending)"]
+  Apply --> Docs["Upload KYC docs /api/sellers/:id/docs"]
+  Docs --> KycReview["Admin KYC review /api/sellers/admin/:id/verify"]
+
+  KycReview -->|rejected or action_required| Rework["Seller updates application and resubmits"]
+  Rework --> Apply
+
+  KycReview -->|verified| Activate["Seller status=active + kyc.status=verified"]
+  Activate --> StoreProvision["Auto-provision Store profile"]
+
+  StoreProvision --> Consents["Seller accepts terms/privacy in dashboard"]
+  Consents --> StoreEdit["Seller updates store profile (logo/banner/policies/description)"]
+  StoreEdit --> StoreReview["Admin store policy/profile review"]
+
+  StoreReview -->|rejected or action_required + notes| StoreFix["Seller applies requested changes"]
+  StoreFix --> StoreEdit
+
+  StoreReview -->|approved| Ready["Seller can add products and submit for moderation"]
+
+  StoreProvision --> Payout["Complete Stripe Connect onboarding"]
+  Payout --> PayoutEligible["Seller becomes payout-eligible for order settlements"]
+```
+
 #### Entry points & UX design
 
 - **Pre-application gate:** `/seller/pre-apply` explains requirements and prevents accidental
@@ -580,6 +615,18 @@ The seller dashboard payment-method flow now has explicit UX rules:
 - **Application Details tab:** review UIs include an **Application Details** tab showing submitted
   bank identity and statement metadata for traceability.
 
+#### Bank-update review lifecycle flowchart
+
+```mermaid
+flowchart TD
+  Submit["Seller submits bank update"] --> Pending["updateReview.status=pending"]
+  Pending --> Admin{"Admin decision"}
+  Admin -->|Approve| Approved["status=approved + payout.bank updated"]
+  Admin -->|Reject| Rejected["status=rejected + notes + archived snapshot"]
+  Pending -->|Seller cancel| Cancelled["Restore last approved bank + clear active review"]
+  Rejected -->|Seller cancel| Cancelled
+```
+
 #### Backend contract for bank-update records
 
 The backend model contract is intentionally strict so UI and admin tooling can rely on stable
@@ -707,6 +754,23 @@ Policy edits are **forward-looking only**: the seller UI explicitly warns that *
 the latest approved policies, while prior orders keep their original policy snapshot at the time of
 purchase.
 
+#### Policy update + immutable order snapshot flowchart
+
+```mermaid
+flowchart TD
+  Edit["Seller edits store policy/branding"] --> Save["Save settings"]
+  Save --> Changed{"Reviewed fields changed?"}
+  Changed -->|No| Instant["Instant update (non-reviewed fields)"]
+  Changed -->|Yes| Pending["Set reviewStatus=pending + lock reviewed fields"]
+  Pending --> Snapshot["Keep last approved snapshot for storefront"]
+  Snapshot --> Checkout["New checkout reads approved source only"]
+  Checkout --> OrderSnap["Persist immutable order policy text on Order"]
+  Pending --> AdminDecision{"Admin decision"}
+  AdminDecision -->|Approve| Live["New policy/branding goes live"]
+  AdminDecision -->|Reject / Action required| OldLive["Storefront keeps last approved snapshot"]
+  Live --> FutureOrders["Future orders use newly approved policy snapshot"]
+```
+
 #### Admin review workflow (store profile + policy updates)
 
 Store profile reviews appear in the admin **Seller Requests → Policy update reviews** tab:
@@ -784,6 +848,24 @@ human-in-the-loop review, and an auditable trail.
 
 This keeps the storefront clean (no unreviewed listings) while still letting sellers iterate quickly
 in draft mode.
+
+#### Product creation + moderation pipeline flowchart
+
+```mermaid
+flowchart TD
+  Create["Seller creates product draft"] --> Validate["Backend validates ownership + payload"]
+  Validate --> Media["Images processed (Sharp) + uploaded (Cloudinary)"]
+  Media --> Draft["approvalStatus=draft, visibility=hidden"]
+  Draft --> Submit["Seller submits for review"]
+  Submit --> Pending["approvalStatus=pending"]
+  Pending --> AdminQueue["Admin moderation queue"]
+  AdminQueue --> Decision{"Approve?"}
+  Decision -->|Yes| Approved["approvalStatus=approved"]
+  Approved --> Public["visibility=public (storefront eligible)"]
+  Decision -->|No| Rejected["approvalStatus=rejected + notes"]
+  Rejected --> Revise["Seller edits product"]
+  Revise --> Submit
+```
 
 #### Data model & status fields (seller-aware products)
 
@@ -2586,6 +2668,48 @@ Validation errors (API):
 
 ### Seller settlements, ledger lifecycle, and payout execution
 
+#### System relationship diagram (simplified)
+
+```mermaid
+erDiagram
+    SELLER ||--o{ LEDGER_ENTRY : has
+    SELLER ||--o{ SETTLEMENT_PAYOUT : has
+    SETTLEMENT_BATCH ||--o{ SETTLEMENT_PAYOUT : contains
+    SETTLEMENT_BATCH ||--o{ LEDGER_ENTRY : includes
+```
+
+#### Settlement and payout flow
+
+```mermaid
+flowchart TD
+  OrderDelivered["Order delivered"] -->|trigger| RecordLedger
+  RecordLedger["recordDeliveryLedger(order)"] --> LedgerEntries{"Ledger: sale + commission entries"}
+  LedgerEntries -->|pending| AwaitSettlement
+  AwaitSettlement["Wait until period end"] -->|cron job| CreateBatch
+  CreateBatch["scheduleNextBatch"] -->|creates| SettlementBatch
+  SettlementBatch -->|creates| SettlementPayout
+  SettlementPayout -->|status=scheduled| ExecutePayout
+  ExecutePayout["executeSettlementBatch"] -->|stripe.transfer.create| Stripe
+  Stripe -->|success| MarkPaid
+  ExecutePayout -->|failure| MarkFailed
+  MarkPaid["SettlementPayout: status=paid\nLedgerEntries: status=paid"]
+  MarkFailed["SettlementPayout: status=failed/manual_required"]
+```
+
+#### Ledger lifecycle narrative (delivery -> payout -> reserve release)
+
+1. Order delivery finalization calls `recordDeliveryLedger(order)` and posts immutable
+   sale/commission ledger rows.
+2. Refunds (partial/full) append `refund` + `commission_reversal` rows, preserving immutable
+   history.
+3. Scheduler closes eligible period windows and computes seller net from pending rows.
+4. Batch scheduling creates `SettlementBatch` and positive-net `SettlementPayout` rows.
+5. Reserve policy withholds holdback value (`reserveWithheldAmountCents`) before payout execution.
+6. Stripe payout execution marks payouts `paid` or transitions to `failed` / `manual_required`.
+7. Reserve release job creates `reserve_release` rows when hold windows expire.
+8. Released reserves flow back into future settlement eligibility; reversals/retries keep correction
+   audit trails.
+
 The payout system is implemented as a **double-entry style operational ledger** at seller level:
 
 **Ledger dimensions (authoritative contract)**
@@ -2818,6 +2942,9 @@ re-execution using a regenerated idempotency key.
 - `SETTLEMENT_SCHEDULER_TZ` (default `UTC`): scheduler timezone for cron registration.
 - `SETTLEMENT_PERIOD_DAYS` (default `15`): settlement window size.
 - `SETTLEMENT_HOLD_DAYS` (default `0`): release delay after period end.
+- Period computation example (UTC): with `SETTLEMENT_PERIOD_DAYS=15`, windows are typically
+  `1st–15th` and `16th–end-of-month`; `SETTLEMENT_HOLD_DAYS` is then added after `periodEnd` before
+  payout eligibility.
 - `SETTLEMENT_CURRENCY` (default `USD`): settlement currency.
 - `SETTLEMENT_AUTO_EXECUTE` (default `false`): auto-runs transfer execution for newly created cron
   batches.
@@ -2989,6 +3116,10 @@ Same filters as summary/ledger; liability rows are constrained to liability type
 ### Seller financial summary behavior updates
 
 Endpoint: `GET /api/seller/financials/summary`
+
+> Quick interpretation: keep **settlement payout balances** and **subscription dues** separate in
+> seller/admin UI logic. Settlement readiness should be based on settlement fields, not subscription
+> dues.
 
 - For normal sellers, summary reflects the seller's rows in requested/default scope.
 - For platform-store seller context (admin acting as platform seller), default scope is
@@ -3682,6 +3813,8 @@ transfer (`externalTransferId` or payout/batch metadata lookup).
 
 - Reconciliation cron is controlled by `startSettlementReconciliationJob` and runs on
   `SETTLEMENT_RECONCILIATION_CRON`.
+- Reconciliation/financial summary emails are emitted on the same cron cadence to configured
+  recipients/role.
 - Every cycle computes a rolling scan window using `SETTLEMENT_RECONCILIATION_SCAN_DAYS` and scans:
   - recent `SettlementBatch` records,
   - recent terminal payouts (`paid`, `failed`, `manual_required`).
@@ -3831,6 +3964,14 @@ For incident handling, remediation sequencing, and operator SOP details, use:
 - [`docs/settlements-runbook.md`](docs/settlements-runbook.md)
 
 ### Settlement Payout Retry & Cron Operations
+
+**Operator action endpoints (quick map):**
+
+- Retry failed payout: `POST /api/admin/settlements/payouts/:payoutId/retry`
+- Reverse paid payout (Stripe transfer reversal):
+  `POST /api/admin/settlements/payouts/:payoutId/reverse`
+- Manually complete payout after off-platform transfer:
+  `POST /api/admin/settlements/payouts/:payoutId/manual-complete`
 
 This section captures the payout resiliency behavior and how to operate it safely.
 
@@ -4294,6 +4435,15 @@ refreshes the 30-day window.
 - Coverage: Backend coverage is reported at **89.28%** (unit + integration).
 
 ### How to run tests
+
+**Financial chaos/regression scenarios (manual):**
+
+- Simulate duplicate settlement schedule triggers and verify deduped response (`created:false`,
+  `reason:'duplicate'`).
+- Simulate transient Stripe payout failures and verify retry backoff / escalation to
+  `manual_required` when retry budget is exhausted.
+- Simulate persistence failure boundaries (batch creation vs payout creation) and verify
+  reconciliation invariants remain intact.
 
 - **Unit + integration**:
 
