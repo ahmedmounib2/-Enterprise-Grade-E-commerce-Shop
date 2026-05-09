@@ -145,6 +145,9 @@
     - [Stock reservation \& restoration (variant-aware)](#stock-reservation--restoration-variant-aware)
     - [Failure \& expired session handling](#failure--expired-session-handling)
     - [Seller settlements, ledger lifecycle, and payout execution](#seller-settlements-ledger-lifecycle-and-payout-execution)
+      - [Seller ledger exports (CSV + PDF) and filter](#seller-ledger-exports-csv--pdf-and-filter)
+        - [Export data shape](#export-data-shape)
+        - [Amount formatting fix](#amount-formatting-fix)
     - [Admin marketplace financials API (`/api/admin/platform-financials/*`)](#admin-marketplace-financials-api-apiadminplatform-financials)
       - [`GET /api/admin/platform-financials/summary`](#get-apiadminplatform-financialssummary)
       - [`GET /api/admin/platform-financials/ledger`](#get-apiadminplatform-financialsledger)
@@ -2705,6 +2708,44 @@ platform-owned merchant rows.
 - `netPayoutAmountCents`: payout-intended net after reserve withholding.
 - Net equation: `netPayoutAmountCents = grossEligibleAmountCents - reserveWithheldAmountCents`.
 
+#### Seller ledger exports (CSV + PDF) and filter
+
+The seller financials ledger supports:
+
+- Filter controls in dashboard ledger tab:
+  - From date
+  - To date
+  - Entry type
+  - Payout status
+- Export options as separate actions:
+  - **Download CSV** (`GET /api/seller/ledger/export`)
+  - **Download PDF** (`GET /api/seller/ledger/export-pdf`)
+
+##### Export data shape
+
+Both export formats use the same backend filter inputs (`from`, `to`, `type`, `payoutStatus`,
+`includeOperatorRows`) so exported data mirrors on-screen filtering.
+
+Exports include order-level fields where available from ledger references/metadata:
+
+- `orderId`
+- `gross` / `grossCents`
+- `commission` / `commissionCents`
+- `fees` / `feesCents`
+- `reserve` / `reserveCents`
+- `net` / `netCents`
+- `orderStatus`
+
+##### Amount formatting fix
+
+To avoid confusion, human-readable monetary values are now formatted from cents into currency units
+(e.g. `10000` cents => `$100.00`) in:
+
+- PDF row summaries
+- CSV readable amount columns
+
+Raw cents columns are still included in CSV for accounting/system integrations.
+
 **Batch statuses (`SettlementBatch.status`)**
 
 - `calculated`: reserved for pre-scheduled calculation states.
@@ -3847,6 +3888,11 @@ This section captures the payout resiliency behavior and how to operate it safel
   completed inside `JOB_HEALTH_SCHEDULER_STALE_HOURS`.
 - **Payout retry failure-rate alerts:** payout retry runs are windowed and failure-rate alerts are
   triggered when configured minimum-run and threshold conditions are met.
+- **Admin dashboard health indicator:** the Admin page surfaces a compact scheduler-health pill
+  (`healthy` / `stale` / `unknown`) based on `/api/admin/jobs/health` for quick operator triage.
+- **Prometheus + Datadog hooks:** settlement scheduler and payout retry jobs emit counters that can
+  be scraped/ingested (`/api/monitoring/metrics` for Prometheus; `datadog.metric` structured logs
+  for Datadog log pipelines).
 
 #### 2) Environment variables reference
 
@@ -4235,6 +4281,9 @@ refreshes the 30-day window.
 - Sanitization and NoSQL injection protection for request bodies and query params.
 - Logging: Winston with daily rotation, sensitive data redaction, and optional Sentry forwarding for
   uncaught exceptions and errors.
+- Metrics: Prometheus-compatible scrape output at `GET /api/monitoring/metrics`, including
+  settlement scheduler run status counters and retryable payout counters; mirrored Datadog-friendly
+  metric logs are emitted as `datadog.metric` events.
 
 ---
 
