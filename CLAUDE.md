@@ -92,6 +92,12 @@ Provide these sections:
 - **i18n impact** (when applicable)
 - **Environment Changes** (when applicable)
 
+**List and inventory formatting rule:**
+
+All lists, tables, screen inventories, component counts, and task groupings must be output as a
+clean markdown codeblock. No emojis, no nested collapse sections, no rich-text formatting — just a
+plain markdown table or bullet list inside a single code fence.
+
 ## 10. Safety and Risk Controls
 
 - Never expose secrets, tokens, `.env` contents, private keys, or internal credentials.
@@ -145,13 +151,14 @@ When asked to create or modify Figma designs for this project:
 
 ### B. Frame Specifications
 
-- **Desktop frames**: Width 1280–1440px, Auto-layout enabled, multi-column where the web app uses
+- **Desktop frames**: 1440 × 1024 px, Auto-layout enabled, multi-column where the web app uses
   multi-column.
-- **Mobile frames**: Width 375–390px, Auto-layout enabled, single-column, touch-optimised (minimum
-  44px tap targets).
+- **Mobile frames**: 393 × 852 px, Auto-layout enabled, single-column, touch-optimised (minimum 44px
+  tap targets).
 - Every screen gets **both** a Desktop and a Mobile frame unless the platform explicitly excludes it
   (e.g., Admin has no mobile app).
 - Naming convention: `[ScreenName] – Desktop – HiFi` and `[ScreenName] – Mobile – HiFi`.
+- Do not deviate from these frame sizes unless explicitly asked.
 
 ### C. Page Organisation
 
@@ -205,7 +212,15 @@ Reply with:
 - Number of Hi-Fi frames created (desktop / mobile)
 - Number of Lo-Fi frames created (desktop / mobile)
 - Number of prototype connections added
-- Any screens skipped (and why) if mobile seller screens exist)
-- Every interactive element (buttons, links, Add to Cart, Login, Submit, nav items) must have a
-  `Navigate to` interaction pointing to the correct frame.
-- Name each flow in the prototyping panel exactly as listed above.
+- Any screens skipped (and why)
+
+All screen lists, inventories, and counts in design-task responses must follow the list-formatting
+rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
+
+### I. Theme and Mode Restrictions
+
+- **Create all screens in the native default light mode only.**
+- Use only the light‑mode color tokens from the design system.
+- Do **not** create dark‑mode variations or alternate theme variants unless explicitly instructed.
+- If a request mentions “all themes,” “dark mode,” or similar, stop and ask for clarification before
+  proceeding.
