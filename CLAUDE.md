@@ -155,8 +155,6 @@ When asked to create or modify Figma designs for this project:
   multi-column.
 - **Mobile frames**: 393 × 852 px, Auto-layout enabled, single-column, touch-optimised (minimum 44px
   tap targets).
-- Every screen gets **both** a Desktop and a Mobile frame unless the platform explicitly excludes it
-  (e.g., Admin has no mobile app).
 - Naming convention: `[ScreenName] – Desktop – HiFi` and `[ScreenName] – Mobile – HiFi`.
 - Do not deviate from these frame sizes unless explicitly asked.
 
@@ -224,3 +222,20 @@ rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
 - Do **not** create dark‑mode variations or alternate theme variants unless explicitly instructed.
 - If a request mentions “all themes,” “dark mode,” or similar, stop and ask for clarification before
   proceeding.
+
+### J. Batch Size and Task Splitting Rules
+
+- **Never attempt all screens in a single prompt.** This causes hallucinations and token waste.
+- Split work by platform:
+  - **Web screens** (`frontend/src/pages/`) → Desktop frames only (1440 × 1024 px).
+  - **Mobile Expo screens** (`mobile/src/screens/`) → Mobile frames only (393 × 852 px).
+  - Do not create mobile variants of web screens or desktop variants of mobile screens unless
+    explicitly asked.
+- Batch sizes by screen complexity:
+  - **Heavy screens** (dashboards, multi‑section pages, data tables, multi‑step forms): **1–2 per
+    batch**.
+  - **Medium screens** (product grids, filtered lists, detail pages): **2–3 per batch**.
+  - **Simple screens** (auth forms, static/legal pages, confirmation pages): **4–5 per batch**.
+- After every batch, take a screenshot and wait for approval before the next batch.
+- Before generating any frames, always output a clean markdown table of the batch plan (screen name,
+  complexity, expected frame count) and get approval on the plan.
