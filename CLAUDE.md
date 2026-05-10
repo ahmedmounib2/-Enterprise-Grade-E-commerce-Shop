@@ -201,6 +201,17 @@ For non-trivial tasks, follow this order:
 - Explicitly state assumptions.
 - If blocked by missing context, stop early and request exactly what is needed.
 
+### 3A. Resuming After a Limit Hit
+
+When the previous turn was cut off by a usage limit, the last batch of tool calls (Figma or code)
+may NOT have executed. Always re-state the incomplete work explicitly.
+
+**Design (Figma):** "The last batch was cut off and NOT applied. The frame still has: [list].
+Re-read the frame, apply, screenshot, and wait."
+
+**Code:** "Cut off mid-edit. Last changes NOT saved. Task: [description]. Files: [list]. Re-read,
+apply, test, commit."
+
 ## 4. Code Change Standards
 
 - Favor existing patterns in this codebase over introducing new abstractions.
