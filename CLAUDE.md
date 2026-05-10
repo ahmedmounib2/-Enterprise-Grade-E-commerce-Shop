@@ -1,4 +1,169 @@
-# CLAUDE.md — Project Instructions
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this
+repository.
+
+---
+
+## A. Development Commands
+
+**Root (from repo root — runs both services concurrently):**
+
+```bash
+npm run dev              # backend + frontend in parallel
+npm run dev:all          # backend + frontend + mobile in parallel
+npm run dev:backend      # backend only (cd backend && npm run dev)
+npm run dev:frontend     # frontend only (cd frontend && npm run dev)
+npm run dev:mobile       # Expo mobile only
+npm run lint             # ESLint + Stylelint across all workspaces
+npm run lint:fix         # auto-fix lint errors
+npm run format           # Prettier + Stylelint fix
+npm run test             # runs tests in all workspaces
+npm run build            # backend install (prod) + frontend build
+npm run prepare:theme    # regenerate mobile theme from shared/theme/daisyThemes.js
+```
+
+**Backend (run from `backend/`):**
+
+```bash
+npm run dev              # nodemon with dotenv (.env auto-loaded)
+npm test                 # Jest (mongodb-memory-server, babel-jest, --runInBand)
+npm run test:watch       # watch mode
+npm run test:coverage    # coverage report
+npm run test:e2e         # E2E jest suite (separate config)
+npm run test:debug       # --inspect-brk for debugger attach
+```
+
+**Frontend (run from `frontend/`):**
+
+```bash
+npm run dev              # Vite dev server
+npm test                 # Jest + Testing Library
+npm run test:coverage
+npm run cypress:open     # Cypress interactive
+npm run test:e2e         # headless Cypress via xvfb-run
+```
+
+**Mobile (run from `mobile/`):**
+
+```bash
+npm start                # expo start (auto-runs prepare-theme)
+npm run env:emu          # switch to emulator .env
+npm run env:lan          # switch to LAN .env
+npm run env:tunnel       # switch to ngrok tunnel .env
+npm run start:tunnel     # expo start --tunnel -c
+npm run tunnel:api       # ngrok http https://localhost:5001
+```
+
+**Single backend test file:**
+
+```bash
+cd backend && npx jest src/tests/services/someService.spec.js --runInBand
+```
+
+---
+
+## B. Monorepo Architecture
+
+npm workspaces: `backend`, `frontend`, `mobile`, `shared`, `packages/*`.
+
+```
+repo root
+├── backend/          Node.js + Express 5 API (ESM)
+├── frontend/         React 19 + Vite + Tailwind/DaisyUI SPA
+├── mobile/           React Native + Expo 54
+├── shared/           @eshop/locales — JSON translations (en/ar/es/fr) + shared theme + utilities
+└── packages/
+    └── api-client/   @eshop/api-client — axios HTTP client (used by frontend & mobile)
+```
+
+### Backend (`backend/src/`)
+
+- **Entry:** `server.js` → imports `app.js`, connects DB, starts background jobs.
+- **Auth:** JWT access token (short-lived, httpOnly cookie) + refresh token stored in Redis. Session
+  managed via `express-session` + `connect-redis`. Passport handles local, Google OAuth, and
+  Facebook OAuth strategies (`auth/passport.js`). Token helpers in `lib/auth.utils.js`.
+- **Database:** MongoDB via Mongoose (`lib/db.js`). `autoIndex` disabled in production; use the
+  `sync:order-indexes` script for manual index sync.
+- **Cache / Redis:** Dual-driver pattern (`lib/cache/index.js`): Upstash REST
+  (`UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`) or ioredis TCP (`REDIS_URL`). Override
+  with `REDIS_DRIVER=rest|tcp`. Never import drivers directly — use helpers from
+  `lib/cache/cache.js`.
+- **Background jobs** (`src/jobs/`): Settlement scheduling, subscription renewal, payout retry, COD
+  reconciliation — all started in `server.js`.
+- **Feature flags:** Env-var-driven, parsed in `src/utils/featureFlags.js`. Current flags:
+  `FEATURE_CATEGORY_TREE_V2`, `FEATURE_SELLER_KYC`.
+- **Security stack:** helmet, hpp, csurf, mongo-sanitize, express-rate-limit, express-validator,
+  sanitize middleware.
+- **Integrations:** Stripe (payments + webhooks + subscriptions), Cloudinary (images),
+  SendGrid/Resend (email), Sentry (`SENTRY_DSN`).
+- **Testing:** Jest with `mongodb-memory-server` (in-memory Mongo), `supertest`, `ioredis-mock`.
+  Config: `jest.config.cjs`. All tests run with `--runInBand`.
+
+### Frontend (`frontend/src/`)
+
+- **Router:** react-router-dom v7. All page components live in `pages/`.
+- **State:** Zustand stores in `stores/`. Each domain has its own store file (e.g.
+  `useProductStore.js`, `useCartStore.jsx`, `useUserStore.js`).
+- **HTTP:** `@eshop/api-client` (axios wrapper); base URL set from `VITE_API_BASE_URL` in
+  `main.jsx`.
+- **Theming:** DaisyUI 5 + Tailwind 3. Themes defined in `shared/theme/daisyThemes.js`. CSS
+  variables in `src/index.css`. Theme context in `src/contexts/ThemeContext.jsx`; supports
+  light/dark appearance + multiple named style themes (stored in `localStorage`). Always use
+  existing CSS variables — never hardcode colors.
+- **i18n:** i18next + react-i18next. All 4 locale JSON files loaded from `shared/locales/` (`en`,
+  `ar`, `es`, `fr`). RTL set automatically when `ar` is active.
+- **Testing:** Jest + `@testing-library/react` + `msw` for API mocking. E2E: Cypress (`cypress/`).
+
+### Mobile (`mobile/src/`)
+
+- **Framework:** Expo 54 + React Native 0.81. Navigation via `@react-navigation/native-stack`
+  (`src/navigation/AppNavigator.js`).
+- **Auth:** `expo-secure-store` for token persistence (`src/auth/secureStore.js`). Auth state via
+  `src/auth/AuthProvider.js`.
+- **Cart:** `src/cart/CartProvider.js`.
+- **State:** Zustand (`src/stores/`).
+- **HTTP:** Same `@eshop/api-client` as frontend; base URL from `EXPO_PUBLIC_API_BASE_URL`.
+- **Theme:** Palette generated from `shared/theme/daisyThemes.js` via
+  `mobile/scripts/build-mobile-theme.mjs` (output: `mobile/src/theme/generated/`). Run
+  `npm run prepare:theme` after any theme change. Never edit generated files directly.
+- **i18n:** Same `@eshop/locales` package as frontend, same 4 locales.
+- **Env files:** Multiple env profiles (`emu`, `lan`, `tunnel`, `production`). Switch with
+  `npm run env:<profile>` before starting.
+- **SSL pinning:** `react-native-ssl-pinning` via `packages/api-client/sslPinningAdapter.native.js`.
+
+### Shared (`shared/`)
+
+Published as `@eshop/locales`. Exports:
+
+- `en`, `ar`, `es`, `fr` translation JSON objects.
+- `SUPPORTED_LANGUAGES`, `normalizeLanguage`, `ensureLanguage`.
+- `categories` data array.
+- Utility helpers: `resolveTranslationKey`, `extractApiMessage`, `resolveApiError`, `shuffleArray`,
+  `buildVariantKey`, `getOrderProductKey`.
+- Theme: `shared/theme/daisyThemes.js` (canonical source for all DaisyUI palette definitions).
+
+### `packages/api-client` (`@eshop/api-client`)
+
+Thin axios wrapper. Call `setBaseURL(url)` once at app startup. Platform-specific SSL pinning
+adapter loaded automatically in React Native via Metro resolver (`.native.js` suffix).
+
+---
+
+## C. Key Patterns
+
+- **Adding a new DaisyUI theme:** Edit `shared/theme/daisyThemes.js` → run `npm run prepare:theme` →
+  restart dev server. No other files need editing.
+- **Adding a translation key:** Add to all 4 files in `shared/locales/`. Locale key parity across
+  `en/ar/es/fr` is required.
+- **Backend route pattern:** `routes/*.route.js` → `controllers/*.controller.js` →
+  `services/**/*.service.js`. Middleware in `middleware/`.
+- **Zustand stores:** `create((set, get) => ({...}))` pattern; no Redux. Web stores in
+  `frontend/src/stores/`, mobile in `mobile/src/stores/`.
+- **Redis cache helpers:** Import from `lib/cache/cache.js` (`cacheGetJSON`, `cacheSetJSON`,
+  `cacheDel`). Never import drivers directly.
+
+---
 
 ## 1. Role and Operating Mode
 
