@@ -441,7 +441,9 @@ rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
 
 ### M. Scrollable Frames
 
-- When the natural content of a desktop screen exceeds **1024 px** in height, **keep the frame size
-  at 1440 × 1024 px** and enable **vertical scrolling** on the frame (overflow behavior).
-- Do **not** increase the frame height to contain all content — let it overflow and enable scrolling
-  so the frame works correctly in Figma’s presentation view.
+- When the natural content of a screen exceeds the frame height, **keep the frame size fixed**
+  and enable **vertical scrolling** on the frame (overflow behavior).
+  - **Desktop**: frame size **1440 × 1024 px** — enable scrolling when content exceeds 1024 px.
+  - **Mobile**: frame size **393 × 852 px** — enable scrolling when content exceeds 852 px.
+- Do **not** increase the frame height to contain all content — let it overflow and enable
+  scrolling so the frame works correctly in Figma's presentation view.
