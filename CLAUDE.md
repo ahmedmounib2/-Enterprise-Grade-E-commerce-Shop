@@ -425,3 +425,10 @@ rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
 - For heavy screens (dashboards, checkout, multi‑section pages), always include the screenshot.
 - Reading frame state via `get_node` / `scan_nodes_by_types` is acceptable for intermediate checks
   within a batch, but the final visual confirmation must be a screenshot. ?
+
+### L. Scrollable Frames
+
+- When the natural content of a desktop screen exceeds **1024 px** in height, **keep the frame size
+  at 1440 × 1024 px** and enable **vertical scrolling** on the frame (overflow behavior).
+- Do **not** increase the frame height to contain all content — let it overflow and enable scrolling
+  so the frame works correctly in Figma’s presentation view.
