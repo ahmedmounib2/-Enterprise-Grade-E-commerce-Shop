@@ -415,3 +415,13 @@ rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
 - After every batch, take a screenshot and wait for approval before the next batch.
 - Before generating any frames, always output a clean markdown table of the batch plan (screen name,
   complexity, expected frame count) and get approval on the plan.
+
+### K. Screenshot Strategy
+
+- **One screenshot per batch, at completion** — before asking for user confirmation.
+- Do not take screenshots after every individual Figma call within a batch.
+- Even for simple screens, a single final screenshot is required unless the user explicitly says "no
+  screenshot needed for this batch."
+- For heavy screens (dashboards, checkout, multi‑section pages), always include the screenshot.
+- Reading frame state via `get_node` / `scan_nodes_by_types` is acceptable for intermediate checks
+  within a batch, but the final visual confirmation must be a screenshot. ?
