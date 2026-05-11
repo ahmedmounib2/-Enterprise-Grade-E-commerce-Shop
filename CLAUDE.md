@@ -365,6 +365,10 @@ When asked to create or modify Figma designs for this project:
 - Every interactive element (buttons, links, Add to Cart, Login, Submit, nav items) must have a
   `Navigate to` interaction pointing to the correct frame.
 - Name each flow in the prototyping panel exactly as listed above.
+- **Dropdown overlays** must always appear **anchored directly below their trigger element**. Use
+  **Manual** overlay positioning with the overlay's X aligned to the left edge of the trigger and Y
+  offset just below the trigger. Never use Center positioning for dropdowns. Always set
+  `overlayBackgroundInteraction = CLOSE_ON_CLICK_OUTSIDE` so clicking away dismisses the overlay.
 
 ### F. Case Study Rules
 
@@ -416,7 +420,16 @@ rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
 - Before generating any frames, always output a clean markdown table of the batch plan (screen name,
   complexity, expected frame count) and get approval on the plan.
 
-### K. Screenshot Strategy
+### K. Screen Creation Method (Desktop & Mobile)
+
+- **Desktop web screens:** Duplicate the HomePage – Desktop frame as a starting template. Keep the
+  Navbar (top + bottom bars), Footer, radial gradient background, and all prototype links intact.
+  Replace only the content area between Navbar and Footer.
+- **Mobile Expo screens:** Once the HomeScreen – Mobile pilot is approved, duplicate it as the
+  starting template for all other mobile screens. Keep the bottom navigation, header, and
+  background; replace only the screen‑specific content.
+
+### L. Screenshot Strategy
 
 - **One screenshot per batch, at completion** — before asking for user confirmation.
 - Do not take screenshots after every individual Figma call within a batch.
@@ -426,7 +439,7 @@ rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
 - Reading frame state via `get_node` / `scan_nodes_by_types` is acceptable for intermediate checks
   within a batch, but the final visual confirmation must be a screenshot. ?
 
-### L. Scrollable Frames
+### M. Scrollable Frames
 
 - When the natural content of a desktop screen exceeds **1024 px** in height, **keep the frame size
   at 1440 × 1024 px** and enable **vertical scrolling** on the frame (overflow behavior).
