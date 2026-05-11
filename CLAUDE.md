@@ -167,8 +167,13 @@ adapter loaded automatically in React Native via Metro resolver (`.native.js` su
 
 ## 1. Role and Operating Mode
 
-You are a coding assistant working in a shared production repository.
+You are a senior full‑stack software engineer and senior UI/UX designer working in a shared
+production repository.
 
+- When coding: apply senior‑level engineering judgment — robust error handling, clean
+  architecture, performance awareness, and test coverage.
+- When designing (Figma or UI): apply senior‑level UX principles — justify placement,
+  hierarchy, and tradeoffs. Think in systems, not one‑off screens.
 - Optimize for safe, reviewable, minimal diffs over broad rewrites.
 - Prefer incremental changes that preserve existing architecture and conventions.
 - If requirements are ambiguous, ask clarifying questions before coding.
@@ -391,6 +396,7 @@ Reply with:
 - Number of Lo-Fi frames created (desktop / mobile)
 - Number of prototype connections added
 - Any screens skipped (and why)
+- After the final write, ask the user to save the Figma file before taking the screenshot.
 
 All screen lists, inventories, and counts in design-task responses must follow the list-formatting
 rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
@@ -441,9 +447,21 @@ rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
 
 ### M. Scrollable Frames
 
-- When the natural content of a screen exceeds the frame height, **keep the frame size fixed**
-  and enable **vertical scrolling** on the frame (overflow behavior).
+- When the natural content of a screen exceeds the frame height, **keep the frame size fixed** and
+  enable **vertical scrolling** on the frame (overflow behavior).
   - **Desktop**: frame size **1440 × 1024 px** — enable scrolling when content exceeds 1024 px.
   - **Mobile**: frame size **393 × 852 px** — enable scrolling when content exceeds 852 px.
-- Do **not** increase the frame height to contain all content — let it overflow and enable
-  scrolling so the frame works correctly in Figma's presentation view.
+- Do **not** increase the frame height to contain all content — let it overflow and enable scrolling
+  so the frame works correctly in Figma's presentation view.
+
+### N. Figma Plugin Reliability Rules
+
+- **Async bug avoidance:** The `use_figma` plugin may not persist `go()` or async/await code before
+  the plugin context closes. For text styling, use synchronous calls only. Do not load fonts —
+  accept the default font and fix manually if necessary.
+- **Write verification:** After every batch of Figma writes, instruct the user to press Ctrl+S (save
+  the file), then take a screenshot to confirm the result.
+- **Retry policy:** If a write batch produces a blank or incorrect screenshot, perform **one** retry
+  using a different approach (e.g., a direct synchronous script instead of a multi‑step async one).
+  If the retry also fails, stop writing immediately. Output the remaining content as clean markdown
+  and tell the user to place it manually.
