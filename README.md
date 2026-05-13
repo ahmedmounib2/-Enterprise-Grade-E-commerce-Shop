@@ -13,9 +13,19 @@
 
 ---
 
+## Tooling
+
+- [AI-Assisted Design Workflow](docs/CLAUDE-FIGMA-SETUP.md) — Claude Desktop + Figma MCP integration
+  for design creation and design-to-code conversion.
+- [AI Development Guidelines](CLAUDE.md) — Structured ruleset for AI-assisted development (commit
+  hygiene, i18n, theming, approval gates, Figma workflow).
+
+---
+
 ## Table of contents
 
 - [AhmedMonib E-Shop — Enterprise-Grade E-commerce Shop](#ahmedmonib-e-shop--enterprise-grade-e-commerce-shop)
+  - [Tooling](#tooling)
   - [Table of contents](#table-of-contents)
   - [Maintainer context](#maintainer-context)
   - [One-line pitch](#one-line-pitch)
@@ -206,6 +216,7 @@
       - [5) Validation checklist (post-deploy)](#5-validation-checklist-post-deploy)
     - [Stripe Connect prerequisites (seller payouts)](#stripe-connect-prerequisites-seller-payouts)
   - [Products, variants \& model behavior](#products-variants--model-behavior)
+    - [Size-chart visibility and category slug naming (Product Page)](#size-chart-visibility-and-category-slug-naming-product-page)
   - [Dynamic categories system (tree + drag-and-drop)](#dynamic-categories-system-tree--drag-and-drop)
     - [Data model \& flags](#data-model--flags)
     - [Admin workflow (drag-and-drop + image upload)](#admin-workflow-drag-and-drop--image-upload)
@@ -245,7 +256,9 @@
     - [Orders \& Fulfilment](#orders--fulfilment)
     - [Create Product \& Variants](#create-product--variants)
     - [Analytics \& Campaigns](#analytics--campaigns)
-    - [Emails](#emails)
+    - [Seller Onboarding Flow](#seller-onboarding-flow)
+    - [Seller Dashboard](#seller-dashboard)
+    - [Admin Dashboard](#admin-dashboard)
     - [Mobile](#mobile)
   - [Commercial license (proprietary) \& selling notes](#commercial-license-proprietary--selling-notes)
   - [Demo credentials (web \& mobile)](#demo-credentials-web--mobile)
@@ -4170,6 +4183,31 @@ For automatic settlement transfers, each seller must have:
 - Ability to **hide** items from the UI (instead of deleting) so you can retain product data and
   reinstate when restocked.
 
+### Size-chart visibility and category slug naming (Product Page)
+
+On `frontend/src/components/ProductPage.jsx`, size-chart visibility depends on **both**:
+
+1. A variant attribute that looks like size (`size`, `sizes`, `Size`, etc.).
+2. A resolvable size-chart key from product category/subcategory metadata.
+
+Recommended conventions for reliable matching:
+
+- Always store the **leaf subcategory slug** on products (`subCategorySlug`) when applicable.
+  - Example tree: `fashion -> women-fashion -> dress`
+  - Product should carry `subCategorySlug: "dress"` (not only `categorySlug: "fashion"`).
+- Use lowercase, URL-safe slugs with hyphens (no spaces/underscores), e.g.:
+  - `dress`, `jackets`, `jeans`, `shoes`, `suits`, `hats`, `glasses`, `bags`, `wallets`.
+- For t-shirts, use one of the supported forms:
+  - `t-shirt`, `tshirts`, `t-shirts`, `tee`, `t shirts`.
+  - The resolver aliases these to the existing t-shirt chart key.
+- For dresses, `dress` is supported and is aliased to `dresses`.
+
+Notes:
+
+- Category **name** fields are used as fallback hints, but slug-based matching is more reliable.
+- If a product has no size-like variant attribute, the size-chart link is intentionally hidden even
+  when category resolution succeeds.
+
 ---
 
 ## Dynamic categories system (tree + drag-and-drop)
@@ -5421,7 +5459,123 @@ management._
 
 ---
 
-### Emails
+### Seller Onboarding Flow
+
+![Seller onboarding — Customer account entry](./docs/screenshots/customer_account_page_apply_to_become_a_seller_.png)
+_Customer account page entry point to apply as a seller._
+
+![Seller onboarding — Pre-onboarding questionnaire](./docs/screenshots/seller_pre_onboarding_questionnair.png)
+_Initial seller pre-onboarding questionnaire screen._
+
+![Seller onboarding — Seller information](./docs/screenshots/seller_onboarding_seller_information_form.png)
+_Seller information form (identity and business basics)._
+
+![Seller onboarding — Store info](./docs/screenshots/seller_onboarding_store_info_form.png) _Store
+profile and storefront setup form._
+
+![Seller onboarding — Business policy](./docs/screenshots/seller_onboarding_business_policy_form.png)
+_Business policy form for shipping/returns and policy details._
+
+![Seller onboarding — Verification](./docs/screenshots/seller_onboarding_verification_form.png) _KYC
+verification form for identity and compliance checks._
+
+![Seller onboarding — Banking](./docs/screenshots/seller_onboarding_banking_form.png) _Banking
+details form used for payout setup._
+
+![Seller onboarding — Admin received application](./docs/screenshots/admin_dashboard_seller_application_received.png)
+_Admin dashboard view showing incoming seller applications._
+
+![Seller onboarding — Admin application review](./docs/screenshots/admin_dashboard_seller_application_expanded.png)
+_Admin expanded view for reviewing seller application details._
+
+![Seller onboarding — Admin document review](./docs/screenshots/admin_dashboard_admin_expand_to_view_seller_application_uploaded_documents.png)
+_Admin expanded document viewer for uploaded seller verification documents._
+
+---
+
+### Seller Dashboard
+
+![Seller dashboard — Overview](./docs/screenshots/seller_dashboard_page.png) _Seller dashboard
+landing page overview._
+
+![Seller dashboard — Orders panel](./docs/screenshots/seller__dashboard_orders_panel.png) _Seller
+order fulfilment panel with filters and status controls._
+
+![Seller dashboard — Product creation](./docs/screenshots/seller_dashboard_create_product_form.png)
+_Seller create product form._
+
+![Seller dashboard — Products panel](./docs/screenshots/seller_dashboard_products_panel_with_lots_of_products_from_different_categories.png)
+_Seller products panel showing products across categories._
+
+![Seller dashboard — Financials](./docs/screenshots/seller_dashboard_financials_panel.png) _Seller
+financial summary panel._
+
+![Seller dashboard — Financial deductions breakdown](./docs/screenshots/seller_dashboard_financials_panel_deductions_Breakdown.png)
+_Detailed deductions breakdown in financials._
+
+![Seller dashboard — Plan summary](./docs/screenshots/seller_dashboard_Plan_summary.png) _Seller
+subscription plan summary._
+
+![Seller dashboard — Payment methods](./docs/screenshots/seller_dashboard_payment_method_panel.png)
+_Payment method panel._
+
+![Seller dashboard — Payment method update](./docs/screenshots/seller_dashboard_payment_method_update_form_expanded.png)
+_Expanded payment method update form._
+
+![Seller dashboard — Bank update confirmation](./docs/screenshots/seller_dashboard_bank_update_confirmation_message.png)
+_Confirmation message after submitting a bank update request._
+
+![Seller dashboard — Application details](./docs/screenshots/seller_dashboard_application_details_panel_showing_document_tiers_and_redacted_document.png)
+_Application details with document tiers and redacted documents._
+
+![Seller dashboard — Store settings](./docs/screenshots/seller_dashboard_store_settings_panel.png)
+_Store settings and policy configuration panel._
+
+![Seller dashboard — QR code section](./docs/screenshots/seller_dashboard_seller_download_your_store_qr_code_section.png)
+_Download store QR code section._
+
+![Seller dashboard — Product moderation state](./docs/screenshots/seller_newly_created_products_are_draft_needto_submit_for_review.png)
+_Newly created products saved as draft and ready for submission for review._
+
+![Seller dashboard — Upgrade flow to Stripe](./docs/screenshots/seller_upgrading_to_pro_plan_routed_toStripe_to_pay.png)
+_Upgrade to Pro plan routed to Stripe checkout._
+
+![Seller dashboard — Upgraded to Pro](./docs/screenshots/Seller_upgraded_to_pro_plan.png) _Seller
+upgraded to Pro plan confirmation state._
+
+---
+
+### Admin Dashboard
+
+![Admin dashboard — Platform management context](./docs/screenshots/admin_dashboard_have_seller_dashboard_to_manage_main_website_products_and_Dashboard_for_admin_platform_level_management.png)
+_Admin dashboard context for platform-level management._
+
+![Admin dashboard — Order tab platform visibility](./docs/screenshots/admin_panel_order_tab_can_see_the_whole_platform_orders.png)
+_Admin orders tab can view platform-wide orders._
+
+![Admin dashboard — Approved sellers](./docs/screenshots/admin_dashboard_approved_sellers_panel.png)
+_Approved sellers management panel._
+
+![Admin dashboard — Category tree](./docs/screenshots/admin_dashboard_category_tree_panel_where_admin_create_and_edit_categories_for_thewhole_website_and_mobile_app.png)
+_Category tree panel for web and mobile taxonomy management._
+
+![Admin dashboard — Commissions](./docs/screenshots/admin_dashboard_commissions_panel.png)
+_Commission configuration panel._
+
+![Admin dashboard — Settlements](./docs/screenshots/admin_dashboard_settlements_panel.png)
+_Settlements panel._
+
+![Admin dashboard — Marketplace financials](./docs/screenshots/admin_dashboard_marketplace_financials_panel.png)
+_Marketplace financials panel._
+
+![Admin dashboard — Adjustments](./docs/screenshots/admin_dashboard_adjustments_panel.png) _Platform
+adjustments panel._
+
+![Admin dashboard — Seller adjustments](./docs/screenshots/admin_dashboard_seller_adjustments_panel.png)
+_Seller-specific adjustments panel._
+
+![Admin dashboard — Product moderation](./docs/screenshots/admin_Moderation_tab_product_moderation_panel.png)
+_Product moderation panel in admin moderation tab._
 
 ![Email Campaign Subscription Confirmation](./docs/screenshots/email-campaign-subscription-confirmation-email.png)
 _Email campaign subscription confirmation email._
