@@ -1016,6 +1016,11 @@ and the Pro plan price metadata. Each configuration record includes:
 - `stripePriceId` — Stripe Price ID for the Pro subscription checkout + renewals.
 - `effectiveStartDate` / `effectiveEndDate` — date range for when the config is active.
 
+**Versioning behavior:** creating a new FeeConfig via the admin API automatically closes the
+previously active record by setting its `effectiveEndDate` to one second before the new
+`effectiveStartDate`. This ensures there is never more than one active config at any point in time
+and preserves a complete audit trail of historical rate changes.
+
 At runtime the API loads the **active FeeConfig** (effective date window containing “now” and
 highest `effectiveStartDate`) and applies it across order calculations and subscription pricing.
 Commission rates, plan limits, and Stripe Price IDs are **not** controlled by environment variables;
@@ -1056,6 +1061,16 @@ retroactively. The flow is:
 4. Multiply by quantity to get the item’s `platformFee`.
 5. Persist `commissionPct`, `commissionRuleId`, `commissionRuleScope`, `commissionMinFee`, and the
    order-level `commissionTotal`.
+6. Persist four **fee snapshot fields** on each order item:
+   - `appliedFeeConfigId` — ObjectId of the FeeConfig record active at checkout time.
+   - `appliedCommissionPct` — commission percentage actually applied.
+   - `appliedMinFeeCents` — minimum fee in cents actually applied.
+   - `appliedPlatformFeeCents` — platform fee in cents charged for this item.
+
+These snapshot fields are populated by `buildOrderItemsWithCommission` at order creation and are
+never recalculated retroactively. The admin Order Details modal displays them under the "Fee
+Snapshot" panel (visible to admin scope only). A backfill script for existing orders is available at
+`backend/src/scripts/backfill-order-fee-snapshot.js`.
 
 This locks the fee details on each order and supports reporting/analytics without recalculating fees
 later. It also ensures minimum fee enforcement on **every unit**, not just per line item.
@@ -1742,6 +1757,8 @@ This section explains the exact runtime flow implemented by the backend payment 
 1. **Request validation**
    - Backend receives `products`, `shippingAddress`, `billingAddress`, and optional `phoneNumbers`.
    - Validates addresses and that the cart is non-empty.
+   - Rejects carts that span more than one store with HTTP 400. Multi-store checkout is
+     intentionally blocked; customers must complete a separate checkout per store.
 
 2. **Cart backup & fallback**
    - Saves a `cart_backup:<userId>` key in Redis (TTL) so the server can recover cart if the client
@@ -1815,6 +1832,18 @@ The webhook handler validates Stripe signatures and supports multiple events:
   - If a full refund is detected for a payment intent related to an order:
     - Sets `order.status = 'refunded'`, persists `refundId`, updates timestamps.
     - Restores inventory via `restoreStockReservation(order._id)`.
+
+- **`refund.updated`**
+  - Idempotent: uses Redis key `processed_refund_updated_event:{event.id}`. Duplicate deliveries of
+    the same event are discarded without re-processing.
+  - On `succeeded`:
+    - Marks the refund record `completed`.
+    - Updates order status.
+    - Posts refund ledger entries via `recordRefundLedger` (reverses sale/commission rows for the
+      refunded items).
+    - Restores reserved stock for full refunds.
+  - On `failed`: marks the refund record `failed` and updates order status; no ledger entries are
+    written.
 
 > All webhook processing logs heavily and attempts safe recovery. Non-critical failures (e.g.,
 > email) are logged but don't crash the handler.
@@ -2844,6 +2873,14 @@ platform-owned merchant rows.
 - `reserveWithheldAmountCents`: reserve/holdback value withheld for risk policy.
 - `netPayoutAmountCents`: payout-intended net after reserve withholding.
 - Net equation: `netPayoutAmountCents = grossEligibleAmountCents - reserveWithheldAmountCents`.
+- `inPeriodAmountCents`: portion of `grossEligibleAmountCents` from ledger entries created within
+  the current settlement period.
+- `carryForwardAmountCents`: portion from pending entries created in prior periods that were carried
+  into this payout cycle.
+
+When `carryForwardAmountCents > 0`, the seller financials panel displays an inline indicator —
+"Includes $X.XX from prior periods" — alongside the payout total so sellers can distinguish
+current-period earnings from accumulated carry-forward amounts.
 
 #### Seller ledger exports (CSV + PDF) and filter
 
@@ -3384,6 +3421,7 @@ RESERVE_MIN_HOLD_DAYS=14
 RESERVE_RELEASE_CRON="0 2 * * *"
 RESERVE_RELEASE_TZ=UTC
 RESERVE_RELEASE_JOB_ENABLED=true
+RESERVE_RELEASE_BATCH_LIMIT=500   # max rows processed per release cycle (default 500)
 
 
 # Reserve policy (dev/test fast cycle)
@@ -3401,6 +3439,7 @@ RESERVE_MIN_HOLD_DAYS=0
 RESERVE_RELEASE_CRON="*/2 * * * *"
 RESERVE_RELEASE_TZ=UTC
 RESERVE_RELEASE_JOB_ENABLED=true
+RESERVE_RELEASE_BATCH_LIMIT=500   # max rows processed per release cycle (default 500)
 
 ```
 
@@ -3432,10 +3471,15 @@ Eligibility logic used by the job:
 - `type='reserve'`
 - `payoutStatus='reserved'`
 - `releaseScheduledAt <= now`
-- `reserveMonth != currentMonth`
+
+Any reserve with an elapsed `releaseScheduledAt` is eligible regardless of which calendar month it
+originated. The release is not gated on the calendar month of the reserve — same-month releases are
+included when their hold period has elapsed.
 
 Processing behavior:
 
+- Processes at most `RESERVE_RELEASE_BATCH_LIMIT` eligible rows per cycle (default `500`). Set this
+  env var to control per-cycle DB load.
 - Groups eligible reserves by seller/currency/month set
 - Creates `reserve_release` entries as `payoutStatus='pending'` so normal settlements can pick them
   up

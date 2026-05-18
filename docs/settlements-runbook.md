@@ -7,13 +7,32 @@ and manual fallback procedures.
 
 ## 1) Double-entry ledger behavior and settlement lifecycle
 
-The settlement engine aggregates immutable seller ledger entries:
+The settlement engine aggregates immutable seller ledger entries. Every entry carries an integer
+`amountCents`, currency, and source references (order/refund).
 
-- `sale`
-- `commission`
-- `refund`
-- `commission_reversal`
-- `adjustment`
+| Type                       | Trigger                                                                                         | Merchant-scoped sign                                 | Platform-scoped sign                       | Idempotency-key pattern                                                                                                                               |
+| -------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sale`                     | Order marked delivered (`recordDeliveryLedger`)                                                 | Positive (seller revenue)                            | —                                          | `delivered:sale:{orderId}:{sellerId}`                                                                                                                 |
+| `commission`               | Same delivery event as `sale`                                                                   | Negative (platform fee deducted)                     | —                                          | `delivered:commission:{orderId}:{sellerId}`                                                                                                           |
+| `platform_fee`             | Same delivery event as `sale`/`commission`                                                      | —                                                    | Positive (mirrors commission credit)       | `delivered:platform_fee:{orderId}:{sellerId}:platform`                                                                                                |
+| `tax`                      | Same delivery event; two rows posted                                                            | Negative (seller tax share)                          | Positive (platform collects)               | `delivered:tax:{orderId}:{sellerId}:seller` / `:platform`                                                                                             |
+| `shipping_fee`             | Same delivery event; two rows posted                                                            | Negative (seller shipping share)                     | Positive (platform collects)               | `delivered:shipping_fee:{orderId}:{sellerId}:seller` / `:shipping`                                                                                    |
+| `refund`                   | `refund.updated` or `charge.refunded` webhook (`recordRefundLedger`)                            | Negative (revenue reversed)                          | —                                          | `refunded:refund:{orderId}:{sellerId}:{refundKeyPart}`                                                                                                |
+| `commission_reversal`      | Same refund event as `refund`                                                                   | Positive (commission returned to seller)             | Negative (platform gives back fee)         | `refunded:commission:{orderId}:{sellerId}:{refundKeyPart}`                                                                                            |
+| `tax_refund`               | Same refund event; two rows posted                                                              | Positive (tax refunded to seller)                    | Negative (platform returns tax)            | `refunded:tax_refund:{orderId}:{sellerId}:seller:{refundKeyPart}` / `:platform:{refundKeyPart}`                                                       |
+| `shipping_refund`          | Same refund event; two rows posted                                                              | Positive (shipping refunded to seller)               | Negative (platform returns shipping)       | `refunded:shipping_refund:{orderId}:{sellerId}:seller:{refundKeyPart}` / `:shipping:{refundKeyPart}`                                                  |
+| `processor_fee`            | Stripe balance transaction resolved (`recordPaymentProcessorFeeLiabilities`)                    | —                                                    | Negative (processor cost to platform)      | `processor_fee:{orderId}`                                                                                                                             |
+| `processing_fee`           | Same event as `processor_fee`; per-seller row                                                   | Negative (seller's share of processor cost)          | —                                          | `processing_fee:{orderId}:{sellerId}`                                                                                                                 |
+| `processor_fee_recovery`   | Corrective entry when actual processor fee differs from estimate (`recordProcessorFeeRecovery`) | Positive or negative (delta vs estimate, per seller) | Positive or negative (platform-side delta) | `processor_fee_recovery:{orderId}:delta:{deltaKey}` / `:{sellerId}`                                                                                   |
+| `cod_refund_disbursement`  | COD refund paid out to customer via provider (Chimoney webhook / reconciliation)                | —                                                    | Negative (platform disburses)              | `refunded:cod_refund_disbursement:{orderId}:{sellerId}:{refundKeyPart}:platform`                                                                      |
+| `cod_refund_reimbursement` | Same COD refund event                                                                           | Negative (seller reimburses platform)                | —                                          | `refunded:cod_refund_reimbursement:{orderId}:{sellerId}:{refundKeyPart}:seller`                                                                       |
+| `adjustment`               | Manual operator correction                                                                      | Variable                                             | Variable                                   | Caller-supplied; no standard shape                                                                                                                    |
+| `payout_reversal`          | Admin reversal endpoint (`POST /api/admin/settlements/payouts/:id/reverse`)                     | Negative (offsets original payout credit)            | —                                          | `payout_reversal:{payoutId}:{reversalId}`                                                                                                             |
+| `payout_execution`         | Successful retry execution of a `retryable` payout                                              | Positive (re-credited after reversal)                | —                                          | `settlement:{batchId}:{sellerId}:{currency}:retry:{retrySeq}:{timestamp}`                                                                             |
+| `manual_payout`            | Manual payout via `manualSettlementPayout.service.js`                                           | Positive (payout credit)                             | —                                          | `manual_payout:{payoutId}:{transactionId}`                                                                                                            |
+| `reserve`                  | Reserve withholding job at settlement cycle                                                     | Negative (amount withheld from net payout)           | —                                          | Caller-supplied or derived from `reserve_release:{sellerId}:{currency}:{amount}:{reason}:{actor}:{reserveMonth}`                                      |
+| `reserve_release`          | Reserve release job after hold period expires                                                   | Positive (withheld amount returned)                  | —                                          | Derived from components: `reserve_release:{sellerId}:{currency}:{amount}:{reason}:{actor}:{reserveMonth}:{marker}`                                    |
+| `reserve_used`             | Reserve applied against outstanding debt (refund path or release job debt path)                 | Positive (cancels outstanding reserve debit)         | —                                          | `refunded:reserve_used:{orderId}:{sellerId}:{refundKeyPart}` (refund) or `reserve_release_job:reserve_used:debt:{sellerId}:{currency}:{reserveMonth}` |
 
 Every entry carries an integer `amountCents`, currency, and source references (order/refund).
 Entries start with `payoutStatus=pending` and move through these phases:
@@ -27,6 +46,34 @@ Entries start with `payoutStatus=pending` and move through these phases:
 Scheduler netting rule is carry-forward by design: each cycle nets all pending entries where
 `createdAt <= periodEnd`. This means pending rows from prior windows are intentionally included
 until they are scheduled/paid.
+
+Each `SettlementPayout` now exposes two complementary fields that break down the gross eligible
+amount:
+
+- `inPeriodAmountCents`: the portion of `grossEligibleAmountCents` attributable to ledger entries
+  created within the current settlement period.
+- `carryForwardAmountCents`: the portion attributable to pending entries from prior periods that
+  were carried forward into this payout.
+
+When `carryForwardAmountCents > 0`, the seller financials panel in the dashboard displays an inline
+indicator — "Includes $X.XX from prior periods" — alongside the payout total so sellers can
+distinguish current-period earnings from accumulated carry-forward amounts.
+
+### Delivery ledger posting
+
+When an order is marked delivered, `recordDeliveryLedger` posts `sale` and `commission` entries for
+all sellers in the order. The implementation guarantees atomicity through a single Mongo session:
+
+1. An atomic `findOneAndUpdate` claims the order by setting `deliveryLedgerPostedAt`. Any concurrent
+   call for the same order finds the field already set and exits without writing financial rows.
+2. Inside the same session, `withSellerPairTransaction` (which accepts an optional `externalSession`
+   parameter) writes sale + commission rows for each seller.
+3. The session commits only after all seller rows succeed; a failure on any seller row rolls back
+   the entire batch.
+
+Prior to this implementation, each seller used its own independent session and
+`deliveryLedgerPostedAt` was written outside any transaction. The current approach ensures the claim
+flag and all financial rows are always consistent.
 
 ### Settlement lifecycle
 
@@ -61,7 +108,13 @@ until they are scheduled/paid.
 - `paid`: transfer succeeded (`externalTransferId` populated).
 - `failed`: transfer attempt failed.
 - `manual_required`: auto payout blocked; manual operator flow required.
-- `retryable`: paid transfer was reversed and is eligible for a controlled re-execution.
+- `retryable`: paid transfer was reversed and is eligible for a controlled re-execution. This is the
+  correct post-reversal status. `reversed` is **not** a valid enum value and was removed from the
+  schema; any historical reference to `reversed` in tooling or scripts should be replaced with
+  `retryable`.
+- `under_review`: payout auto-quarantined by the reconciliation job after detecting a Stripe
+  mismatch (see Section 5 — Reconciliation). Payouts in this status are excluded from automated
+  retries and require operator investigation before re-enabling.
 
 ---
 
@@ -72,6 +125,13 @@ Automatic settlement payout requires seller-level prerequisites:
 1. `seller.payout.stripeAccountId` exists.
 2. `seller.payout.bank.externalAccountId` exists.
 3. Approved payout bank metadata (`seller.payout.bank.bankName`, `last4`, etc.) is present.
+
+Before executing a transfer, `settlementExecution.service.js` performs a Stripe account pre-flight
+check that blocks on unresolved requirements in **any** of the following Stripe requirement sets:
+`currently_due`, `past_due`, and `eventually_due` (when the `eventually_due` deadline has passed).
+If unresolved requirements are found, the payout is automatically marked `manual_required` with a
+reason that identifies the blocking requirement set. Operators should resolve any `eventually_due`
+items before their deadline to prevent payout interruption.
 
 ### Account and external-account flow
 
@@ -195,8 +255,9 @@ SETTLEMENT_RECONCILIATION_SCAN_DAYS=2
 
 Purpose:
 
-- scans stale COD refund records that are still `in_progress`
-- fetches provider payout status (`CHIMONEY_PAYOUT_STATUS_PATH`)
+- scans stale COD refund records that are still `in_progress` regardless of their `providerName`
+  (not scoped to any single provider)
+- fetches provider payout status via the configured adapter
 - marks records completed on terminal success
 - marks unresolved items for manual review with explicit failure codes
 
@@ -254,6 +315,19 @@ Operational notes:
 - Provider metadata should remain sanitized (no raw account numbers; no raw webhook body unless
   explicit debug storage is enabled).
 
+### COD refund debt model and transaction boundaries
+
+When a COD refund completes, the seller `payoutHold` flag remains active until the associated ledger
+debt is resolved:
+
+- The Chimoney webhook handler (`chimoneyWebhook.service.js`) writes all ledger entries inside the
+  same Mongo session as the status updates. The refund record, order status, and ledger rows are
+  committed atomically; a partial write cannot leave the system in an inconsistent state.
+- The COD reconciliation job (`codPayoutReconciliation.js`) wraps the order update and
+  `onOrderStatusChanged` call in a single session for the same reason.
+- A seller with `payoutHold: true` is excluded from payout execution and from the reserve release
+  job until the hold is lifted (see Section 8 — Reserve withholding & release).
+
 ### COD refund error-rate alerting and dashboarding
 
 The COD refund workflow emits `cod_refund.execution.failure_by_error_code` with dimensions:
@@ -297,16 +371,58 @@ Troubleshooting stuck pending refunds:
 2. Run/inspect reconciliation output for stale `in_progress` records.
 3. If unresolved, keep payout hold active and route to manual review before any new payout attempt.
 
+### Stripe refund lifecycle
+
+Stripe `refund.updated` events are processed by a dedicated webhook handler:
+
+- **Idempotency key:** `processed_refund_updated_event:{event.id}` stored in Redis. Duplicate event
+  deliveries are discarded without re-processing.
+- **On `succeeded`:**
+  - Marks the refund record `completed`.
+  - Updates the order status.
+  - Posts refund ledger entries via `recordRefundLedger` (reverses the relevant sale and commission
+    rows for the refunded items).
+  - Restores reserved stock for full refunds.
+- **On `failed`:**
+  - Marks the refund record `failed` and updates the order status.
+  - No ledger entries are written; the original sale/commission rows remain in place.
+
+If you observe a mismatch between refund record status and order status, replay the `refund.updated`
+event from the Stripe dashboard (see _Replay webhook_ section) or correct the refund record status
+manually via the admin API.
+
+### Auto-quarantine on reconciliation mismatch
+
+When the reconciliation job detects one of the following discrepancy codes for a `paid` payout, it
+automatically transitions that payout to `under_review`:
+
+- `stripe_transfer_missing`: no matching Stripe transfer can be found for the payout's
+  `externalTransferId` or metadata.
+- `stripe_status_mismatch`: the Stripe transfer status does not align with the internal payout
+  state.
+
+Payouts in `under_review` are:
+
+- Excluded from automated retry queues (batch retry and single-payout retry).
+- Visible to admins via the standard payout listing with `?status=under_review` filter.
+
+To resolve a quarantined payout, investigate the root cause using the payout reconcile endpoint
+(`GET /api/admin/settlements/payouts/:payoutId/reconcile`), fix the underlying issue (missing
+transfer, Stripe state drift, etc.), and then manually progress the payout through the appropriate
+path (re-execute or escalate to manual payout flow).
+
 ### Triage workflow for discrepancies
 
 1. Open reconciliation result from admin batch/payout reconcile endpoints.
 2. Categorize by discrepancy code (`*_mismatch`, `stripe_transfer_missing`,
    `stripe_transfer_lookup_failed`, etc.).
-3. For Stripe lookup failures, confirm transfer id/metadata linkage and API access health.
-4. For amount/status mismatches, correlate payout row, ledger rows, and Stripe transfer timeline.
-5. For stale `processing` or in-progress payouts, avoid duplicate payout actions; use retry/manual
+3. For payouts automatically moved to `under_review`, use `?status=under_review` to list them;
+   investigate and resolve before re-enabling automated retry.
+4. For Stripe lookup failures, confirm transfer id/metadata linkage and API access health.
+5. For amount/status mismatches, correlate payout row, ledger rows, and Stripe transfer timeline.
+6. For stale `processing` or in-progress payouts, avoid duplicate payout actions; use retry/manual
    actions after confirming current provider state.
-6. Document all interventions in ops ticketing with batch/payout IDs and timestamps.
+7. Document all interventions in ops ticketing with batch/payout IDs and timestamps.
 
 ### Payout reversal operator notes
 
@@ -342,6 +458,12 @@ same reversal key, the API returns a no-op success payload.
 - **When to choose batch vs single**
   - Choose **batch** for queue-level recovery and consistent replay across many payouts.
   - Choose **single** for surgical retries where broad reprocessing is unnecessary or risky.
+
+> **Duplicate-transfer safeguard:** In the retryable execution path, the handler queries Stripe via
+> `findTransferByMetadata` (exported from `reconciliation.service.js`) before issuing a new
+> transfer. If a matching prior transfer is found for the payout metadata, the payout is marked
+> `paid` using the existing transfer ID without creating a second transfer. This makes retry
+> execution safe to run even when a previous attempt partially succeeded before crashing.
 
 ---
 
@@ -419,6 +541,23 @@ When `manual_required` payouts exist, follow this short procedure:
 - `missing_stripe_account_id`
 - `non_positive_amount`
 
+### Ledger atomicity on manual payout execution
+
+When a manual payout is executed via `manualSettlementPayout.service.js`, the following steps run
+inside a single Mongo transaction:
+
+1. A `manual_payout` ledger row is created. This row now carries `merchantSellerId`, which allows
+   correct attribution when the `sellerId` on the row points to a platform/operator account rather
+   than directly to the merchant.
+2. The `SettlementPayout` record is updated to `paid`.
+3. `LedgerEntry.updateMany({ settlementBatchId, sellerId, payoutStatus: 'scheduled' })` sets
+   `payoutStatus: 'paid'` on all underlying `sale`, `commission`, `refund`, and related entries.
+
+All three writes commit together or not at all. If you encounter a `SettlementPayout` with
+`status: paid` but underlying entries still showing `payoutStatus: scheduled`, those records
+pre-date this fix and can be corrected with a targeted backfill against the affected
+`settlementBatchId` and `sellerId`.
+
 ### Re-execution ledger semantics (`payout_execution`)
 
 When a `retryable` payout is executed successfully, the system creates a new payout row linked by
@@ -435,3 +574,59 @@ Reconciliation math for reversed/re-executed payouts:
 Operationally, this means you should expect exactly one `payout_reversal` row per reversed payout
 idempotency domain and at most one successful `payout_execution` row per successful retry payout
 execution attempt key.
+
+---
+
+## 8) Reserve withholding & release
+
+### Sign convention
+
+Reserve withholding produces two ledger row types per settlement cycle:
+
+| Entry type     | `amountCents` sign | Meaning                                         |
+| -------------- | ------------------ | ----------------------------------------------- |
+| `reserve`      | Negative           | Amount withheld from the seller's net payout.   |
+| `reserve_used` | Positive           | Amount applied against the outstanding reserve. |
+
+`reserve_used` is always stored as a **positive** amount so that it nets correctly against the
+negative `reserve` row. The release job computes remaining balance as `|reserve| − reserve_used` and
+caps each release at that net remaining balance to prevent over-release if a reserve was partially
+consumed in a prior cycle.
+
+### Reserve release job behavior
+
+Eligibility for release requires:
+
+- `type='reserve'`
+- `payoutStatus='reserved'`
+- `releaseScheduledAt <= now`
+
+Any reserve with an elapsed `releaseScheduledAt` is eligible regardless of which calendar month it
+originated. The prior month-boundary guard (`reserveMonth != currentMonth`) has been removed; same-
+month releases are now correctly included when their hold period has elapsed.
+
+- Sellers with `payoutHold: true` are **skipped** by the release job. Releases resume automatically
+  once the hold is lifted (e.g., after a COD debt is resolved — see Section 5, COD refund debt
+  model).
+- The release amount is capped at the net remaining balance; a release can never exceed what was
+  originally withheld minus what has already been returned.
+- The job processes at most `RESERVE_RELEASE_BATCH_LIMIT` eligible reserve rows per cycle (default
+  `500`). Raise this limit if the release backlog consistently approaches the cap; lower it to
+  reduce per-cycle DB load in high-volume environments.
+
+---
+
+## 9) Processor fee recovery
+
+When the actual payment processor fee differs from the estimate posted at order time,
+`recordProcessorFeeRecovery` posts corrective ledger entries:
+
+- **Upward correction (actual > estimate):** Posts an additional `processor_fee` debit entry for the
+  platform and a `processing_fee` debit for the seller.
+- **Downward correction (actual < estimate):** Posts a **negative** `processor_fee` entry for the
+  platform and a `processing_fee` reversal for the seller, reducing the previously recorded
+  estimate.
+
+Both directions are handled in the same ledger write. The corrective entries ensure the net booked
+cost always equals the true processor charge regardless of whether the actual fee came in above or
+below the original estimate.

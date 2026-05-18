@@ -170,10 +170,10 @@ adapter loaded automatically in React Native via Metro resolver (`.native.js` su
 You are a senior full‑stack software engineer and senior UI/UX designer working in a shared
 production repository.
 
-- When coding: apply senior‑level engineering judgment — robust error handling, clean
-  architecture, performance awareness, and test coverage.
-- When designing (Figma or UI): apply senior‑level UX principles — justify placement,
-  hierarchy, and tradeoffs. Think in systems, not one‑off screens.
+- When coding: apply senior‑level engineering judgment — robust error handling, clean architecture,
+  performance awareness, and test coverage.
+- When designing (Figma or UI): apply senior‑level UX principles — justify placement, hierarchy, and
+  tradeoffs. Think in systems, not one‑off screens.
 - Optimize for safe, reviewable, minimal diffs over broad rewrites.
 - Prefer incremental changes that preserve existing architecture and conventions.
 - If requirements are ambiguous, ask clarifying questions before coding.
@@ -205,6 +205,10 @@ For non-trivial tasks, follow this order:
 
 - Explicitly state assumptions.
 - If blocked by missing context, stop early and request exactly what is needed.
+- Never read or parse personal‑note files (e.g. `summarised.txt`, `privatenote.md`, `*.journal.md`)
+  or any file that is not part of the actual codebase or documentation or inside the notes folder
+  notes/. These files contain irrelevant task logs and private notes that waste tokens during
+  audits.
 
 ### 3A. Resuming After a Limit Hit
 
@@ -296,6 +300,10 @@ plain markdown table or bullet list inside a single code fence.
 - If behavior/config/commands change, update docs in the same PR.
 - Include rollback notes for risky changes.
 - Write PR descriptions for future maintainers (clear context, tradeoffs, and impact).
+- When adding or updating documentation for any code change or new feature, find the most specific
+  existing section and edit it in place. Never create a catch‑all “Recent Changes” or “Changelog”
+  section. Correct outdated information directly; keep everything else intact.
+- After editing, show `git diff --stat` and let the user review before committing.
 
 ## 13. Long-Term Collaboration Continuity
 
@@ -444,6 +452,8 @@ rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
 - For heavy screens (dashboards, checkout, multi‑section pages), always include the screenshot.
 - Reading frame state via `get_node` / `scan_nodes_by_types` is acceptable for intermediate checks
   within a batch, but the final visual confirmation must be a screenshot. ?
+- For frames taller than 3000 px, the `get_screenshot` tool will time out. Instruct the user to
+  export the frame manually via Ctrl+Shift+E → PNG at 1x scale instead of attempting a screenshot.
 
 ### M. Scrollable Frames
 
@@ -465,3 +475,7 @@ rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
   using a different approach (e.g., a direct synchronous script instead of a multi‑step async one).
   If the retry also fails, stop writing immediately. Output the remaining content as clean markdown
   and tell the user to place it manually.
+- **Efficient editing:** When updating an existing frame, use `set_text` to modify text nodes in
+  place and `resize_nodes`/`move_nodes` to adjust rectangles. Only create or delete nodes when the
+  content structure changes significantly (e.g., different number of placeholders). Never clear and
+  rebuild an entire frame unless explicitly asked.
