@@ -46,11 +46,14 @@
       - [Security \& ownership controls](#security--ownership-controls)
       - [Post-approval seller experience](#post-approval-seller-experience)
       - [Operational notes](#operational-notes)
+      - [Seller withdrawal](#seller-withdrawal)
+      - [Audit trail collections](#audit-trail-collections)
       - [Seller bank-update review lifecycle (pending/approved/rejected + seller cancel)](#seller-bank-update-review-lifecycle-pendingapprovedrejected--seller-cancel)
       - [Seller dashboard behavior for bank-update reviews](#seller-dashboard-behavior-for-bank-update-reviews)
       - [Bank-update review lifecycle flowchart](#bank-update-review-lifecycle-flowchart)
       - [Backend contract for bank-update records](#backend-contract-for-bank-update-records)
       - [Bank-update API routes (seller + admin)](#bank-update-api-routes-seller--admin)
+      - [KYC document handling](#kyc-document-handling)
     - [Seller store settings, storefront policies, and admin review flow](#seller-store-settings-storefront-policies-and-admin-review-flow)
       - [Seller settings: editable fields \& review gates](#seller-settings-editable-fields--review-gates)
       - [What happens when a seller updates policies or branding](#what-happens-when-a-seller-updates-policies-or-branding)
@@ -517,9 +520,13 @@ flowchart TD
      provisioning state) in a single response.
 4. **Admin decision** — `PATCH /api/sellers/admin/:id/verify`
    - Admins mark KYC as `verified`, `rejected`, or `action_required`.
+   - The endpoint validates the requested transition against the KYC state machine before writing;
+     invalid transitions return `422`.
    - Rejections store both `kyc.rejectionReason` and a frozen `kyc.rejectedApplication` snapshot for
      auditability.
    - For `action_required`, sellers can re-submit without losing their previous submission context.
+   - Full approval (status change, document marks, store creation, role grant) executes inside a
+     single MongoDB transaction; any failure triggers automatic rollback.
 5. **Store provisioning** (auto after approval)
    - On approval, the backend ensures a Store exists for the seller, using defaults derived from the
      seller profile (store name, slug, branding defaults, and basic policies).
@@ -527,18 +534,36 @@ flowchart TD
 
 #### State machine (clear, enforced transitions)
 
+Transitions are enforced by `backend/src/services/seller/kycStateMachine.js`. The allowed transition
+matrix is:
+
+```
+draft            → pending
+pending          → verified | rejected | action_required
+action_required  → pending
+rejected         → pending
+```
+
+The seller `apply` endpoint blocks all mutations when `kyc.status === 'verified'`. Profile changes
+for verified sellers must go through an admin-mediated flow.
+
 | Seller `status` | KYC `status`      | Meaning / Access                                                         |
 | --------------- | ----------------- | ------------------------------------------------------------------------ |
 | `inactive`      | `draft`           | Application saved but not submitted. Seller dashboard access is blocked. |
 | `inactive`      | `pending`         | Submitted for review; admin action required.                             |
 | `inactive`      | `action_required` | Seller must re-submit updates; previous data is preserved.               |
-| `inactive`      | `rejected`        | Rejected with reason; seller must restart or re-apply.                   |
+| `inactive`      | `rejected`        | Rejected with reason; seller must re-apply.                              |
 | `active`        | `verified`        | Approved; full seller access unlocked and store provisioning enabled.    |
 
 #### Security & ownership controls
 
 - **Ownership enforcement:** All seller endpoints use `protectRoute` + role restriction plus
   `requireSeller`, ensuring only the seller who owns a seller profile can access seller APIs.
+- **KYC gate (`requireVerifiedSeller`):** Product write, order management, and store-settings edit
+  endpoints are additionally gated by `requireVerifiedSeller` (defined in
+  `backend/src/middleware/seller.middleware.js`), which requires `kyc.status === 'verified'` and
+  `status === 'active'`. Non-verified sellers retain access to read-only, bank-account, Stripe
+  Connect onboarding, and KYC document upload routes.
 - **Data isolation:** Seller-scoped queries use `sellerId` consistently (orders, products, store
   settings) to prevent cross-tenant leakage.
 - **Encrypted banking data:** Sensitive settlement details are stored with encryption using
@@ -588,32 +613,57 @@ readiness, and payout setup stay aligned:
 - The onboarding flow is intentionally **idempotent**: repeated submissions update the same seller
   record instead of creating duplicates.
 - Drafts allow multi-step completion, while pending submissions lock the application for review.
-- Rejections preserve a snapshot of the submitted application to support support reviews or audits.
+- Rejections preserve a snapshot of the submitted application to support reviews or audits.
+
+#### Seller withdrawal
+
+Sellers in `draft`, `pending`, `action_required`, or `rejected` KYC states may withdraw their
+application via the `/withdraw` endpoint. Verified sellers (`kyc.status === 'verified'`) receive
+`422` and must use a dedicated "close account" flow instead.
+
+Withdrawal does **not** hard-delete documents. The controller sets `lifecycleStatus='archived'`,
+`archiveReason='withdrawn'`, and `supersededAt=now` on seller documents. All document queries filter
+on `lifecycleStatus: 'active'` by default so archived records are excluded from normal reads.
+
+A purge script (`backend/src/scripts/purge-archived-seller-documents.js`) permanently removes
+archived documents older than the configured retention window. Set `KYC_DOCUMENT_RETENTION_DAYS` to
+control the window (default `2555`, equivalent to 7 years).
+
+#### Audit trail collections
+
+**`SellerLifecycleAudit`** (`backend/src/models/sellerLifecycleAudit.model.js`) — append-only record
+of every admin decision in the seller lifecycle. Covered actions include: KYC
+verify/reject/action_required, bank-update approve/reject, store review, payout-hold toggle,
+reserve-tier change, and store-status change. Each record captures actor, action, `fromStatus`,
+`toStatus`, notes, a data snapshot, and the actor's IP address.
+
+**`SellerProfileAccessAudit`** (`backend/src/models/sellerProfileAccessAudit.model.js`) —
+append-only record of admin access to tier-1 seller PII (govIdNumber, birthDate, addresses, banking
+last-four). Entries are created when admin views the `/admin/requests` or `/admin/approved` list
+endpoints that expose this data.
 
 #### Seller bank-update review lifecycle (pending/approved/rejected + seller cancel)
 
 Bank updates for already-verified sellers now run on a dedicated review lifecycle that is separate
 from seller-application KYC statuses. The current lifecycle is:
 
-`pending` → (`approved` | `rejected`) with a seller-side cancel action available from `pending` and
-`rejected`.
+`pending` → (`approved` | `rejected` | `action_required`) with a seller-side cancel action available
+from `pending`, `rejected`, and `action_required`.
 
-There is **no `action_required` state for bank updates**. Any legacy reference to bank-update
-`action_required` should be treated as obsolete.
-
-| Bank update review status | Who sets it           | Meaning                                                                |
-| ------------------------- | --------------------- | ---------------------------------------------------------------------- |
-| `pending`                 | Seller submits update | Admin review is required; storefront/product creation remains paused.  |
-| `approved`                | Admin approve action  | New bank details are promoted to approved payout bank fields.          |
-| `rejected`                | Admin reject action   | Submitted bank update is denied; admin notes explain why.              |
-| `cancelled` (UI outcome)  | Seller cancel action  | Seller reverts to last approved bank profile and clears active review. |
+| Bank update review status | Who sets it           | Meaning                                                                           |
+| ------------------------- | --------------------- | --------------------------------------------------------------------------------- |
+| `pending`                 | Seller submits update | Admin review is required; storefront/product creation remains paused.             |
+| `approved`                | Admin approve action  | New bank details are promoted to approved payout bank fields.                     |
+| `rejected`                | Admin reject action   | Submitted bank update is denied; admin notes explain why.                         |
+| `action_required`         | Admin action          | Admin requests more information without outright rejecting; seller must resubmit. |
+| `cancelled` (UI outcome)  | Seller cancel action  | Seller reverts to last approved bank profile and clears active review.            |
 
 State transition summary:
 
 1. Seller submits a bank update (`pending`).
-2. Admin approves (`approved`) or rejects (`rejected`).
-3. Seller can cancel while review is `pending` or after `rejected`; cancel restores the last
-   approved bank profile and clears the in-flight review metadata.
+2. Admin approves (`approved`), rejects (`rejected`), or requests changes (`action_required`).
+3. Seller can cancel while review is `pending`, `rejected`, or `action_required`; cancel restores
+   the last approved bank profile and clears the in-flight review metadata.
 
 #### Seller dashboard behavior for bank-update reviews
 
@@ -649,13 +699,23 @@ semantics:
   the legacy `bank` type.
 - Bank statement documents now include explicit phase metadata: `isOnboarding=true` for onboarding
   uploads before seller approval and `isOnboarding=false` for post-approval bank-update uploads.
-- bank statement `version` is incremented in both onboarding and bank-update upload paths, so the
+- `bank_statement` `version` is incremented in both onboarding and bank-update upload paths, so the
   latest statement is deterministic without relying on legacy type aliases.
-- `seller.updateReview` is the active review envelope for bank updates (`type/requestType`
-  `bank_update`).
-- `updateReview.status` for bank updates is constrained to `pending`, `approved`, or `rejected`.
-- On deny, the submitted payload is copied into an archived record (`ArchivedBankUpdate`) and the
-  mutable in-review payload is cleared from the active review envelope.
+- `seller.updateReview` is the active review envelope for bank updates. The envelope uses only
+  `requestType` (the legacy `type` field has been dropped). Run
+  `backend/src/scripts/normalize-bank-update-review.js` to migrate any existing records that still
+  carry the old `type` field.
+- `updateReview.status` for bank updates is constrained to `pending`, `approved`, `rejected`, or
+  `action_required`.
+- **Stripe bank account retention:** when a seller submits a bank update, the old Stripe external
+  account is **not** deleted at submit time. The pending account is created on Stripe but the old
+  account remains the default until an admin decision:
+  - **Admin approve** → old external account is deleted from Stripe; new account becomes the
+    default.
+  - **Admin reject / seller cancel** → the pending (new) external account is deleted from Stripe and
+    the old account is re-set as the default.
+- On admin reject, the submitted payload is copied into an archived record (`ArchivedBankUpdate`)
+  and the mutable in-review payload is cleared from the active review envelope.
 - `seller.payout.bank` is the approved source of truth for live settlement data. UIs should treat
   this as canonical approved bank information.
 - Seller cancel restores `application.banking` from `payout.bank` and clears `updateReview`, so the
@@ -667,8 +727,8 @@ Use the following API routes for the full bank-update lifecycle:
 
 - **Submit bank update (seller):** `POST /api/seller/payment-method`
   - Submit one-time bank token + statement metadata to start/replace a bank-update review.
-  - Backend immediately exchanges the token with Stripe (`createExternalAccount`) and updates the
-    seller's connected external bank account on their Stripe Connect account.
+  - Backend creates the new external account on Stripe (`createExternalAccount`) but keeps the
+    existing Stripe bank account as the default until an admin decision is made.
   - Creates/updates `updateReview` with `status=pending` for verified active sellers.
 - **Admin approve/deny review:** `PATCH /api/sellers/admin/:id/update-review?action=approve|reject`
   - `approve`: promotes previously persisted non-sensitive bank metadata to `payout.bank` and marks
@@ -678,19 +738,33 @@ Use the following API routes for the full bank-update lifecycle:
 - **Seller cancel update review:**
   - `POST /api/seller/payment-method/cancel-bank-update`
   - `POST /api/seller/bank-update/cancel` (alias)
-  - Allowed when current bank-update review is `pending` or `rejected`; restores last approved bank
-    fields and clears active review state.
+  - Allowed when current bank-update review is `pending`, `rejected`, or `action_required`; restores
+    last approved bank fields and clears active review state.
   - The primary cancel endpoint is intentionally excluded from the global API rate limiter to avoid
     blocking seller recovery actions with `429` during repeated cancel/retry attempts.
-    `action_required` remains valid for seller-application KYC and store-profile review workflows,
-    but it is **not** part of the bank-update review state machine. The KYC document access layer
-    now enforces a **view-first, policy-driven** model:
+
+#### KYC document handling
+
+**Document upload:** Data URI payloads are rejected at the upload endpoint with `400 Bad Request`.
+Documents must be sent as multipart file uploads.
+
+**Server-side document viewing:** The preferred access pattern for KYC documents is server-side
+proxying. The backend fetches the document from Cloudinary and pipes it to the client without
+exposing the Cloudinary URL to the browser:
+
+- `GET /api/seller/kyc/documents/:documentId/view` — seller-authorized server-side document view.
+- `GET /api/sellers/admin/docs/:documentId/view` — admin server-side document view.
+
+The KYC document access layer enforces a **view-first, policy-driven** model:
 
 - **Inline viewer is the default** for all roles. Document access uses short-lived view tokens and
   renders with `Content-Disposition: inline`.
 - **Tiered controls are enforced per document**:
-  - **Tier 1** (`identity`, `authorization`) is **view-only**.
+  - **Tier 1** (`identity`, `proof_of_address`, `authorization`) is **view-only**. Note:
+    `proof_of_address` is classified as tier 1 (previously tier 2).
   - **Tier 2** documents can be viewed and are eligible for tightly controlled admin download.
+- `isOnboarding` defaults on document records are now derived from the `ONBOARDING_DOCUMENT_TYPES`
+  set rather than being hard-coded per type.
 - **Audit logging is built in** for view token creation, viewer access attempts, frontend viewer
   events, and download attempts/outcomes.
 - **Tier 2 downloads are admin-only** and pass through a watermarking step before file delivery.
@@ -797,7 +871,10 @@ Store profile reviews appear in the admin **Seller Requests → Policy update re
    - **Approve** → `reviewStatus=approved`, clear `reviewSnapshot`, the new profile goes live.
    - **Reject** → `reviewStatus=rejected`, keep `reviewNotes`, storefront stays on last approved
      snapshot.
-   - **Action required** → `reviewStatus=action_required` with required notes.
+   - **Action required** → `reviewStatus=action_required` with required notes. The admin may also
+     populate `requiresChangesFor` — a structured list of field names that need correction. The
+     seller dashboard can use this list to highlight which specific fields must be updated before
+     resubmission.
 4. Email notifications are sent automatically to the seller on approve/reject/action required.
 
 This workflow ensures **brand/policy edits are moderated** while the storefront remains stable for
@@ -816,9 +893,9 @@ see the **previously approved** shipping/return policies and branding details on
 profile** so that order history can always display the exact policy the buyer agreed to.
 Specifically:
 
-- During checkout, the backend resolves the **approved** policy source (current store profile if
-  `reviewStatus=approved`, otherwise the `reviewSnapshot`) and derives the **shipping** and
-  **return/refund** policy text.
+- During checkout, `fetchStorePolicySnapshot` resolves the **approved** policy source. It prefers
+  `reviewSnapshot` when `reviewStatus !== 'approved'`, matching the storefront's display behavior.
+  This ensures a pending policy edit cannot leak into the order snapshot at checkout.
 - These values are persisted on the **Order** as immutable fields (e.g.,
   `orderShippingPolicy`/`orderReturnPolicy` or `order_shipping_policy`/`order_return_policy`
   depending on API shape).
@@ -837,7 +914,15 @@ hide all of their products **without changing policies**. When enabled:
 
 When the seller resumes the store, products paused by the store are reactivated. This is designed as
 a **temporary safety switch** for sellers who want to pause orders while policies are being reviewed
-or updated.reviewed or updated.
+or updated.
+
+**Admin-initiated pause:** When an admin pauses a store, the backend automatically sets
+`seller.payoutHold=true` with `payoutHoldReason=’store_paused_admin’`. When the admin reactivates
+the store, the payout hold is released. Seller self-pause does **not** affect `payoutHold`.
+
+**In-flight checkout contract:** Pausing a store hides products from new carts and prevents new
+checkout sessions from including that store’s items. It does **not** cancel in-flight checkout
+sessions that were already initiated before the pause.
 
 ### Seller product creation & admin moderation (end-to-end)
 
@@ -943,35 +1028,43 @@ Admins have a moderation queue scoped to seller submissions:
    - Product metadata, variants, images, category mapping.
    - Historical submissions / prior rejection notes.
 3. **Decision**
-   - **Approve** → sets `approvalStatus=approved`, `visibility=public` (or scheduled visibility).
+   - **Approve** → verifies that `seller.kyc.status === 'verified'` and `seller.status === 'active'`
+     before writing; returns `422` if either condition is not met. On success, sets
+     `approvalStatus=approved`, `visibility=public` (or scheduled visibility).
    - **Reject** → sets `approvalStatus=rejected`, `visibility=hidden`, and writes a rejection
      reason.
 4. **Notification**
    - Seller receives a status update in dashboard (and optionally email).
 
 This workflow ensures every seller product has a clear admin decision before being shown in public
-lists or categories.
+lists or categories, and that approval is blocked if the seller's own KYC has lapsed or been
+revoked.
 
 #### State transitions & audit trail
 
 The flow is intentionally explicit to avoid ambiguous states:
 
-| Current status | Action                                 | Next status | Notes                                                                    |
-| -------------- | -------------------------------------- | ----------- | ------------------------------------------------------------------------ |
-| `draft`        | Seller saves without submitting        | `draft`     | Editable by seller; never visible publicly.                              |
-| `draft`        | Seller submits for review              | `pending`   | Locks fields that require moderation.                                    |
-| `pending`      | Admin approves                         | `approved`  | Eligible for storefront when visibility rules also allow it.             |
-| `pending`      | Admin rejects                          | `rejected`  | Seller receives reason and must edit before re-submit.                   |
-| `rejected`     | Seller edits and re-submits            | `pending`   | Starts a new review cycle; prior rejection context is retained.          |
-| `approved`     | Seller edits moderation-sensitive data | `pending`   | Re-review gate for core listing changes.                                 |
-| `approved`     | Admin unpublishes/archives             | `hidden`    | Listing remains in system for audit/reporting but is removed storefront. |
-| `hidden`       | Admin republishes (if policy permits)  | `approved`  | Returns to approved lifecycle without creating a new product record.     |
+| Current status | Action                                 | Next status | Notes                                                                                                                                                                                      |
+| -------------- | -------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `draft`        | Seller saves without submitting        | `draft`     | Editable by seller; never visible publicly.                                                                                                                                                |
+| `draft`        | Seller submits for review              | `pending`   | Locks fields that require moderation.                                                                                                                                                      |
+| `pending`      | Admin approves                         | `approved`  | Eligible for storefront when visibility rules also allow it.                                                                                                                               |
+| `pending`      | Admin rejects                          | `rejected`  | Seller receives reason and must edit before re-submit.                                                                                                                                     |
+| `rejected`     | Seller edits and re-submits            | `pending`   | Starts a new review cycle; prior rejection context is retained. A `pendingReviewSnapshot` is always captured on submission so moderators can diff against the previously rejected version. |
+| `approved`     | Seller edits moderation-sensitive data | `pending`   | Re-review gate for core listing changes.                                                                                                                                                   |
+| `approved`     | Admin unpublishes/archives             | `hidden`    | Listing remains in system for audit/reporting but is removed storefront.                                                                                                                   |
+| `hidden`       | Admin republishes (if policy permits)  | `approved`  | Returns to approved lifecycle without creating a new product record.                                                                                                                       |
 
 Audit trail expectations:
 
 - Every moderation decision stores actor (`adminId`/seller), timestamp, and reason metadata.
 - Rejections preserve reviewer notes for seller feedback and operational follow-up.
 - Status history is retained to support disputes, compliance review, and rollback investigations.
+
+**Stale category guard on cancel:** when a seller cancels a pending product edit, the backend
+validates that all category references in the edit snapshot still exist. If any referenced category
+has since been deleted, the product is forced back to `draft` rather than restoring to the previous
+`pending` state. The seller must update the category selection before resubmitting.
 
 #### Visibility rules & storefront behavior
 
@@ -4808,6 +4901,16 @@ CLOUDINARY_API_KEY
 CLOUDINARY_API_SECRET
 SENTRY_DSN
 SENTRY_RELEASE
+```
+
+**Seller / KYC**
+
+```
+SELLER_DATA_SECRET                 # encryption key for application.banking at rest
+SELLER_DOC_VIEW_TOKEN_SECRET       # signing key for short-lived KYC document view tokens
+                                   # (falls back to ACCESS_TOKEN_SECRET if unset)
+KYC_DOCUMENT_RETENTION_DAYS        # days before archived seller documents are hard-deleted
+                                   # by the purge script (default: 2555 = 7 years)
 ```
 
 **Payment provider + COD refund/payout policy**
