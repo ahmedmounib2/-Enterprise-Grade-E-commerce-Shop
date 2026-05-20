@@ -1,5 +1,7 @@
 # ==== Universal Ignore Patterns ====
 phase1-audit-report.md
+report.md
+Phase-1-changes.md
 # https://github.com/github/gitignore/blob/main/Node.gitignore
 paymobSwitch.txt
 cronJobTest.txt
@@ -16,10 +18,22 @@ eshop_api.cer
 multi-store-googlePlay-policy-consideration.txt
 refactor-seller-application.txt
 todo-hidden.txt
-sprint.md
 multi-store-update-guide.txt
+sprint.md
+prettier-configuration-cheatSheet.md
+eslint-cheatsheet.md
+privatenote3.md
+notes/phase-2-changes.md
+notes/private-note3.md
+notes/gibberishSummary.txt
+phase2-audit-report.md
+phase3-audit-report.md
+
 
 .env.test
+# Local upload temp files
+backend/uploads/
+
 # Dependency directories
 node_modules/
 
@@ -71,6 +85,18 @@ npm-debug.log*
 # Lockfiles (keep package-lock.json/yarn.lock)
 yarn.lock
 pnpm-lock.yaml
+
+# ==== Security: generated TLS certs (Fix C-1) ====
+cert/*.pem
+cert/*.key
+
+# ==== Security: cookie jars (Fix C-2) ====
+cookies.txt
+*.cookies.txt
+
+# ==== Test/scratch artefacts (Fix L-2) ====
+testers.csv
+testers2.csv
 
 # ==== Project-Specific ====
 # ESLint (already covered in cache dirs)

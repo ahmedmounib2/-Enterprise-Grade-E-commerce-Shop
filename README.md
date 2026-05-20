@@ -154,6 +154,7 @@
       - [1) COD payout reconciliation cron](#1-cod-payout-reconciliation-cron)
       - [2) COD refund details purge cron](#2-cod-refund-details-purge-cron)
     - [Key rotation \& webhook replay procedures](#key-rotation--webhook-replay-procedures)
+      - [Rotate Stripe webhook secret safely](#rotate-stripe-webhook-secret-safely)
       - [Rotate Chimoney API key safely](#rotate-chimoney-api-key-safely)
       - [Rotate Chimoney webhook secret safely](#rotate-chimoney-webhook-secret-safely)
       - [Replay webhook (admin/on-call detailed)](#replay-webhook-adminon-call-detailed)
@@ -237,6 +238,8 @@
   - [Order fulfilment, PDF export \& canceled order labeling](#order-fulfilment-pdf-export--canceled-order-labeling)
   - [GDPR \& user data export](#gdpr--user-data-export)
   - [Security \& observability](#security--observability)
+    - [Field-level PII encryption](#field-level-pii-encryption)
+    - [Role \& Permission Matrix](#role--permission-matrix)
   - [Testing \& CI](#testing--ci)
     - [How to run tests](#how-to-run-tests)
     - [How to test the COD refund purge cron job](#how-to-test-the-cod-refund-purge-cron-job)
@@ -746,7 +749,9 @@ Use the following API routes for the full bank-update lifecycle:
 #### KYC document handling
 
 **Document upload:** Data URI payloads are rejected at the upload endpoint with `400 Bad Request`.
-Documents must be sent as multipart file uploads.
+Documents must be sent as multipart file uploads using the `kycUpload` middleware
+(`middleware/kycUpload.middleware.js`). The middleware enforces per-file size limits, validates MIME
+types, and attaches the processed buffer to `req.file` before the controller runs.
 
 **Server-side document viewing:** The preferred access pattern for KYC documents is server-side
 proxying. The backend fetches the document from Cloudinary and pipes it to the client without
@@ -789,6 +794,19 @@ Configuration and operational notes for maintainers:
   viewer first and reserve Tier 2 download for approved admin workflows.
 - Any older examples, scripts, or runbooks that imply unrestricted seller/admin KYC downloads should
   be updated to the tiered policy above.
+
+**PII decryption helper:** All seller-facing and admin endpoints that return application data call
+`decryptApplicationPii(sellerDoc)` before sending the response. This helper decrypts every
+AES-256-GCM field-encrypted value on the Seller record (see
+[Field-level PII encryption](#field-level-pii-encryption)) and returns a plain object safe for
+serialization. Never expose the raw Mongoose document containing encrypted buffer values to the
+client.
+
+**Application resume flow:** The seller onboarding form persists a draft to the backend on every
+step transition. When a seller returns to a partially completed application, the backend detects the
+first incomplete step (the first step whose required fields are not yet filled) and resumes from
+there rather than always returning to step 1. This logic is enforced server-side; the frontend reads
+the `resumeStep` field from the API response and navigates accordingly.
 
 ### Seller store settings, storefront policies, and admin review flow
 
@@ -1926,6 +1944,11 @@ The webhook handler validates Stripe signatures and supports multiple events:
     - Sets `order.status = 'refunded'`, persists `refundId`, updates timestamps.
     - Restores inventory via `restoreStockReservation(order._id)`.
 
+- **`account.updated`**
+  - Idempotent: uses Redis key `processed_account_updated:{event.id}` with a **7-day TTL** to handle
+    Stripe's retry window. Duplicate deliveries within the TTL window are discarded without
+    re-processing.
+
 - **`refund.updated`**
   - Idempotent: uses Redis key `processed_refund_updated_event:{event.id}`. Duplicate deliveries of
     the same event are discarded without re-processing.
@@ -2481,17 +2504,20 @@ Also inspect structured logs with `orderId`, `idempotencyKey`, `providerRefundId
 
 #### Chimoney webhook endpoint setup (sandbox dashboard)
 
-When creating the webhook endpoint in Chimoney dashboard, use your backend public URL with:
+When creating the webhook endpoint in Chimoney dashboard, use your backend public URL:
 
-- Preferred endpoint URL:
-  - `https://<your-backend-domain>/api/chimoney/webhook`
-- Optional path-secret style endpoint URL (if you prefer URL secret matching):
-  - `https://<your-backend-domain>/api/chimoney/webhook/<CHIMONEY_WEBHOOK_SECRET>`
+- Endpoint URL: `https://<your-backend-domain>/api/chimoney/webhook`
 
-Both routes are supported by backend routing:
+The backend exposes a single authenticated route:
 
 - `POST /api/chimoney/webhook`
-- `POST /api/chimoney/webhook/:webhookSecret`
+
+**Security:** Every incoming request is verified with HMAC-SHA256 over `req.rawBody` using
+`CHIMONEY_WEBHOOK_SECRET`. The secret is **required** — the server throws at boot time if it is
+missing in production (`NODE_ENV=production`). The URL-path secret variant
+(`/webhook/:webhookSecret`) has been removed; all authentication is now signature-based. Redis SETNX
+replay protection is applied per event (TTL: 24 h) so duplicated deliveries are safely ignored
+without re-processing.
 
 Subscribe to these events (the ones currently processed by backend):
 
@@ -2550,6 +2576,25 @@ CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}
 
 ### Key rotation & webhook replay procedures
 
+For full step-by-step rotation procedures including dual-secret Stripe rotation, see
+[docs/security/webhook-rotation.md](docs/security/webhook-rotation.md).
+
+#### Rotate Stripe webhook secret safely
+
+Stripe supports up to 5 active secrets per endpoint, enabling zero-downtime dual-secret rotation.
+
+1. In the Stripe Dashboard, go to **Developers → Webhooks → your endpoint** and click **"Add
+   secret"**.
+2. Add the new secret alongside the old one in Railway:
+   `STRIPE_WEBHOOK_SECRETS=whsec_new,whsec_old`.
+3. Deploy and confirm both secrets verify incoming events (check logs).
+4. Remove the old secret from the list and delete it from the Stripe Dashboard.
+5. Update `STRIPE_WEBHOOK_SECRET` to the new value.
+
+> **Note:** Multi-secret support (comma-separated `STRIPE_WEBHOOK_SECRETS`) is not yet implemented
+> in `payment.controller.js`. See
+> [docs/security/webhook-rotation.md](docs/security/webhook-rotation.md) for the full TODO.
+
 #### Rotate Chimoney API key safely
 
 1. Create new API key in Chimoney console (same environment).
@@ -2569,7 +2614,9 @@ CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}
 #### Replay webhook (admin/on-call detailed)
 
 1. Capture original payload + event metadata from provider dashboard.
-2. `POST /api/chimoney/webhook` with payload and `x-chimoney-webhook-secret: <active-secret>`.
+2. `POST /api/chimoney/webhook` with the original raw payload body and the HMAC-SHA256 signature
+   header matching `CHIMONEY_WEBHOOK_SECRET`. The signature must be computed over the raw body bytes
+   — do not re-serialize the JSON.
 3. Confirm 2xx response and `received: true`.
 4. Validate matching path:
    - first by `idempotencyKey`
@@ -4546,12 +4593,35 @@ In `product.controller.js` we use a single helper:
 - Token rotation:
   - `/api/auth/refresh-token` validates the cookie against Redis and atomically rotates to a new
     `jti` to prevent reuse of stolen tokens.
+  - A dedicated rate limiter on the refresh-token route is enforced at the router level
+    (`auth.route.js`) to limit brute-force refresh attempts.
 
 - Sliding window:
   - Each successful refresh or keep-alive `EXPIRE`s the `session_start:<userId>` key for another 30
     days.
   - If a user is inactive for 30 days (no refresh / keep-alive), `session_start` expires — server
     rejects further refreshes and requires re-login.
+
+- Session invalidation:
+  - **Password reset**, **`unlinkSocial`**, and **profile password change** all invalidate every
+    existing refresh token for the user (all `refresh_token:<userId>:*` keys deleted) and clear the
+    session heartbeat key before issuing new credentials. This ensures a compromised token cannot
+    survive a password change.
+  - `keepAlive` verifies the `session_start:<userId>` Redis key exists before minting a new access
+    token; if the key has expired (inactive session), the request is rejected and the client must
+    re-authenticate.
+
+- Email enumeration prevention:
+  - `POST /api/auth/login` returns a generic `401 Unauthorized` for both unknown email addresses and
+    incorrect passwords — the response body does not distinguish between the two cases.
+  - `POST /api/auth/forgot-password` adds a 250 ms artificial delay for requests where the email
+    address does not match any account, equalizing response timing with the code-path that does find
+    a user.
+
+- Email-verification token security:
+  - The raw token sent to the user's email is **SHA-256 hashed** before being stored in the
+    database. Comparison at verification time also uses the hash, so a database dump cannot be used
+    to verify arbitrary addresses without the original token.
 
 - Mobile friendliness:
   - Frontend implements mobile-aware keep-alive intervals and additional activity listeners
@@ -4577,14 +4647,48 @@ refreshes the 30-day window.
 
 ## GDPR & user data export
 
-- Users can request their data export via the `exportUserData` endpoint. Export includes orders,
-  profile, and related user metadata in JSON format.
-- Account deletion/anonymize flow:
-  - When requested, PII is removed/anonymized and orders are either retained as anonymized records
-    or deleted per config/policy.
+**Consent logging**
 
-- The system provides audit logging and an admin review path for data exports to comply with privacy
-  regulations.
+- `POST /api/users/me/consent` — records a consent event (e.g., marketing opt-in, terms acceptance)
+  to the `ConsentLog` collection for the authenticated user. The `logConsent` handler appends an
+  entry with the consent type, version, and timestamp; existing entries are never modified,
+  preserving a full immutable audit trail.
+
+**Account deletion (soft-delete lifecycle)**
+
+- `DELETE /api/user/me` — requires re-authentication: local-provider accounts must supply
+  `confirmationPassword` in the request body; OAuth accounts skip the password check.
+- On success the controller (inside a single MongoDB transaction):
+  1. Anonymizes all PII inline on the User document (`name`, `email`, `phone`, addresses, OAuth
+     tokens, cart, wishlist, `password`) and sets `deletedAt` + optional `deletionReason`.
+  2. Scrubs `shippingAddress`, `billingAddress`, and `phoneNumbers` on all related Orders.
+  3. Scrubs unencrypted and encrypted PII fields on the linked Seller record (if any) and sets
+     `seller.deletedAt`.
+  4. Archives all associated SellerDocuments (`lifecycleStatus: 'archived'`).
+  5. Deletes ConsentLog records and the Subscriber record for that email.
+  6. Creates an append-only `UserDeletionAudit` entry (`actor: 'self'`, `action: 'soft_delete'`)
+     with a `retentionExpiresAt` timestamp.
+- After the transaction commits, Cloudinary KYC assets are destroyed best-effort (failures are
+  logged; the transaction is not rolled back).
+- Purge job (`scripts/purge-expired-soft-deleted-users.js`) — run via cron or manually —
+  hard-deletes documents whose `deletedAt` exceeds the retention window
+  (`USER_DELETION_RETENTION_DAYS`, default 30). The Mongoose `pre('deleteOne', { document: true })`
+  hook writes a `hard_delete` audit record before each removal.
+
+**Data export (Articles 15 & 20)**
+
+- `GET /api/user/export` — streams a JSON attachment (`Content-Disposition: attachment`) containing:
+  - `profile` — all user fields with encrypted PII decrypted via Mongoose getters; password and
+    token fields excluded.
+  - `cartItems`, `wishlist` — current embedded arrays.
+  - `orders` — full order documents including line-items, addresses, and payment references.
+  - `seller` — full seller application fields (decrypted); raw IBAN excluded, only
+    `payout.bank.last4` included.
+  - `sellerDocuments` — document metadata plus 24-hour signed Cloudinary URLs for each KYC file.
+  - `sellerBilling`, `ledgerEntries`, `sellerLifecycleAudit`, `documentAccessAudit`.
+  - `consentLogs` — full consent history.
+  - `subscriber` — newsletter subscription record.
+  - `deletionAudit` — `UserDeletionAudit` entries for this user.
 
 ---
 
@@ -4592,14 +4696,68 @@ refreshes the 30-day window.
 
 - Cookies: `HttpOnly`, `Secure`, `SameSite=None` (when cross-site), and domain configured to allow
   cross-subdomain cookies for frontend + API.
-- CSRF protection enabled for state-changing endpoints (`/api/csrf-token` endpoint available).
-- Rate limiting on auth endpoints and refresh endpoint.
+- **CSRF:** `csrf-csrf` (double-submit cookie pattern) replaces the removed `csurf` dependency. The
+  `X-Mobile-Client` CSRF bypass has been removed; all clients must go through the standard
+  double-submit flow. The `/api/csrf-token` endpoint issues the CSRF cookie.
+- **Rate limiting** (tiered):
+  - Global **GET / HEAD**: 1 000 requests per 15 min — applied to all roles, including admin.
+  - Global **mutating** (POST / PUT / PATCH / DELETE): 100 requests per 15 min.
+  - Per-route overrides: COD checkout — 10 req / 15 min; GDPR export — 5 req / 60 min.
+- Password hashing uses bcrypt with a cost factor of **12** (up from 10). Existing hashes are
+  transparently rehashed at login time.
 - Sanitization and NoSQL injection protection for request bodies and query params.
-- Logging: Winston with daily rotation, sensitive data redaction, and optional Sentry forwarding for
-  uncaught exceptions and errors.
-- Metrics: Prometheus-compatible scrape output at `GET /api/monitoring/metrics`, including
-  settlement scheduler run status counters and retryable payout counters; mirrored Datadog-friendly
-  metric logs are emitted as `datadog.metric` events.
+- **Logging:** Winston with daily rotation; `redactSensitive()` is applied at the top-level logger
+  format and covers **all transports** (Console and DailyRotateFile). The sensitive-key list covers
+  25 fields (up from 7) including common PII, token, and credential field names. The admin audit
+  middleware logs only a whitelist of safe body keys — raw request bodies are never written to audit
+  logs.
+- **Metrics:** Prometheus-compatible scrape at `GET /api/monitoring/metrics` requires a
+  `Bearer <MONITORING_METRICS_TOKEN>` header in production. The endpoint returns `404 Not Found` if
+  `MONITORING_METRICS_TOKEN` is not configured, preventing accidental metric exposure.
+  Datadog-friendly `datadog.metric` log events are still emitted alongside the scrape endpoint.
+
+### Field-level PII encryption
+
+Sensitive personal data is encrypted at rest using AES-256-GCM via
+`backend/src/utils/fieldEncryption.js`. The server **throws at startup** if `FIELD_ENCRYPTION_KEY`
+is absent in production.
+
+Encrypted fields:
+
+```
+Seller model
+  application.firstName, .middleName, .lastName
+  application.govIdNumber, .birthDate, .taxId
+  application.identityProof
+  payout.bank.iban
+
+User model
+  phone
+  shippingAddress (embedded object)
+  billingAddress  (embedded object)
+```
+
+Multi-key rotation is supported via `FIELD_ENCRYPTION_KEYS` (comma-separated list of historical
+keys). New writes always use `FIELD_ENCRYPTION_KEY`; decryption attempts each key in the rotation
+list until one succeeds. After a rotation window, remove the old key from `FIELD_ENCRYPTION_KEYS`.
+
+### Role & Permission Matrix
+
+```
+Role      | Canonical source            | Route-level check                   | Notes
+----------|-----------------------------|------------------------------------|------------------------------------------------------
+admin     | User.role                   | restrictTo('admin')                 | Full platform access
+staff     | User.role                   | restrictTo('admin', 'staff')        | TODO: scope down — currently has admin-level access
+                                                                              | on all routes where both roles are listed
+seller    | Seller.status + kyc.status  | requireVerifiedSeller middleware     | User.role = 'seller' is a convenience label only;
+          |                             |                                      | it is NOT used as the sole authorization gate on any
+          |                             |                                      | endpoint. Canonical check: seller.status === 'active'
+          |                             |                                      | && seller.kyc.status === 'verified'
+customer  | User.role (default)         | protectRoute only                   | Standard authenticated user
+```
+
+**System sellers** (platform admin store, shipping liability) use special `ownerUserId` references
+and must never be modified through the standard seller application flow.
 
 ---
 
@@ -4903,6 +5061,20 @@ SENTRY_DSN
 SENTRY_RELEASE
 ```
 
+**Security / encryption**
+
+```
+FIELD_ENCRYPTION_KEY               # required in production — AES-256-GCM primary key for
+                                   # field-level PII encryption (Seller + User models).
+                                   # Server throws at startup if absent in NODE_ENV=production.
+                                   # Dev default: any non-empty string (e.g. "dev_field_enc_key")
+                                   # Production: generate with `openssl rand -hex 32`
+FIELD_ENCRYPTION_KEYS              # optional comma-separated rotation list of historical keys
+                                   # used for decryption only. New writes always use
+                                   # FIELD_ENCRYPTION_KEY. Remove old keys after rotation window.
+                                   # Example: FIELD_ENCRYPTION_KEYS=new_key,old_key
+```
+
 **Seller / KYC**
 
 ```
@@ -4911,6 +5083,8 @@ SELLER_DOC_VIEW_TOKEN_SECRET       # signing key for short-lived KYC document vi
                                    # (falls back to ACCESS_TOKEN_SECRET if unset)
 KYC_DOCUMENT_RETENTION_DAYS        # days before archived seller documents are hard-deleted
                                    # by the purge script (default: 2555 = 7 years)
+USER_DELETION_RETENTION_DAYS       # days before soft-deleted users are hard-deleted
+                                   # by the purge script (default: 30)
 ```
 
 **Payment provider + COD refund/payout policy**
@@ -5198,6 +5372,9 @@ GOOGLE_LINK_CALLBACK_URL
 ```
 PORT
 NODE_ENV
+TRUST_PROXY              # Express trust proxy hop count. Set to 1 when behind a single reverse
+                         # proxy (Railway, Vercel, nginx). Controls X-Forwarded-For trust depth.
+                         # Dev default: false (or 0)  Production recommended: 1
 RATE_WINDOW_MS           # shared limiter window in ms (default 3600000)
 SELLER_REQ_LIMIT         # legacy seller write cap alias (fallback)
 SELLER_READ_LIMIT        # seller GET/HEAD budget (default 1000/hr)
@@ -5205,6 +5382,12 @@ SELLER_WRITE_LIMIT       # seller POST/PATCH/DELETE budget (default 1000/hr)
 ADMIN_REQ_LIMIT          # legacy admin write cap alias (fallback)
 ADMIN_READ_LIMIT         # admin GET/HEAD budget (default 10000/hr)
 ADMIN_WRITE_LIMIT        # admin POST/PATCH/DELETE budget (default 10000/hr)
+MONITORING_METRICS_TOKEN # Bearer token required to access GET /api/monitoring/metrics in
+                         # production. If unset, the endpoint returns 404. Generate with
+                         # `openssl rand -hex 32`. Not required in development.
+MOBILE_DASHBOARD_BRIDGE_SECRET # Required signing key for the mobile seller dashboard bridge
+                               # JWT. No fallback to ACCESS_TOKEN_SECRET — server throws at
+                               # startup if absent in production.
 VITE_TAX_RATE
 VITE_SHIPPING_COST
 VITE_FEATURE_CATEGORY_TREE_V2
@@ -5268,6 +5451,17 @@ CSRF_SECRET=changeme_csrf
 COOKIE_SECRET=changeme_cookie_secret
 JWT_SECRET=changeme_jwt_secret
 DEBUG_REFRESH=false
+
+# Mobile seller dashboard bridge (required in production)
+MOBILE_DASHBOARD_BRIDGE_SECRET=changeme_bridge_secret
+
+# Field-level PII encryption (required in production)
+FIELD_ENCRYPTION_KEY=dev_field_enc_key_32bytes_________
+FIELD_ENCRYPTION_KEYS=dev_field_enc_key_32bytes_________
+
+# Monitoring metrics endpoint protection
+# Leave empty in dev; set to a random token in production
+MONITORING_METRICS_TOKEN=
 
 # API rate limits
 RATE_WINDOW_MS=3600000
