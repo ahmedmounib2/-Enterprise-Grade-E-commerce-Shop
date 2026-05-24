@@ -37,3 +37,24 @@ the variable is absent. The URL-path secret variant has been removed.
 5. Replay a known recent webhook payload (with the raw body and correct HMAC-SHA256 signature
    computed from the new secret) to confirm the new secret is accepted.
 6. Revoke the old secret in the Chimoney console after confirming the new one works.
+
+## OAuth Bridge Secret Rotation
+
+`OAUTH_BRIDGE_SECRET` signs the one-shot HMAC bridge codes used by the OAuth signup flow
+(`/auth/oauth-signup`). Codes are short-lived (`OAUTH_BRIDGE_TTL_SECONDS`, default `300`) and
+single-use; they replace the previous pattern of passing `providerId`/`email`/`name` in URL query
+parameters.
+
+1. Generate a new secret:
+
+   ```bash
+   openssl rand -hex 32
+   ```
+
+2. Update `OAUTH_BRIDGE_SECRET` in Railway (or your secret manager).
+3. Deploy. New OAuth signup flows will immediately use the new signing key.
+4. There is no grace-period dual-secret support for bridge codes — codes signed with the old secret
+   expire within `OAUTH_BRIDGE_TTL_SECONDS` seconds. Any in-flight OAuth signup initiated just
+   before the deploy will fail and the user will need to restart the OAuth flow.
+5. Remove the old secret value from all config stores after confirming the new deployment is
+   healthy.

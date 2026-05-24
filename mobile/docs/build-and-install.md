@@ -71,6 +71,10 @@ APK_ABS="$(realpath mobile/android/app/build/outputs/apk/internal/release/app-in
 adb devices -l
 adb push "$APK_ABS" /data/local/tmp/eshop-internal.apk
 adb shell pm install -r /data/local/tmp/eshop-internal.apk
+
+
+#if its stuck run this to verify its moving in another terminal
+adb logcat | rg INSTALL
 ```
 
 **Verify APK contains your cert (it may or may not be used when pinning is off):**

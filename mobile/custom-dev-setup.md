@@ -176,11 +176,11 @@ import App from "./App";
 registerRootComponent(App);
 ```
 
-2. **No axios deep imports** (use public API only).
-3. **Android wrappers**: `MainApplication.kt` uses `ReactNativeHostWrapper`; `MainActivity.kt`
+1. **No axios deep imports** (use public API only).
+2. **Android wrappers**: `MainApplication.kt` uses `ReactNativeHostWrapper`; `MainActivity.kt`
    returns a `ReactActivityDelegateWrapper`.
-4. **Manifest** `<application android:name=".MainApplication" .../>`.
-5. **Gradle uses Expo plugin**: root `mobile/android/build.gradle` has the Expo classpath;
+3. **Manifest** `<application android:name=".MainApplication" .../>`.
+4. **Gradle uses Expo plugin**: root `mobile/android/build.gradle` has the Expo classpath;
    `app/build.gradle` applies `expo`.
 
 ---

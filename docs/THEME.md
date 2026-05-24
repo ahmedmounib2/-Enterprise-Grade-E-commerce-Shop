@@ -15,9 +15,9 @@ file per platform and, if needed, copy-pasting the tokens between them.
    defaults. These values power the native (non-DaisyUI) UI components.
 2. `frontend/theme/styleThemes.js` merges the native tokens with the shared DaisyUI catalogue and
    exposes helpers used across the React app.
-3. `frontend/src/contexts/ThemeContext.jsx` reads those helpers, writes CSS variables to the `<html>`
-   element, and keeps `data-theme`, `data-style-theme`, and `color-scheme` in sync with the selected
-   palette.
+3. `frontend/src/contexts/ThemeContext.jsx` reads those helpers, writes CSS variables to the
+   `<html>` element, and keeps `data-theme`, `data-style-theme`, and `color-scheme` in sync with the
+   selected palette.
 4. `frontend/src/components/ThemeDropdown.jsx` consumes the context to offer the theme picker used
    throughout the site.
 5. `mobile/src/theme/themeTokens.js` mirrors the native palette, while

@@ -4,6 +4,22 @@ This checklist walks through everything needed to cut a signed Android release f
 mobile app and upload it to the Google Play Console. Follow the steps in order — the release Gradle
 tasks will now fail fast if any signing secrets are missing.
 
+> ⚡ **Quick recovery when testers hit “Network request failed”**
+>
+> If the Play Console build currently installed on devices cannot log in (or stock/restock/payment
+> screens error with “Network request failed”), the pinned TLS certificate is stale. Fix the live
+> release bundle by running these commands from the repo root:
+>
+> ```bash
+> npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api
+> npm -w mobile run env:production           # copies .env.production and re-syncs cert assets
+>  cd mobile/android && ./gradlew clean bundleProdRelease
+> ```
+>
+> Ship the new `app-prod-release.aab` to testers. If you need to run `expo prebuild --clean` for any
+> reason, run `npm -w mobile run env:production` **again** after prebuild (it re-copies the
+> certificate into `android/app/src/main/assets/` before Gradle packages the bundle).
+
 ---
 
 ## 1. Prerequisites
@@ -183,27 +199,221 @@ Steps:
 starting a release build. The `Variant: release` block must show your upload keystore path and
 alias, not `androiddebugkey`.
 
+### Recover flavors and signing after `expo prebuild`
+
+Running `npm run --workspace mobile expo-prebuild -- --clean` regenerates the native Android folder
+from Expo config. This is helpful when new native modules are added, but it **overwrites**
+`mobile/android/app/build.gradle`. After a prebuild you must re-apply both the flavor setup **and**
+the release signing block or Gradle will silently fall back to defaults. Missing flavors make
+`assembleProdRelease`/`bundleProdRelease` disappear and cause the internal APK to reuse the Play
+package name. Missing signing secrets push Gradle back to the debug keystore, and Google Play will
+reject the bundle with an error similar to:
+
+> 💾 Commit the regenerated `mobile/android/` folder after you re-apply the blocks below. Avoid
+> re-running `expo prebuild` unless native dependencies change; otherwise restore the diff from Git
+> to keep the flavors intact.
+
+```
+Your Android App Bundle is signed with the wrong key...
+Expected SHA1: 48:95:F7:29:...
+Actual SHA1:   5E:8F:16:06:...
+```
+
+1. Open `mobile/android/app/build.gradle` and restore the **flavor and signing configuration**.
+   Paste the helper snippets below so Gradle can read from environment variables **or**
+   `~/.gradle/gradle.properties` without hardcoding secrets.
+
+   ```gradle
+   android {
+     flavorDimensions "env"
+
+     productFlavors {
+       internal {
+         dimension "env"
+         applicationIdSuffix ".internal"
+         versionNameSuffix "-internal"
+         resValue "string", "app_name", "eShop (Internal)"
+       }
+
+       prod {
+         dimension "env"
+       }
+     }
+   }
+   ```
+
+   ```gradle
+   android {
+     signingConfigs {
+       release {
+         def envOrProp = { key -> System.getenv(key) ?: findProperty(key) }
+
+         def keystorePath     = envOrProp('ESHOP_ANDROID_KEYSTORE')
+         def keystorePassword = envOrProp('ESHOP_ANDROID_KEYSTORE_PASSWORD')
+         def keyAliasValue    = envOrProp('ESHOP_ANDROID_KEY_ALIAS')
+         def keyPasswordValue = envOrProp('ESHOP_ANDROID_KEY_PASSWORD')
+
+         if (!keystorePath || !keystorePassword || !keyAliasValue || !keyPasswordValue) {
+           throw new IllegalStateException('Missing release keystore configuration. Export the '
+             + 'ESHOP_ANDROID_* secrets (or add them to ~/.gradle/gradle.properties).')
+         }
+
+         storeFile file(keystorePath)
+         storePassword keystorePassword
+         keyAlias keyAliasValue
+         keyPassword keyPasswordValue
+       }
+     }
+
+     buildTypes {
+       release {
+         signingConfig signingConfigs.release
+         // keep any existing shrink/minify settings here
+       }
+     }
+   }
+   ```
+
+   ```gradle
+   android {
+     signingConfigs {
+       release {
+         def envOrProp = { key -> System.getenv(key) ?: findProperty(key) }
+
+         def keystorePath     = envOrProp('ESHOP_ANDROID_KEYSTORE')
+         def keystorePassword = envOrProp('ESHOP_ANDROID_KEYSTORE_PASSWORD')
+         def keyAliasValue    = envOrProp('ESHOP_ANDROID_KEY_ALIAS')
+         def keyPasswordValue = envOrProp('ESHOP_ANDROID_KEY_PASSWORD')
+
+         if (!keystorePath || !keystorePassword || !keyAliasValue || !keyPasswordValue) {
+           throw new IllegalStateException('Missing release keystore configuration. Export the '
+             + 'ESHOP_ANDROID_* secrets (or add them to ~/.gradle/gradle.properties).')
+         }
+
+         storeFile file(keystorePath)
+         storePassword keystorePassword
+         keyAlias keyAliasValue
+         keyPassword keyPasswordValue
+       }
+     }
+
+     buildTypes {
+       release {
+         signingConfig signingConfigs.release
+         // keep any existing shrink/minify settings here
+       }
+     }
+   }
+   ```
+
+2. Save the file and run
+   `./gradlew --console=plain signingReport | sed -n '/Variant: release/,/^$/p'` from
+   `mobile/android`. Confirm the printed SHA1 matches the upload certificate stored in the Play
+   Console (for example `48:95:F7:29:0E:74:C8:E6:F9:78:4F:F9:EE:80:C9:FD:9C:35:EB:13`).
+3. If the report shows `androiddebugkey` or the SHA1
+   `5E:8F:16:06:2E:A3:CD:2C:4A:0D:54:78:76:BA:A6:F3:8C:AB:F6:25`, verify that:
+   - `ESHOP_ANDROID_KEYSTORE` points to the upload keystore path (not `debug.keystore`).
+   - The secrets exist either in the current shell environment or in `~/.gradle/gradle.properties`.
+   - You are running the command from `mobile/android` so Gradle picks up the project files.
+4. Only proceed to `bundleProdRelease` when the signing report is correct. As a final safety check,
+   run
+   `keytool -printcert -jarfile app/build/outputs/bundle/prodRelease/app-prod-release.aab | grep SHA1`
+   after each build to validate the generated bundle before uploading to Play.
+
 ### Regenerate and validate the release bundle after fixing secrets
 
 If Google Play previously rejected an `.aab` because it was signed with the debug keystore, delete
-`mobile/android/app/build/outputs/bundle/release/app-release.aab` and rebuild from scratch:
+`mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab` and rebuild from scratch:
 
 ```bash
 cd mobile/android
 ./gradlew clean
-./gradlew bundleRelease
+./gradlew bundleProdRelease
 ```
 
 Before uploading, double-check the signature inside the bundle matches your upload key alias:
 
 ```bash
-jarsigner -verify -verbose -certs app/build/outputs/bundle/release/app-release.aab \
+jarsigner -verify -verbose -certs app/build/outputs/bundle/prodRelease/app-prod-release.aab \
   | grep -A1 "sm      0"  # should list eshopUploadKey
 ```
 
 ## Only upload the freshly generated bundle after these checks pass
 
-## 4. Bump the version before every store submission
+## 4. Enable R8 minification and crash deobfuscation
+
+R8 shrinking trims unused code/resources, shortens symbol names, and makes reverse-engineering
+harder. We enable it to ship a smaller, harder-to-tamper bundle. Because minification rewrites class
+names, we must keep the generated mapping file so Play Console and crash reporters can deobfuscate
+stack traces.
+
+### Enable the Gradle toggles
+
+R8 is already wired up in `build.gradle`. Turn it on via the release-only flags in
+`mobile/android/gradle.properties`:
+
+```diff
+--- a/mobile/android/gradle.properties
++++ b/mobile/android/gradle.properties
+@@
+ android.enablePngCrunchInReleaseBuilds=true
++android.enableMinifyInReleaseBuilds=true
++android.enableShrinkResourcesInReleaseBuilds=true
+```
+
+> ℹ️ These properties affect **release** variants only. Debug builds remain unminified for an easy
+> developer experience.
+
+### Harden the ProGuard configuration
+
+Update `mobile/android/app/proguard-rules.pro` so libraries that rely on reflection keep their entry
+points while everything else can be stripped:
+
+```diff
+--- a/mobile/android/app/proguard-rules.pro
++++ b/mobile/android/app/proguard-rules.pro
+@@
+-# react-native-reanimated
+--keep class com.swmansion.reanimated.** { *; }
+--keep class com.facebook.react.turbomodule.** { *; }
+-
+-# Add any project specific keep options here:
++# react-native core & dependencies
++-keep class com.facebook.react.** { *; }
++-keep class com.facebook.hermes.** { *; }
++-keep class com.facebook.react.turbomodule.** { *; }
++-keep class com.facebook.react.bridge.** { *; }
++-keepclassmembers class * extends com.facebook.react.bridge.JavaScriptModule { *; }
++-keepclassmembers class * extends com.facebook.react.bridge.NativeModule { *; }
++-keepclassmembers class * extends com.facebook.react.uimanager.ViewManager { *; }
++-dontwarn com.facebook.react.**
++-dontwarn com.facebook.hermes.**
++
++# react-native-reanimated
++-keep class com.swmansion.reanimated.** { *; }
++-dontwarn com.swmansion.reanimated.**
++
++# Expo modules that rely on reflection
++-keep class expo.modules.** { *; }
++-keep class com.swmansion.gesturehandler.** { *; }
++-dontwarn expo.modules.**
++-dontwarn com.swmansion.gesturehandler.**
++
++# Keep the generated BuildConfig fields so R8 doesn't strip them.
++-keepclassmembers class **.BuildConfig { *; }
++
++# Add any project specific keep options here:
+```
+
+### Archive the mapping file on every build
+
+Every `bundleProdRelease` or `assembleProdRelease` run emits
+`mobile/android/app/build/outputs/mapping/prodRelease/mapping.txt`. Upload this file alongside the
+AAB inside the Play Console (`Release > App bundle explorer > Deobfuscation files`) and store an
+off-repo copy (e.g. shared vault/cloud storage). Without the mapping file, crash stacks inside Play
+Console, Sentry, or Firebase Crashlytics will stay obfuscated.
+
+## 5. Bump the version before every store submission
 
 1. Edit `mobile/app.config.js` and update both `version` (semantic string) and `android.versionCode`
    (positive integer, monotonically increasing).
@@ -226,54 +436,89 @@ Commit the version bump alongside any release notes changes.
 
 ---
 
-## 5. Build artifacts
+## 6. Build artifacts
 
 Always run production builds against the production backend so QA mimics what Play users will see.
 
-### A. Production AAB (upload to Play)
+### A. How to build & install each variant
+
+> ℹ️ All Gradle commands below run from `mobile/android/`. Use `adb -s <serial> install ...` if more
+> than one device/emulator is attached.
+
+#### Internal release (side-by-side with Play version)
+
+```bash
+cd mobile/android
+./gradlew assembleInternalRelease
+adb install -r app/build/outputs/apk/internal/release/app-internal-release.apk
+```
+
+This produces the `com.ahmedmonib.eshop.internal` package. It installs next to the Play build, so no
+uninstall is required when hopping between store and sideloaded versions.
+
+#### Production release (same package as Play)
+
+```bash
+cd mobile/android
+./gradlew assembleProdRelease     # optional APK for local smoke tests
+./gradlew bundleProdRelease       # required AAB for Play Console upload
+```
+
+- APK output: `app/build/outputs/apk/prod/release/app-prod-release.apk`
+- AAB output: `app/build/outputs/bundle/prodRelease/app-prod-release.aab`
+- Mapping file: `app/build/outputs/mapping/prodRelease/mapping.txt`
+
+Run `npm -w mobile run android:show-artifacts` if you need an absolute-path reminder. The helper
+prints the variant-specific filenames and warns when an artifact is missing so you know to rebuild
+the corresponding flavor.
+
+Why it matters: the internal APK sideloads quickly for regression testing, while the prod AAB is the
+only file accepted by Google Play.
+
+> 🔐 The `copyPinnedCerts` Gradle task runs before every variant build, so both internal and prod
+> outputs bundle the refreshed SSL pin automatically after `npm -w mobile run env:production`.
+
+### B. Prepare environments before building
 
 ```bash
 # from repo root
 npm install
+npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api
+npm -w mobile run env:production
 npm run --workspace mobile expo-prebuild -- --clean   # optional: refresh native folders after config changes
-npm -w mobile run env:production    # or: cp mobile/.env.production mobile/.env
-
+npm -w mobile run env:production    # run again if prebuild just regenerated android/
 cd mobile/android
-./gradlew clean bundleRelease
+./gradlew clean
 ```
 
-Outputs:
+> ℹ️ `EXPO_PUBLIC_API_BASE_URL` in `.env.production` should be the bare origin
+> (`https://api.ahmedmonib-eshop-demo.com`). The shared `packages/api-client` module automatically
+> appends the `/api` suffix, so do **not** include it in the environment variable.
 
-- `mobile/android/app/build/outputs/bundle/release/app-release.aab` → upload this file to the Play
-  Console.
-- `mobile/android/app/build/outputs/mapping/release/mapping.txt` → archive alongside the AAB for
-  crash symbolication.
-
-### B. Optional APK (sideload for quick QA)
-
-This artifact is not accepted for publishing but is ideal for smoke-testing on real hardware.
-
-```bash
-./gradlew assembleRelease
-adb install -r app/build/outputs/apk/release/app-release.apk
-```
-
-Why it matters: sideloading lets you validate network traffic, deep links, and first-run flows
-faster than waiting for Play’s review/install pipeline.
+Run the internal/prod Gradle commands from section A immediately after this prep so the clean slate
+uses the refreshed environment and certificates.
 
 > ✅ Remember: when building the AAB/APK, ensure `mobile/.env` points to production. Do **not**
 > reuse a dev/tunnel `.env`.
+
+If Gradle reports "Missing SSL pinning certificates" or the resulting bundle fails API calls with a
+`Network request failed` error, it usually means the pinned certificate under `mobile/certs/`
+doesn't match the live Railway host anymore (for example, Let’s Encrypt rotated it). Re-run
+`npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api` to capture
+the current certificate, switch the env back to production, and rebuild. The helper copies the
+refreshed `.cer` into `android/app/src/main/assets/`, so login, checkout (stock/restock mutations),
+and payment flows all resume once the updated bundle is installed.
 
 ```bash
      npx uri-scheme open "eshop://reset-password?token=TEST123&email=user%40example.com" --android
 ```
 
-     Verify the reset screen opens and the token/email parameters propagate through the UI.
+Verify the reset screen opens and the token/email parameters propagate through the UI.
 
-## 6. Smoke-test the release build locally
+## 7. Smoke-test the release build locally
 
-Perform these checks **before** uploading anything to Play. Use the sideloaded `app-release.apk`,
-not the Expo dev client.
+Perform these checks **before** uploading anything to Play. Use the sideloaded
+`app-prod-release.apk`, not the Expo dev client.
 
 ### Prepare a test target
 
@@ -287,7 +532,8 @@ not the Expo dev client.
 
      ```bash
      cd mobile/android
-     adb install -r app/build/outputs/apk/release/app-release.apk
+     adb install -r app/build/outputs/apk/prod/release/app-prod-release.apk
+
      ```
 
      For multiple devices/emulators, scope the target with `adb -s <serial> install -r ...`.
@@ -298,12 +544,12 @@ not the Expo dev client.
   2. From WSL, confirm it appears with `adb devices -l` (typically `emulator-5554`).
   3. Install the APK to that emulator serial:
 
-     ```bash
+     ````bash
      cd mobile/android
-     adb -s emulator-5554 install -r app/build/outputs/apk/release/app-release.apk
-     ```
+     adb -s emulator-5554 install -r app/build/outputs/apk/prod/release/app-prod-release.apk     ```
 
      Adjust the serial if Android Studio reports a different ID.
+     ````
 
 > 🔁 These steps reuse the same adb workflow documented for the custom dev client. The only
 > difference is that you install the Gradle-generated release APK instead of `installDebug` output.
@@ -340,7 +586,7 @@ not the Expo dev client.
    - App content (privacy policy URL, Data safety form, Ads?, Content rating questionnaire).
    - Play App Signing (accept the recommended option).
 3. Navigate to **Testing → Internal testing → Create release**.
-4. Upload `app-release.aab`, add release notes, resolve warnings, and roll out to the internal
+4. Upload `app-prod-release.aab`, add release notes, resolve warnings, and roll out to the internal
    testers list.
 5. Install the build from the Play Store on a tester device and repeat the smoke tests above.
 6. ***
@@ -384,16 +630,16 @@ that still uses the debug keystore. Walk through the checks below before rebuild
    ```bash
    cd mobile/android
    ./gradlew clean
-   ./gradlew bundleRelease
+   ./gradlew bundleProdRelease
    ```
 
    After the build finishes, re-run the signing report and verify that the release variant now shows
-   the release keystore. Only upload the new `app-release.aab` to the Play Console once the check
-   passes.
+   the release keystore. Only upload the new `app-prod-release.aab` to the Play Console once the
+   check passes.
 
 Following these steps ensures Play receives a bundle signed with the long-lived upload keystore.
 
-7. When satisfied, promote the existing artifact to Closed or Production tracks—no rebuild required.
+1. When satisfied, promote the existing artifact to Closed or Production tracks—no rebuild required.
 
 ---
 
@@ -414,7 +660,7 @@ npx expo start --tunnel --dev-client
 ```bash
 npm -w mobile run env:production
 cd mobile/android
-./gradlew clean bundleRelease
+./gradlew clean bundleProdReleas
 ```
 
 Never mix tunnel/dev clients with release builds. Before building, ensure `mobile/.env` contains the
@@ -430,8 +676,8 @@ production values (copy from `.env.production`).
 - [ ] `android/app/build.gradle` release build uses `signingConfigs.release` (not debug).
 - [ ] `versionCode` incremented and `versionName` updated in both `mobile/app.config.js` and
       `mobile/android/app/build.gradle`.
-- [ ] `app-release.aab` built, archived with `mapping.txt`, and smoke-tested via the sideloaded
-      `app-release.apk`.
+- [ ] `app-prod-release.aab` built, archived with `mapping.txt`, and smoke-tested via the sideloaded
+      `app-prod-release.apk`.
 - [ ] Internal testing release created first, then promoted to Production when ready.
 
 Tag the release commit (e.g. `git tag mobile-v1.1.0 && git push --tags`), store artifacts securely,
@@ -455,10 +701,11 @@ monitor Play Console vitals, and update documentation or changelogs as needed.
 3. Run `npm install` and refresh native code if configuration changed
    (`npm run --workspace mobile expo-prebuild --clean`).
 4. Switch the environment to production (`npm -w mobile run env:production`).
-5. Build the release AAB and optional APK (`./gradlew clean bundleRelease` and
-   `./gradlew assembleRelease`).
+5. Build the release AAB and optional APK (`./gradlew clean bundleProdRelease` and
+   `./gradlew assembleProdRelease`).
 6. Smoke-test using the sideloaded APK and deep-link command above.
-7. Upload the fresh `app-release.aab` to Internal testing, verify, then promote to wider tracks.
+7. Upload the fresh `app-prod-release.aab` to Internal testing, verify, then promote to wider
+   tracks.
 8. Tag the release, archive artifacts, and monitor telemetry.
 
 Following this loop ensures each Play Store update uses the same hardened process and reduces missed

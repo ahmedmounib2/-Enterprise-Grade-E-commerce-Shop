@@ -213,6 +213,7 @@
         - [`reverseStripePayout` idempotency and retry behavior](#reversestripepayout-idempotency-and-retry-behavior)
         - [`SettlementPayout` schema/index hardening](#settlementpayout-schemaindex-hardening)
         - [New payout retry cron job](#new-payout-retry-cron-job)
+        - [Distributed Redis locks (non-scheduler cron jobs)](#distributed-redis-locks-non-scheduler-cron-jobs)
         - [Job-health monitoring](#job-health-monitoring)
       - [2) Environment variables reference](#2-environment-variables-reference)
       - [3) Recommended value profiles](#3-recommended-value-profiles)
@@ -244,6 +245,7 @@
     - [How to run tests](#how-to-run-tests)
     - [How to test the COD refund purge cron job](#how-to-test-the-cod-refund-purge-cron-job)
     - [Test status](#test-status)
+    - [CI/CD pipeline](#cicd-pipeline)
   - [How to run locally (no Docker)](#how-to-run-locally-no-docker)
     - [Local HTTPS for development (optional but recommended)](#local-https-for-development-optional-but-recommended)
   - [Environment variables used](#environment-variables-used)
@@ -1731,8 +1733,21 @@ Refer to [`mobile/env.md`](mobile/env.md) for the full run-mode matrix and env p
   `{ ResetPassword: 'reset-password' }`.
 - `extractResetParams` normalizes `token`/`code` query params and surfaces them as React Navigation
   route params.
+- **Reset-password token delivery:** the reset token is delivered in the URL **fragment**
+  (`#token=…`) rather than the query string. `AppNavigator` parses the fragment first with a
+  query-string fallback for backward compatibility with older email clients.
 - `ResetPassword` screen lives in both auth and authed stacks so the user always lands on the
   correct screen whether the app is cold-started or already in memory.
+- **OAuth signup bridge-code flow:** after OAuth authentication the backend issues a short-lived,
+  one-shot HMAC-signed bridge code and redirects to the mobile deep link as
+  `eshop://oauth?code=<bridge_code>`. `AuthProvider` exchanges the code via a server-side API
+  call instead of reading `accessToken`/`refreshToken` directly from query parameters. This
+  prevents token leakage through server logs, referrer headers, and deep-link history.
+  - Bridge codes are signed with `OAUTH_BRIDGE_SECRET` and expire after
+    `OAUTH_BRIDGE_TTL_SECONDS` (default `300` seconds).
+  - The `/auth/oauth-signup` endpoint is rate-limited to 5 requests per minute.
+  - See [`docs/security/webhook-rotation.md`](docs/security/webhook-rotation.md) for
+    `OAUTH_BRIDGE_SECRET` rotation instructions.
 - Metro logs beginning with `🔗` confirm the linking handlers fired; re-run
   `npx uri-scheme open ...` to verify changes.
 
@@ -4220,12 +4235,29 @@ This section captures the payout resiliency behavior and how to operate it safel
 - **Failure path:** unsuccessful attempts increment `retryCount`; once threshold is reached, payout
   transitions to `manual_required` and emits an operator alert.
 
+##### Distributed Redis locks (non-scheduler cron jobs)
+
+Four non-scheduler cron jobs — settlement reconciliation, payout retry, COD payout reconciliation,
+and subscription renewal — now each acquire a Redis distributed lock before executing. This prevents
+duplicate runs across multiple app replicas. Lock keys and TTLs are documented in
+[`docs/settlements-runbook.md`](docs/settlements-runbook.md).
+
+Each job wraps its callback with `wrapCronCallback`, which catches and logs unhandled rejections
+from within the cron body so a single-job failure cannot crash the Node process.
+
+**Boot-kickoff behavior:** all four jobs default to `*_RUN_ON_BOOT=false`, meaning they only
+trigger on their configured cron schedule. This is the safe default for multi-replica deployments
+where process startup is staggered. See Environment Variables below for the full list of
+`RUN_ON_BOOT` vars.
+
 ##### Job-health monitoring
 
 - **Stale scheduler detection:** job-health raises alerts if `settlement_scheduler` has not
   completed inside `JOB_HEALTH_SCHEDULER_STALE_HOURS`.
 - **Payout retry failure-rate alerts:** payout retry runs are windowed and failure-rate alerts are
   triggered when configured minimum-run and threshold conditions are met.
+- **Alert fan-out:** alerts are sent via email to the configured admin recipient list and
+  optionally to a Slack channel via `OPS_SLACK_WEBHOOK`.
 - **Admin dashboard health indicator:** the Admin page surfaces a compact scheduler-health pill
   (`healthy` / `stale` / `unknown`) based on `/api/admin/jobs/health` for quick operator triage.
 - **Prometheus + Datadog hooks:** settlement scheduler and payout retry jobs emit counters that can
@@ -4245,6 +4277,12 @@ This section captures the payout resiliency behavior and how to operate it safel
 | `JOB_HEALTH_PAYOUT_FAILURE_WINDOW_RUNS`    | Number of latest runs evaluated for payout failure rate.                         | Positive integer.                                                                         | Smaller windows react quickly to spikes; larger windows smooth volatility and react slower.                                  |
 | `JOB_HEALTH_PAYOUT_FAILURE_MIN_RUNS`       | Minimum runs required before failure-rate alerts can trigger.                    | Positive integer.                                                                         | Prevents early noisy alerts on low sample sizes; too high can delay real incident detection.                                 |
 | `SETTLEMENT_RECONCILIATION_REPORT_EMAILS`  | Explicit recipient list for reconciliation/retry/reversal failure notifications. | Comma/semicolon separated email list.                                                     | Empty value suppresses direct email notifications; configured value provides immediate operator visibility.                  |
+| `SETTLEMENT_RECONCILIATION_MAX_REPORT_RECIPIENTS` | Cap on the number of email recipients for reconciliation reports. | Positive integer (default `5`). | Prevents accidental wide distribution of financial alert emails. |
+| `OPS_SLACK_WEBHOOK`                        | Optional Slack incoming webhook URL for job-health alert fan-out.                | Full Slack webhook URL.                                                                   | When set, job-health alerts are posted to the configured Slack channel in addition to email recipients.                      |
+| `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT`    | Run settlement reconciliation job once immediately on server start.              | Boolean-like (`true/false`). Default `false`.                                             | Set `true` only on single-instance deployments where an immediate first run is required.                                     |
+| `PAYOUT_RETRY_RUN_ON_BOOT`                 | Run payout retry job once immediately on server start.                           | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
+| `COD_PAYOUT_RECONCILIATION_RUN_ON_BOOT`    | Run COD payout reconciliation job once immediately on server start.              | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
+| `SUBSCRIPTION_RENEWAL_RUN_ON_BOOT`         | Run subscription renewal job once immediately on server start.                   | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
 
 #### 3) Recommended value profiles
 
@@ -4708,13 +4746,23 @@ refreshes the 30-day window.
 - Sanitization and NoSQL injection protection for request bodies and query params.
 - **Logging:** Winston with daily rotation; `redactSensitive()` is applied at the top-level logger
   format and covers **all transports** (Console and DailyRotateFile). The sensitive-key list covers
-  25 fields (up from 7) including common PII, token, and credential field names. The admin audit
-  middleware logs only a whitelist of safe body keys — raw request bodies are never written to audit
-  logs.
+  25 fields (up from 7) including common PII, token, and credential field names. Redaction
+  traverses full error objects including axios error shapes (removing `Authorization` headers and
+  cookie values from error metadata). The admin audit middleware logs only a whitelist of safe body
+  keys — raw request bodies are never written to audit logs. All raw `console.*` calls in
+  production paths have been replaced with the Winston logger; ESLint enforces `no-console` for
+  backend code (allowing `warn`/`error` only).
 - **Metrics:** Prometheus-compatible scrape at `GET /api/monitoring/metrics` requires a
   `Bearer <MONITORING_METRICS_TOKEN>` header in production. The endpoint returns `404 Not Found` if
   `MONITORING_METRICS_TOKEN` is not configured, preventing accidental metric exposure.
-  Datadog-friendly `datadog.metric` log events are still emitted alongside the scrape endpoint.
+  Datadog-friendly `datadog.metric` log events are still emitted alongside the scrape endpoint. For
+  the token rotation strategy and future multi-scraper support, see
+  [`docs/security/monitoring-metrics-access.md`](docs/security/monitoring-metrics-access.md).
+- **Mobile SSL pinning:** `react-native-ssl-pinning` is fail-closed in production — if the native
+  module is missing and `EXPO_PUBLIC_SSL_PINNING_CERTS` is set, the app throws rather than falling
+  back to an unpinned connection.
+- **Job-health alerting:** settlement and payout cron job health alerts fan out via email (to the
+  admin recipient list) and optionally to a Slack webhook (`OPS_SLACK_WEBHOOK`).
 
 ### Field-level PII encryption
 
@@ -4853,9 +4901,13 @@ You can test both the **pure purge function** and the **scheduled cron execution
 
 ### Test status
 
+- **Backend:** 129 suites, 1,099 tests — all passing.
+- **Frontend:** 18 suites, 60 tests — all passing.
 - **Coverage:** Backend test coverage: ~89% (unit + integration). Full test suite includes
-  authorization flows, stock reservation, Stripe webhooks, and end-to-end checkout scenarios —
-  automated in CI with deterministic mocks for external services.
+  authorization flows, stock reservation, Stripe webhooks, and end-to-end checkout scenarios.
+- **CI enforcement:** Tests run on every pull request and push to `main` with no
+  `continue-on-error`; a failing test suite blocks merge. See
+  [`docs/ci-cd-setup.md`](docs/ci-cd-setup.md) for the full pipeline description.
 
 ```bash
 # from repo root
@@ -4870,6 +4922,24 @@ npm run -w backend test -- --coverage --coverageReporters=text-summary
 # frontend only
 npm run -w frontend test -- --coverage --coverageReporters=text-summary
 ```
+
+### CI/CD pipeline
+
+The repository ships two GitHub Actions workflows:
+
+- **`ci.yml`** — lint, backend tests (with Redis service container), frontend tests, and Vite
+  production build. Runs on every push to `main` and every PR targeting `main`.
+- **`security.yml`** — Gitleaks secret scanning (full git history) and `npm audit` across all
+  workspaces. Runs on every push.
+
+Dependency updates are automated via **Dependabot** (monthly, npm + GitHub Actions). A
+**CODEOWNERS** file is included, and `lint-staged` is wired into the pre-commit hook.
+
+The backend also ships a **multi-stage Dockerfile** (`node:20-bookworm-slim`, non-root `appuser`,
+`HEALTHCHECK` on `/health`, `npm audit` in the builder stage).
+
+For the full setup guide including branch protection rules and secret scanning configuration, see
+[`docs/ci-cd-setup.md`](docs/ci-cd-setup.md).
 
 ---
 
@@ -4917,6 +4987,11 @@ This project can run the backend locally over **HTTPS** to better mimic producti
 under `backend/cert/` in this repo). If you enable HTTPS you will typically open the backend URL
 first and accept the certificate in your browser; afterwards open the frontend at
 `https://localhost:5173`.
+
+> The TLS private key and certificate files under `backend/cert/` are Git-ignored and must never be
+> committed. See [`cert/README.md`](cert/README.md) for mkcert regeneration instructions and
+> [`SECURITY.md`](SECURITY.md) for the credential revocation log and `SESSION_SECRET` rotation
+> notes.
 
 **Quick note:** you can instead open **`https://localhost:5001`** (your backend) in the browser and
 accept the certificate there **before** opening **`https://localhost:5173`** — accepting the cert
@@ -5043,7 +5118,10 @@ VITE_CLIENT_BASE_URL (frontend)
 **Database & cache**
 
 ```
-MONGO_URI
+MONGO_URI                    # MongoDB connection string — REQUIRED IN PRODUCTION.
+                              # Note: all references previously using MONGODB_URI have been
+                              # standardized to MONGO_URI. Update any existing deployment
+                              # configs accordingly.
 UPSTASH_REDIS_URL (or REDIS connection string)
 ```
 
@@ -5284,6 +5362,23 @@ SUBSCRIPTION_RENEWAL_LOOKAHEAD_DAYS  # default 3 (renew before expiry)
 SUBSCRIPTION_RENEWAL_MAX_RETRIES     # default 3
 SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS # default 12 (space retries)
 SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS # default 24 (grace before downgrade)
+SUBSCRIPTION_RENEWAL_RUN_ON_BOOT     # default false; set true only on single-instance deploys
+```
+
+**Cron job boot-kickoff and ops alerting**
+
+```
+# Boot-kickoff flags — all default false (cron-trigger only; safe for multi-replica)
+SETTLEMENT_RECONCILIATION_RUN_ON_BOOT    # run settlement reconciliation on server start
+PAYOUT_RETRY_RUN_ON_BOOT                 # run payout retry job on server start
+COD_PAYOUT_RECONCILIATION_RUN_ON_BOOT   # run COD payout reconciliation on server start
+SUBSCRIPTION_RENEWAL_RUN_ON_BOOT         # run subscription renewal on server start
+
+# Ops alerting
+OPS_SLACK_WEBHOOK                        # optional Slack incoming webhook URL for job-health alerts
+                                         # (fans out alongside the email recipient list)
+SETTLEMENT_RECONCILIATION_MAX_REPORT_RECIPIENTS  # cap on email recipients for reconciliation reports
+                                                   # (default 5)
 ```
 
 **Settlement scheduler policy (server-side)**
@@ -5365,6 +5460,14 @@ GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET
 GOOGLE_CALLBACK_URL
 GOOGLE_LINK_CALLBACK_URL
+
+# OAuth signup bridge code — REQUIRED IN PRODUCTION
+OAUTH_BRIDGE_SECRET          # HMAC signing key for one-shot bridge codes used in OAuth signup.
+                              # Replaces the previous pattern of passing providerId/email/name in
+                              # URL query parameters. Generate with `openssl rand -hex 32`.
+                              # Server throws at startup if absent in NODE_ENV=production.
+OAUTH_BRIDGE_TTL_SECONDS     # Bridge code expiry window (default 300 seconds / 5 minutes).
+                              # Codes are single-use and expire after this window.
 ```
 
 **Application settings**
@@ -6002,6 +6105,18 @@ Extra reference material that complements this README:
   checkout sequence with deeplink notes.
 - [`mobile/certs/README.md`](mobile/certs/README.md) — explains the local HTTPS certificates and how
   to rotate them.
+- [`cert/README.md`](cert/README.md) — mkcert regeneration instructions for the backend local
+  development TLS certificate.
+- [`SECURITY.md`](SECURITY.md) — credential revocation log and `SESSION_SECRET` rotation notes.
+- [`docs/ci-cd-setup.md`](docs/ci-cd-setup.md) — full CI/CD pipeline documentation including
+  workflow jobs, branch protection rules, Dependabot configuration, Dockerfile hardening, and the
+  Vercel proxy double-egress observation.
+- [`docs/security/monitoring-metrics-access.md`](docs/security/monitoring-metrics-access.md) —
+  `MONITORING_METRICS_TOKEN` rotation strategy and future multi-scraper support plan.
+- [`docs/security/webhook-rotation.md`](docs/security/webhook-rotation.md) — rotation runbooks for
+  Stripe, Chimoney, and OAuth bridge secrets.
+- [`docs/settlements-runbook.md`](docs/settlements-runbook.md) — settlement and payout operations
+  runbook including distributed lock keys, `RUN_ON_BOOT` vars, and manual fallback procedures.
 - [`docs/DAISYUI-THEME.md`](docs/DAISYUI-THEME.md) — shared DaisyUI theming internals for web and
   mobile.
 - [`docs/THEME.md`](docs/THEME.md) — native token architecture for both platforms.
