@@ -46,6 +46,14 @@ details.
 
 ---
 
+### 2026-05-24 — Demo credentials rotated (C-3)
+
+The previously published demo account password has been changed and the old credentials are invalid.
+README now uses placeholders only (`demo@example.com` / `demo123`). Contact the platform
+administrator for actual demo access.
+
+---
+
 ## Dependency Updates
 
 Keep dependencies up to date. Run `npm audit` regularly and address high/critical advisories before

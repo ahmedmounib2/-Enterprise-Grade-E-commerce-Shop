@@ -92,8 +92,8 @@ repo root
 - **Background jobs** (`src/jobs/`): Settlement scheduling, subscription renewal, payout retry, COD
   reconciliation — all started in `server.js`.
 - **Feature flags:** Env-var-driven, parsed in `src/utils/featureFlags.js`. Current flags:
-  `FEATURE_CATEGORY_TREE_V2`, `FEATURE_SELLER_KYC`.
-- **Security stack:** helmet, hpp, csurf, mongo-sanitize, express-rate-limit, express-validator,
+  `FEATURE_MULTI_SELLER`, `FEATURE_SELLER_KYC`, `FEATURE_SELLER_ORDERS`, `FEATURE_CATEGORY_TREE_V2`.
+- **Security stack:** helmet, hpp, csrf-csrf, mongo-sanitize, express-rate-limit, express-validator,
   sanitize middleware.
 - **Integrations:** Stripe (payments + webhooks + subscriptions), Cloudinary (images),
   SendGrid/Resend (email), Sentry (`SENTRY_DSN`).

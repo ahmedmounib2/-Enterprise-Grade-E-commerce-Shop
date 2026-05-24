@@ -77,6 +77,7 @@
       - [Commission calculation \& order locking](#commission-calculation--order-locking)
       - [Pro Plan subscription purchase flow (Stripe Checkout)](#pro-plan-subscription-purchase-flow-stripe-checkout)
       - [Subscription renewal \& expiration handling](#subscription-renewal--expiration-handling)
+      - [Payment grace period](#payment-grace-period)
       - [Admin/operations notes](#adminoperations-notes)
   - [Subscription Billing Ledger](#subscription-billing-ledger)
     - [Architecture \& Design](#architecture--design)
@@ -388,15 +389,21 @@ until you are ready to launch in production, then flip it to `true` in `.env.pro
   `sellerId` and `slug` to support isolation.
 - Products and orders carry seller/store references plus approval, visibility, and payout status
   fields; required indexes are synced during migrations for sellers, stores, products, and orders.
-- Run the idempotent migration to seed the platform admin seller/store and backfill existing data:
-  `npm -w backend exec node src/migrations/0001_multi_tenant_foundation.js` (requires the usual DB
-  env vars such as `MONGO_URI`).
-- Public store lookup is available at `GET /api/stores/{slug}` and only surfaces the `StorePublic`
-  fields when the multi-seller flag is enabled.
+- The platform admin seller/store is provisioned automatically at server startup via
+  `backend/src/lib/ensureAdminStore.js`. No manual migration step is required — the function runs
+  idempotently on every boot (existing records are updated safely; missing records are created).
+- Public store lookup (slug-based) is handled by `publicStore.controller.js` at
+  `GET /api/public/stores/{slug}` and surfaces only `StorePublic` fields when the multi-seller flag
+  is enabled. The authenticated store route (`store.route.js`) exposes `GET /:id` and requires a
+  MongoDB ObjectId, not a slug.
 - Multi-store tenant flags:
   - `FEATURE_MULTI_SELLER=true`
   - `FEATURE_SELLER_KYC=true`
   - `FEATURE_SELLER_ORDERS=true`
+- **Silent-off behaviour:** when `FEATURE_MULTI_SELLER` is unset (or any value other than `"true"`),
+  the entire seller marketplace surface is silently disabled — `/api/seller/*`, `/api/sellers/*`,
+  `/api/stores/*`, and `/api/public/stores/*` routes all return 404 or are never registered. A fresh
+  production deploy without this flag set will have no visible seller or store functionality.
 - Keep backend/frontend flags aligned per environment so APIs and UI stay in sync (for example,
   mirror KYC flags with `VITE_FEATURE_SELLER_KYC=true` in `frontend/.env` and your Vercel
   environment settings when needed).
@@ -1230,10 +1237,16 @@ Pro subscriptions auto-renew via a scheduled job:
   `subscriptionId`. If no subscription exists, a new one is created using the active FeeConfig
   price.
 - **Success path:** plan stays Pro, `planExpiresAt` is extended, and retry counters are reset.
-- **Failure path:** retry attempts are scheduled with a configurable delay. After the final retry,
-  the system schedules a downgrade (grace period) and emails the seller about billing failures.
-- **Downgrade:** once the grace period passes, the seller is auto-downgraded to Free, expiry is
-  cleared, and subscription limits are re-applied.
+- **Failure path (card error):** when a renewal fails with a card-level error (`card_declined`,
+  `expired_card`, `no_payment_method`, etc.) and `PAYMENT_GRACE_ENABLED=true`, the seller enters a
+  payment grace period instead of being immediately downgraded (see
+  [Payment grace period](#payment-grace-period) below). Retry attempts are paused for the duration
+  of the grace period. The seller receives an email notification and the dashboard shows a
+  non-dismissible amber banner with the deadline and an **Update payment method** link.
+- **Failure path (other errors):** retry attempts are scheduled with a configurable delay. After the
+  final retry, the seller is downgraded and emailed.
+- **Downgrade:** once the grace period (or retry window, for non-card failures) passes, the seller
+  is auto-downgraded to Free, expiry is cleared, and subscription limits are re-applied.
 
 **Scheduled cron job settings (recommended defaults)**
 
@@ -1280,6 +1293,43 @@ Separately, the subscription read endpoint enforces expiration on demand: if a P
 pending cancellation flags. This ensures the UI and backend authorization stay consistent even if a
 seller’s plan expires between renewal sweeps.
 
+#### Payment grace period
+
+When a renewal fails due to a card error and `PAYMENT_GRACE_ENABLED=true` (the default), the seller
+is given a configurable window (`PAYMENT_GRACE_PERIOD_DAYS`, default 7 days) to fix their payment
+method before being downgraded.
+
+**Data model additions (Seller)**
+
+- `paymentGracePeriodEndsAt` (`Date`) — set to `now + PAYMENT_GRACE_PERIOD_DAYS` when the grace
+  period starts; cleared on successful recovery or downgrade.
+- `paymentFailureReason` (`String`) — stores the Stripe decline code (e.g. `card_declined`) for
+  display and auditing.
+
+**Grace period lifecycle**
+
+1. **Entry:** renewal fails with a card error → `paymentGracePeriodEndsAt` is set, retry scheduling
+   is paused, seller receives an email notification.
+2. **Seller recovers:** seller updates their payment method in the dashboard → a one-time charge is
+   attempted immediately for the pending renewal amount.
+   - **Success:** grace period fields are cleared, `planExpiresAt` is extended as normal.
+   - **Failure:** grace period continues; seller can retry until the deadline.
+3. **Expiry:** a scheduled sweep finds sellers whose `paymentGracePeriodEndsAt` is in the past →
+   auto-downgrade to Free plan, grace fields cleared, email notification sent.
+
+**Dashboard banner**
+
+While a seller is in a grace period, the seller dashboard renders a non-dismissible amber banner
+containing the grace deadline and an **Update payment method** button. The banner uses i18n keys
+under `seller.paymentGraceBanner`.
+
+**Grace period env vars**
+
+```env
+PAYMENT_GRACE_ENABLED=true         # default true; set false to disable grace period (immediate downgrade)
+PAYMENT_GRACE_PERIOD_DAYS=7        # default 7; number of days before auto-downgrade triggers
+```
+
 #### Admin/operations notes
 
 - **Update fee defaults:** In the admin dashboard, open **Commission settings** and create/update a
@@ -1288,6 +1338,10 @@ seller’s plan expires between renewal sweeps.
   into FeeConfig. The next checkout/renewal will automatically use the updated price.
 - **Rule overrides:** Use the same admin screen to create seller- or category-specific commission
   rules when you need targeted promotions or negotiated fee rates.
+- **Payment status column:** The seller list in the admin dashboard displays a **Payment status**
+  column showing `OK`, `Grace period` (with the deadline), or `Failed` for each seller. Admins can
+  manually end a grace period (triggering an immediate retry) or force-downgrade a seller from this
+  view.
 
 These changes are stored in the database and take effect immediately without requiring a deploy or
 environment variable updates (except the optional Stripe price fallback).
@@ -1769,8 +1823,8 @@ Refer to [`mobile/env.md`](mobile/env.md) for the full run-mode matrix and env p
   profile. Network errors fall back to cached user data; a `401` triggers re-authentication.
 - **Proactive session heartbeat:** The app calls the refresh-token endpoint every 10 minutes and on
   each app foreground event to keep the session alive within the 30-day sliding window. The backend
-  keep-alive endpoint accepts `Authorization: Bearer <refresh-token>` in addition to cookies, so
-  the heartbeat works in mobile runtimes where cookies may not be propagated automatically.
+  keep-alive endpoint accepts `Authorization: Bearer <refresh-token>` in addition to cookies, so the
+  heartbeat works in mobile runtimes where cookies may not be propagated automatically.
 - **Full shopping journey:** The app surfaces the entire catalogue, promotional sliders, cart,
   checkout, order history, profile management (including GDPR data export and account deletion), and
   transactional policy screens.
@@ -1830,8 +1884,8 @@ Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
 
 - `frontend/` — React (Vite) app, i18n, Zustand stores, Stripe client, Sentry instrumentation.
 - `backend/` — Express API (ESM), Mongoose models, Redis for token storage/caches/locks, Stripe
-  webhook handlers, csurf, passport strategies, email helpers. Deployed with the root Dockerfile to
-  Railway.
+  webhook handlers, csrf-csrf (double-submit CSRF protection), passport strategies, email helpers.
+  Deployed with the root Dockerfile to Railway.
 - `mobile/` — Expo + React Native custom dev client with deep-link integration for password reset
   and OAuth flows. See [`mobile/custom-dev-setup.md`](mobile/custom-dev-setup.md).
 - `backend/src/tests/` + `backend/test/` — Jest unit/integration/E2E suites (supertest, fixtures,
@@ -2184,8 +2238,9 @@ legacy beneficiary payload shapes.
 
 **Webhook replay instructions (admin/on-call)**
 
-1. Re-send original payload to `POST /api/chimoney/webhook`.
-2. Pass `x-chimoney-webhook-secret` with active secret.
+1. Re-send original payload to `POST /api/payments/chimoney/webhook`.
+2. Pass `x-chimoney-signature` header with active HMAC-SHA256 signature computed over the raw
+   request body using `CHIMONEY_WEBHOOK_SECRET`.
 3. Confirm response has `received: true`.
 4. Verify matching via idempotency key (fallback provider refund id), and confirm order transition.
 
@@ -2530,11 +2585,11 @@ Also inspect structured logs with `orderId`, `idempotencyKey`, `providerRefundId
 
 When creating the webhook endpoint in Chimoney dashboard, use your backend public URL:
 
-- Endpoint URL: `https://<your-backend-domain>/api/chimoney/webhook`
+- Endpoint URL: `https://<your-backend-domain>/api/payments/chimoney/webhook`
 
 The backend exposes a single authenticated route:
 
-- `POST /api/chimoney/webhook`
+- `POST /api/payments/chimoney/webhook`
 
 **Security:** Every incoming request is verified with HMAC-SHA256 over `req.rawBody` using
 `CHIMONEY_WEBHOOK_SECRET`. The secret is **required** — the server throws at boot time if it is
@@ -2552,7 +2607,7 @@ Subscribe to these events (the ones currently processed by backend):
 If extra events are sent, they are accepted but ignored as `unsupported_event_type`.
 
 For local testing via tunnel (ngrok/Cloudflare Tunnel), set endpoint URL to your temporary HTTPS URL
-plus `/api/chimoney/webhook`, then replay a sample event and confirm `received: true`.
+plus `/api/payments/chimoney/webhook`, then replay a sample event and confirm `received: true`.
 
 Example sandbox-style config:
 
@@ -2615,10 +2670,6 @@ Stripe supports up to 5 active secrets per endpoint, enabling zero-downtime dual
 4. Remove the old secret from the list and delete it from the Stripe Dashboard.
 5. Update `STRIPE_WEBHOOK_SECRET` to the new value.
 
-> **Note:** Multi-secret support (comma-separated `STRIPE_WEBHOOK_SECRETS`) is not yet implemented
-> in `payment.controller.js`. See
-> [docs/security/webhook-rotation.md](docs/security/webhook-rotation.md) for the full TODO.
-
 #### Rotate Chimoney API key safely
 
 1. Create new API key in Chimoney console (same environment).
@@ -2631,16 +2682,16 @@ Stripe supports up to 5 active secrets per endpoint, enabling zero-downtime dual
 
 1. Generate new webhook secret in Chimoney.
 2. Update `CHIMONEY_WEBHOOK_SECRET`.
-3. Replay a known webhook payload against `/api/chimoney/webhook`.
+3. Replay a known webhook payload against `/api/payments/chimoney/webhook`.
 4. Confirm request is accepted and matched to refund record.
 5. Remove old webhook secret in provider console.
 
 #### Replay webhook (admin/on-call detailed)
 
 1. Capture original payload + event metadata from provider dashboard.
-2. `POST /api/chimoney/webhook` with the original raw payload body and the HMAC-SHA256 signature
-   header matching `CHIMONEY_WEBHOOK_SECRET`. The signature must be computed over the raw body bytes
-   — do not re-serialize the JSON.
+2. `POST /api/payments/chimoney/webhook` with the original raw payload body and the
+   `x-chimoney-signature` HMAC-SHA256 header computed over the raw body bytes using
+   `CHIMONEY_WEBHOOK_SECRET` — do not re-serialize the JSON.
 3. Confirm 2xx response and `received: true`.
 4. Validate matching path:
    - first by `idempotencyKey`
@@ -4634,9 +4685,9 @@ In `product.controller.js` we use a single helper:
   - `access token` cookie, short-lived (e.g., 15 minutes).
   - `refresh token` cookie, long-lived (sliding, e.g., up to 30 days).
   - Server stores the refresh token value keyed by `refresh_token:<userId>:<jti>` in Redis.
-  - A `session_active_since:<userId>` key is set in Redis to track the current active session
-    window (default 30 days). Activity resets the expiry, implementing a **sliding window** rather
-    than a hard cap.
+  - A `session_active_since:<userId>` key is set in Redis to track the current active session window
+    (default 30 days). Activity resets the expiry, implementing a **sliding window** rather than a
+    hard cap.
 
 - Token rotation:
   - `/api/auth/refresh-token` validates the cookie against Redis and atomically rotates to a new
@@ -4652,10 +4703,10 @@ In `product.controller.js` we use a single helper:
 
 - Session invalidation:
   - **Password reset**, **`unlinkSocial`**, and **profile password change** all invalidate every
-    existing refresh token for the user (all `refresh_token:<userId>:*` keys deleted) and clear
-    both the access-token and refresh-token cookies. The `session_active_since:<userId>` heartbeat
-    key is also removed before issuing new credentials. This ensures a compromised token cannot
-    survive a password change.
+    existing refresh token for the user (all `refresh_token:<userId>:*` keys deleted) and clear both
+    the access-token and refresh-token cookies. The `session_active_since:<userId>` heartbeat key is
+    also removed before issuing new credentials. This ensures a compromised token cannot survive a
+    password change.
   - `keepAlive` verifies the `session_active_since:<userId>` Redis key exists before minting a new
     access token; if the key has expired (inactive session), the request is rejected and the client
     must re-authenticate.
@@ -4678,12 +4729,12 @@ In `product.controller.js` we use a single helper:
 - Keep-alive authentication:
   - `GET /auth/keep-alive` does **not** require a pre-issued access token. The handler
     self-authenticates by cryptographically verifying the refresh JWT and issuing a fresh access
-    token. Only a valid refresh token (httpOnly cookie or `Authorization: Bearer <token>` header)
-    is needed.
+    token. Only a valid refresh token (httpOnly cookie or `Authorization: Bearer <token>` header) is
+    needed.
 
 - Redis resilience in keep-alive:
-  - If Redis returns a network error during a `keepAlive` call, the server responds with `503
-    Service Unavailable` so clients can retry rather than logging out.
+  - If Redis returns a network error during a `keepAlive` call, the server responds with
+    `503 Service Unavailable` so clients can retry rather than logging out.
   - If the refresh-token key is absent from Redis (cache miss) but the JWT signature is valid, the
     handler re-stores the token in Redis (cache-heal) instead of issuing a `401`. This prevents
     spurious logouts caused by Redis eviction or brief unavailability.
@@ -4691,17 +4742,18 @@ In `product.controller.js` we use a single helper:
 - Mobile friendliness:
   - The mobile app runs a proactive session heartbeat: every 10 minutes and on app foreground, it
     calls the refresh-token endpoint to keep the session alive within the 30-day sliding window.
-  - `GET /auth/keep-alive` accepts both httpOnly cookie refresh tokens and `Authorization: Bearer
-    <refresh-token>` headers, so mobile clients can call it without relying on cookies.
+  - `GET /auth/keep-alive` accepts both httpOnly cookie refresh tokens and
+    `Authorization: Bearer <refresh-token>` headers, so mobile clients can call it without relying
+    on cookies.
   - On app restart, mobile bootstrap checks whether the stored access token is expired and silently
     refreshes it before fetching the user profile. Network errors fall back to cached user data; a
     `401` response triggers re-authentication rather than falling back to the cache.
-  - Web frontend also implements mobile-aware keep-alive intervals and additional activity
-    listeners (touchstart, focus) to counteract background throttling on mobile browsers.
+  - Web frontend also implements mobile-aware keep-alive intervals and additional activity listeners
+    (touchstart, focus) to counteract background throttling on mobile browsers.
 
 **UX rule implemented:** sessions persist for the full 30-day sliding window — any activity
-(refresh, keep-alive) resets the clock. Redis resilience ensures transient cache issues never
-cause an unnecessary logout.
+(refresh, keep-alive) resets the clock. Redis resilience ensures transient cache issues never cause
+an unnecessary logout.
 
 ---
 
@@ -4727,7 +4779,7 @@ cause an unnecessary logout.
 
 **Account deletion (soft-delete lifecycle)**
 
-- `DELETE /api/user/me` — requires re-authentication: local-provider accounts must supply
+- `DELETE /api/users/me` — requires re-authentication: local-provider accounts must supply
   `confirmationPassword` in the request body; OAuth accounts skip the password check.
 - On success the controller (inside a single MongoDB transaction):
   1. Anonymizes all PII inline on the User document (`name`, `email`, `phone`, addresses, OAuth
@@ -4748,7 +4800,8 @@ cause an unnecessary logout.
 
 **Data export (Articles 15 & 20)**
 
-- `GET /api/user/export` — streams a JSON attachment (`Content-Disposition: attachment`) containing:
+- `GET /api/users/me/export` — streams a JSON attachment (`Content-Disposition: attachment`)
+  containing:
   - `profile` — all user fields with encrypted PII decrypted via Mongoose getters; password and
     token fields excluded.
   - `cartItems`, `wishlist` — current embedded arrays.
@@ -4766,14 +4819,14 @@ cause an unnecessary logout.
 ## Security & observability
 
 - Cookies: `HttpOnly`, `SameSite=None` (when cross-site), and domain configured to allow
-  cross-subdomain cookies for frontend + API. The `Secure` flag is computed dynamically per
-  request via `isSecureCookie(req)`: it is set when `SameSite=None`, when the request is served
-  over HTTPS (`req.secure`), or when `NODE_ENV=production`. All cookie option sets are factory
-  functions that accept the request object, ensuring correct behavior in staging and preview
-  environments served over HTTPS.
-- **Session invalidation on credential change:** password reset and `unlinkSocial` immediately
-  clear both the access-token and refresh-token cookies in addition to revoking all Redis tokens,
-  fully signing out the user on all cookie-bearing clients.
+  cross-subdomain cookies for frontend + API. The `Secure` flag is computed dynamically per request
+  via `isSecureCookie(req)`: it is set when `SameSite=None`, when the request is served over HTTPS
+  (`req.secure`), or when `NODE_ENV=production`. All cookie option sets are factory functions that
+  accept the request object, ensuring correct behavior in staging and preview environments served
+  over HTTPS.
+- **Session invalidation on credential change:** password reset and `unlinkSocial` immediately clear
+  both the access-token and refresh-token cookies in addition to revoking all Redis tokens, fully
+  signing out the user on all cookie-bearing clients.
 - **CSRF:** `csrf-csrf` (double-submit cookie pattern) replaces the removed `csurf` dependency. The
   `X-Mobile-Client` CSRF bypass has been removed; all clients must go through the standard
   double-submit flow. The `/api/csrf-token` endpoint issues the CSRF cookie.
@@ -5141,8 +5194,6 @@ SESSION_REDIS_PREFIX
 REFRESH_TOKEN_SECRET
 MAX_SESSION_LIFETIME_DAYS
 COOKIE_DOMAIN
-CSRF_SECRET
-COOKIE_SECRET
 DEBUG_REFRESH
 ```
 
@@ -5173,7 +5224,8 @@ UPSTASH_REDIS_URL (or REDIS connection string)
 STRIPE_SECRET_KEY
 STRIPE_WEBHOOK_SECRET
 STRIPE_PRO_PRICE_ID          # optional fallback if FeeConfig has no stripePriceId
-SENDGRID_API_KEY
+RESEND_API_KEY               # active email provider (backend/src/lib/email.js imports Resend)
+SENDGRID_API_KEY             # fallback email provider; requires swapping the import in email.js
 CLOUDINARY_CLOUD_NAME
 CLOUDINARY_API_KEY
 CLOUDINARY_API_SECRET
@@ -5210,7 +5262,9 @@ USER_DELETION_RETENTION_DAYS       # days before soft-deleted users are hard-del
 **Payment provider + COD refund/payout policy**
 
 ```env
-PAYMENT_PROVIDER=stripe
+# PAYMENT_PROVIDER is reserved for future multi-gateway support and is not currently read by
+# the application. Stripe is always the active payment gateway.
+# PAYMENT_PROVIDER=stripe
 STRIPE_PERCENT_FEE=2.9
 STRIPE_FIXED_FEE_CENTS=30
 STRIPE_FEE_SOURCE=balance_transaction
@@ -5273,7 +5327,7 @@ COD_REFUND_PURGE_TZ=UTC
 CHIMONEY_TIMEOUT_MS=12000
 CHIMONEY_MAX_RETRIES=3
 CHIMONEY_RETRY_BASE_DELAY_MS=500
-CHIMONEY_SOURCE_CURRENCY=USD
+# CHIMONEY_SOURCE_CURRENCY is reserved for future use and not currently read by the application.
 COD_REFUND_CHIMONEY_WEBHOOK_STORE_RAW_DEBUG=false
 ```
 
@@ -5285,14 +5339,13 @@ COD_REFUND_PURGE_TZ=UTC
 CHIMONEY_TIMEOUT_MS=8000
 CHIMONEY_MAX_RETRIES=1
 CHIMONEY_RETRY_BASE_DELAY_MS=200
-CHIMONEY_SOURCE_CURRENCY=USD
+# CHIMONEY_SOURCE_CURRENCY is reserved for future use and not currently read by the application.
 COD_REFUND_CHIMONEY_WEBHOOK_STORE_RAW_DEBUG=true
 ```
 
 **Production vs development guidance for the keys above**
 
 - **Production**
-  - Keep `PAYMENT_PROVIDER=stripe`.
   - Keep Stripe defaults (`STRIPE_PERCENT_FEE=2.9`, `STRIPE_FIXED_FEE_CENTS=30`) unless your Stripe
     contract differs.
   - Keep `STRIPE_FEE_SOURCE=balance_transaction` to favor settled Stripe balance transaction data.
@@ -5311,7 +5364,6 @@ COD_REFUND_CHIMONEY_WEBHOOK_STORE_RAW_DEBUG=true
     - Use the **production baseline block below** and pair production `CHIMONEY_BASE_URL` with
       production `CHIMONEY_API_KEY`.
 - **Development**
-  - Keep `PAYMENT_PROVIDER=stripe` (unless testing a mocked provider).
   - Keep the same Stripe fee defaults so local calculations match production expectations.
   - Keep `STRIPE_FEE_SOURCE=balance_transaction`.
   - Keep `COD_PAYOUT_ADAPTER=manual` unless you have a dedicated sandbox bank adapter.
@@ -5405,6 +5457,9 @@ SUBSCRIPTION_RENEWAL_MAX_RETRIES     # default 3
 SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS # default 12 (space retries)
 SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS # default 24 (grace before downgrade)
 SUBSCRIPTION_RENEWAL_RUN_ON_BOOT     # default false; set true only on single-instance deploys
+
+PAYMENT_GRACE_ENABLED                # default true; set false to skip grace period on card failure
+PAYMENT_GRACE_PERIOD_DAYS            # default 7; days the seller has to fix payment before downgrade
 ```
 
 **Cron job boot-kickoff and ops alerting**
@@ -5593,8 +5648,6 @@ ACCESS_TOKEN_EXPIRE=15m
 # Controls JWT expiry, cookie maxAge, and Redis key TTL — change only this one value.
 REFRESH_TOKEN_EXPIRE=30d
 MAX_SESSION_LIFETIME_DAYS=30
-CSRF_SECRET=changeme_csrf
-COOKIE_SECRET=changeme_cookie_secret
 JWT_SECRET=changeme_jwt_secret
 DEBUG_REFRESH=false
 
@@ -5662,6 +5715,10 @@ SUBSCRIPTION_RENEWAL_MAX_RETRIES=3
 SUBSCRIPTION_RENEWAL_RETRY_DELAY_HOURS=12
 SUBSCRIPTION_RENEWAL_DOWNGRADE_GRACE_HOURS=24
 
+# Payment grace period (card-failure recovery window)
+PAYMENT_GRACE_ENABLED=true
+PAYMENT_GRACE_PERIOD_DAYS=7
+
 # Settlement scheduler policy (server-side)
 SETTLEMENT_SCHEDULER_ENABLED=true
 SETTLEMENT_PERIOD_DAYS=15
@@ -5680,7 +5737,12 @@ SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked
 # SETTLEMENT_HOLD_DAYS=0
 # SETTLEMENT_CRON="*/2 * * * *"
 
-# Email Service (SendGrid)
+# Email Service (Resend — active provider; SendGrid available as fallback)
+# Set RESEND_API_KEY to use Resend (the default). To use SendGrid instead, swap the
+# import in backend/src/lib/email.js and set SENDGRID_API_KEY.
+RESEND_API_KEY=
+RESEND_FROM_EMAIL=your-email@example.com
+RESEND_FROM_NAME="Ecommerce store"
 SENDGRID_API_KEY=
 SENDGRID_FROM_EMAIL=your-email@example.com
 SENDGRID_FROM_NAME="Ecommerce store"
@@ -6122,9 +6184,12 @@ Check LICENSE_PROPRIETARY.txt
 All credentials are scoped to the staging environment (`https://www.ahmedmonib-eshop-demo.com` and
 the Expo mobile client). Update or rotate as needed before sharing broadly.
 
-| Role            | Email / Username      | Password |
-| --------------- | --------------------- | -------- |
-| Regular shopper | `amonib831@gmail.com` | `123456` |
+| Role            | Email / Username   | Password  |
+| --------------- | ------------------ | --------- |
+| Regular shopper | `demo@example.com` | `demo123` |
+
+> **Note:** These are placeholder credentials. Contact the platform administrator for actual demo
+> access.
 
 ---
 
@@ -6154,6 +6219,8 @@ Extra reference material that complements this README:
 - [`docs/ci-cd-setup.md`](docs/ci-cd-setup.md) — full CI/CD pipeline documentation including
   workflow jobs, branch protection rules, Dependabot configuration, Dockerfile hardening, and the
   Vercel proxy double-egress observation.
+- [`docs/monitoring/alerts.md`](docs/monitoring/alerts.md) — alert definitions, thresholds, and
+  on-call runbook for the production monitoring stack.
 - [`docs/security/monitoring-metrics-access.md`](docs/security/monitoring-metrics-access.md) —
   `MONITORING_METRICS_TOKEN` rotation strategy and future multi-scraper support plan.
 - [`docs/security/webhook-rotation.md`](docs/security/webhook-rotation.md) — rotation runbooks for
@@ -6171,9 +6238,6 @@ Extra reference material that complements this README:
   and deployment checklist for the Expo app.
 - [`mobile/docs/docs/mobile/android-build-config.md`](mobile/docs/docs/mobile/android-build-config.md)
   — native build configuration (gradle.properties, signing files, `eas.json` notes).
-- [`eslint-cheatsheet.md`](eslint-cheatsheet.md) — linting reference for contributors.
-- [`prettier-configuration-cheatSheet.md`](prettier-configuration-cheatSheet.md) — Prettier usage
-  guide tailored to this repo.
 
 ---
 
