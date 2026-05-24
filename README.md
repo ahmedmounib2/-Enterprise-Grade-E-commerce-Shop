@@ -277,11 +277,16 @@
 
 ## Maintainer context
 
-This project is built and maintained by a single freelance developer. Any "playbook" style
-documentation in [`docs/`](docs/) is optional scaffolding kept around for potential future growth of
-the project into a team setting; it is **not** required for day-to-day solo development. Feel free
-to ignore those extras unless you want structured guidance when collaborating with additional
-contributors later on.
+This project is designed, built, and maintained end-to-end by a single freelance full-stack
+developer — from system architecture and database schema through to CI/CD pipelines, mobile
+releases, and production security hardening.
+
+Documentation in [`docs/`](docs/) is not scaffolding — it covers actively used operational runbooks,
+security rotation procedures, settlement and payout operations, and CI/CD setup that are referenced
+during day-to-day development and deployment. The codebase is production-grade in both scope and
+discipline: distributed Redis locks, field-level PII encryption, HMAC-signed OAuth bridge codes,
+multi-stage Docker builds, and a full 129-suite / 1099-test backend test suite with CI enforcement
+on every PR.
 
 ---
 
@@ -367,8 +372,6 @@ decide to collaborate with others or formalise operations:
   and mobile rollouts when multiple people coordinate deployments.
 - [`docs/security/access-controls.md`](docs/security/access-controls.md) — optional template for
   documenting account provisioning and least-privilege roles once more contributors join.
-- [`docs/INCIDENT_RESPONSE.md`](docs/INCIDENT_RESPONSE.md) — optional production incident playbook
-  if you later need structured response expectations.
 
 Mobile-only feature flags live in `mobile/.env.*`. To exercise the Category Tree v2 UI, set
 `EXPO_PUBLIC_FEATURE_MOBILE_CATEGORY_TREE_V2=true` in your dev/tunnel profile; leave it `false`
@@ -1740,11 +1743,11 @@ Refer to [`mobile/env.md`](mobile/env.md) for the full run-mode matrix and env p
   correct screen whether the app is cold-started or already in memory.
 - **OAuth signup bridge-code flow:** after OAuth authentication the backend issues a short-lived,
   one-shot HMAC-signed bridge code and redirects to the mobile deep link as
-  `eshop://oauth?code=<bridge_code>`. `AuthProvider` exchanges the code via a server-side API
-  call instead of reading `accessToken`/`refreshToken` directly from query parameters. This
-  prevents token leakage through server logs, referrer headers, and deep-link history.
-  - Bridge codes are signed with `OAUTH_BRIDGE_SECRET` and expire after
-    `OAUTH_BRIDGE_TTL_SECONDS` (default `300` seconds).
+  `eshop://oauth?code=<bridge_code>`. `AuthProvider` exchanges the code via a server-side API call
+  instead of reading `accessToken`/`refreshToken` directly from query parameters. This prevents
+  token leakage through server logs, referrer headers, and deep-link history.
+  - Bridge codes are signed with `OAUTH_BRIDGE_SECRET` and expire after `OAUTH_BRIDGE_TTL_SECONDS`
+    (default `300` seconds).
   - The `/auth/oauth-signup` endpoint is rate-limited to 5 requests per minute.
   - See [`docs/security/webhook-rotation.md`](docs/security/webhook-rotation.md) for
     `OAUTH_BRIDGE_SECRET` rotation instructions.
@@ -4245,10 +4248,10 @@ duplicate runs across multiple app replicas. Lock keys and TTLs are documented i
 Each job wraps its callback with `wrapCronCallback`, which catches and logs unhandled rejections
 from within the cron body so a single-job failure cannot crash the Node process.
 
-**Boot-kickoff behavior:** all four jobs default to `*_RUN_ON_BOOT=false`, meaning they only
-trigger on their configured cron schedule. This is the safe default for multi-replica deployments
-where process startup is staggered. See Environment Variables below for the full list of
-`RUN_ON_BOOT` vars.
+**Boot-kickoff behavior:** all four jobs default to `*_RUN_ON_BOOT=false`, meaning they only trigger
+on their configured cron schedule. This is the safe default for multi-replica deployments where
+process startup is staggered. See Environment Variables below for the full list of `RUN_ON_BOOT`
+vars.
 
 ##### Job-health monitoring
 
@@ -4256,8 +4259,8 @@ where process startup is staggered. See Environment Variables below for the full
   completed inside `JOB_HEALTH_SCHEDULER_STALE_HOURS`.
 - **Payout retry failure-rate alerts:** payout retry runs are windowed and failure-rate alerts are
   triggered when configured minimum-run and threshold conditions are met.
-- **Alert fan-out:** alerts are sent via email to the configured admin recipient list and
-  optionally to a Slack channel via `OPS_SLACK_WEBHOOK`.
+- **Alert fan-out:** alerts are sent via email to the configured admin recipient list and optionally
+  to a Slack channel via `OPS_SLACK_WEBHOOK`.
 - **Admin dashboard health indicator:** the Admin page surfaces a compact scheduler-health pill
   (`healthy` / `stale` / `unknown`) based on `/api/admin/jobs/health` for quick operator triage.
 - **Prometheus + Datadog hooks:** settlement scheduler and payout retry jobs emit counters that can
@@ -4266,23 +4269,23 @@ where process startup is staggered. See Environment Variables below for the full
 
 #### 2) Environment variables reference
 
-| Variable                                   | Purpose                                                                          | Accepted format / range                                                                   | Operational effect                                                                                                           |
-| ------------------------------------------ | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `SETTLEMENT_PAYOUT_RETRY_ENABLED`          | Enables/disables payout retry cron scheduling.                                   | Boolean-like (`true/false`, `1/0`, `yes/no`, `on/off`).                                   | `false` disables automatic recovery, so failed payouts remain failed/manual until operators act.                             |
-| `SETTLEMENT_PAYOUT_RETRY_CRON`             | Cron cadence for retry cycles.                                                   | Valid cron expression (node-cron syntax).                                                 | Faster cadence reduces time-to-recovery but increases Stripe/API pressure and log volume.                                    |
-| `SETTLEMENT_PAYOUT_RETRY_MAX_RETRIES`      | Max failed retry attempts before escalation.                                     | Positive integer (`>=1`).                                                                 | Lower values escalate to `manual_required` faster; higher values increase auto-retry persistence before manual intervention. |
-| `SETTLEMENT_SCHEDULER_TZ`                  | Timezone used by settlement-related cron jobs.                                   | Valid IANA timezone (e.g., `UTC`, `America/New_York`). Invalid values fall back to `UTC`. | Controls when cron expressions fire in wall-clock terms; mismatches can cause off-hours execution.                           |
-| `JOB_HEALTH_SCHEDULER_STALE_HOURS`         | Staleness threshold for scheduler-health alerting.                               | Positive integer hours.                                                                   | Lower values alert sooner for stuck schedulers; overly low values can create noisy false positives.                          |
-| `JOB_HEALTH_PAYOUT_FAILURE_RATE_THRESHOLD` | Failure-rate alert threshold for payout retry job.                               | Decimal between `0` and `1` inclusive.                                                    | Lower thresholds make alerting more sensitive to degradation; higher thresholds reduce alert frequency.                      |
-| `JOB_HEALTH_PAYOUT_FAILURE_WINDOW_RUNS`    | Number of latest runs evaluated for payout failure rate.                         | Positive integer.                                                                         | Smaller windows react quickly to spikes; larger windows smooth volatility and react slower.                                  |
-| `JOB_HEALTH_PAYOUT_FAILURE_MIN_RUNS`       | Minimum runs required before failure-rate alerts can trigger.                    | Positive integer.                                                                         | Prevents early noisy alerts on low sample sizes; too high can delay real incident detection.                                 |
-| `SETTLEMENT_RECONCILIATION_REPORT_EMAILS`  | Explicit recipient list for reconciliation/retry/reversal failure notifications. | Comma/semicolon separated email list.                                                     | Empty value suppresses direct email notifications; configured value provides immediate operator visibility.                  |
-| `SETTLEMENT_RECONCILIATION_MAX_REPORT_RECIPIENTS` | Cap on the number of email recipients for reconciliation reports. | Positive integer (default `5`). | Prevents accidental wide distribution of financial alert emails. |
-| `OPS_SLACK_WEBHOOK`                        | Optional Slack incoming webhook URL for job-health alert fan-out.                | Full Slack webhook URL.                                                                   | When set, job-health alerts are posted to the configured Slack channel in addition to email recipients.                      |
-| `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT`    | Run settlement reconciliation job once immediately on server start.              | Boolean-like (`true/false`). Default `false`.                                             | Set `true` only on single-instance deployments where an immediate first run is required.                                     |
-| `PAYOUT_RETRY_RUN_ON_BOOT`                 | Run payout retry job once immediately on server start.                           | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
-| `COD_PAYOUT_RECONCILIATION_RUN_ON_BOOT`    | Run COD payout reconciliation job once immediately on server start.              | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
-| `SUBSCRIPTION_RENEWAL_RUN_ON_BOOT`         | Run subscription renewal job once immediately on server start.                   | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
+| Variable                                          | Purpose                                                                          | Accepted format / range                                                                   | Operational effect                                                                                                           |
+| ------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `SETTLEMENT_PAYOUT_RETRY_ENABLED`                 | Enables/disables payout retry cron scheduling.                                   | Boolean-like (`true/false`, `1/0`, `yes/no`, `on/off`).                                   | `false` disables automatic recovery, so failed payouts remain failed/manual until operators act.                             |
+| `SETTLEMENT_PAYOUT_RETRY_CRON`                    | Cron cadence for retry cycles.                                                   | Valid cron expression (node-cron syntax).                                                 | Faster cadence reduces time-to-recovery but increases Stripe/API pressure and log volume.                                    |
+| `SETTLEMENT_PAYOUT_RETRY_MAX_RETRIES`             | Max failed retry attempts before escalation.                                     | Positive integer (`>=1`).                                                                 | Lower values escalate to `manual_required` faster; higher values increase auto-retry persistence before manual intervention. |
+| `SETTLEMENT_SCHEDULER_TZ`                         | Timezone used by settlement-related cron jobs.                                   | Valid IANA timezone (e.g., `UTC`, `America/New_York`). Invalid values fall back to `UTC`. | Controls when cron expressions fire in wall-clock terms; mismatches can cause off-hours execution.                           |
+| `JOB_HEALTH_SCHEDULER_STALE_HOURS`                | Staleness threshold for scheduler-health alerting.                               | Positive integer hours.                                                                   | Lower values alert sooner for stuck schedulers; overly low values can create noisy false positives.                          |
+| `JOB_HEALTH_PAYOUT_FAILURE_RATE_THRESHOLD`        | Failure-rate alert threshold for payout retry job.                               | Decimal between `0` and `1` inclusive.                                                    | Lower thresholds make alerting more sensitive to degradation; higher thresholds reduce alert frequency.                      |
+| `JOB_HEALTH_PAYOUT_FAILURE_WINDOW_RUNS`           | Number of latest runs evaluated for payout failure rate.                         | Positive integer.                                                                         | Smaller windows react quickly to spikes; larger windows smooth volatility and react slower.                                  |
+| `JOB_HEALTH_PAYOUT_FAILURE_MIN_RUNS`              | Minimum runs required before failure-rate alerts can trigger.                    | Positive integer.                                                                         | Prevents early noisy alerts on low sample sizes; too high can delay real incident detection.                                 |
+| `SETTLEMENT_RECONCILIATION_REPORT_EMAILS`         | Explicit recipient list for reconciliation/retry/reversal failure notifications. | Comma/semicolon separated email list.                                                     | Empty value suppresses direct email notifications; configured value provides immediate operator visibility.                  |
+| `SETTLEMENT_RECONCILIATION_MAX_REPORT_RECIPIENTS` | Cap on the number of email recipients for reconciliation reports.                | Positive integer (default `5`).                                                           | Prevents accidental wide distribution of financial alert emails.                                                             |
+| `OPS_SLACK_WEBHOOK`                               | Optional Slack incoming webhook URL for job-health alert fan-out.                | Full Slack webhook URL.                                                                   | When set, job-health alerts are posted to the configured Slack channel in addition to email recipients.                      |
+| `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT`           | Run settlement reconciliation job once immediately on server start.              | Boolean-like (`true/false`). Default `false`.                                             | Set `true` only on single-instance deployments where an immediate first run is required.                                     |
+| `PAYOUT_RETRY_RUN_ON_BOOT`                        | Run payout retry job once immediately on server start.                           | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
+| `COD_PAYOUT_RECONCILIATION_RUN_ON_BOOT`           | Run COD payout reconciliation job once immediately on server start.              | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
+| `SUBSCRIPTION_RENEWAL_RUN_ON_BOOT`                | Run subscription renewal job once immediately on server start.                   | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
 
 #### 3) Recommended value profiles
 
@@ -4746,12 +4749,12 @@ refreshes the 30-day window.
 - Sanitization and NoSQL injection protection for request bodies and query params.
 - **Logging:** Winston with daily rotation; `redactSensitive()` is applied at the top-level logger
   format and covers **all transports** (Console and DailyRotateFile). The sensitive-key list covers
-  25 fields (up from 7) including common PII, token, and credential field names. Redaction
-  traverses full error objects including axios error shapes (removing `Authorization` headers and
-  cookie values from error metadata). The admin audit middleware logs only a whitelist of safe body
-  keys — raw request bodies are never written to audit logs. All raw `console.*` calls in
-  production paths have been replaced with the Winston logger; ESLint enforces `no-console` for
-  backend code (allowing `warn`/`error` only).
+  25 fields (up from 7) including common PII, token, and credential field names. Redaction traverses
+  full error objects including axios error shapes (removing `Authorization` headers and cookie
+  values from error metadata). The admin audit middleware logs only a whitelist of safe body keys —
+  raw request bodies are never written to audit logs. All raw `console.*` calls in production paths
+  have been replaced with the Winston logger; ESLint enforces `no-console` for backend code
+  (allowing `warn`/`error` only).
 - **Metrics:** Prometheus-compatible scrape at `GET /api/monitoring/metrics` requires a
   `Bearer <MONITORING_METRICS_TOKEN>` header in production. The endpoint returns `404 Not Found` if
   `MONITORING_METRICS_TOKEN` is not configured, preventing accidental metric exposure.
@@ -6120,6 +6123,14 @@ Extra reference material that complements this README:
 - [`docs/DAISYUI-THEME.md`](docs/DAISYUI-THEME.md) — shared DaisyUI theming internals for web and
   mobile.
 - [`docs/THEME.md`](docs/THEME.md) — native token architecture for both platforms.
+- [`docs/deployment.md`](docs/deployment.md) — release runbook covering frontend, backend, and
+  mobile rollouts for coordinated multi-person deploys.
+- [`docs/security/access-controls.md`](docs/security/access-controls.md) — account provisioning and
+  least-privilege role documentation template.
+- [`mobile/env.md`](mobile/env.md) — environment matrix, API profiles (emulator/LAN/tunnel/prod),
+  and deployment checklist for the Expo app.
+- [`mobile/docs/docs/mobile/android-build-config.md`](mobile/docs/docs/mobile/android-build-config.md)
+  — native build configuration (gradle.properties, signing files, `eas.json` notes).
 - [`eslint-cheatsheet.md`](eslint-cheatsheet.md) — linting reference for contributors.
 - [`prettier-configuration-cheatSheet.md`](prettier-configuration-cheatSheet.md) — Prettier usage
   guide tailored to this repo.
