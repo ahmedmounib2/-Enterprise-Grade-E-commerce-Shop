@@ -1764,7 +1764,13 @@ Refer to [`mobile/env.md`](mobile/env.md) for the full run-mode matrix and env p
   `packages/api-client` workspace, reusing authentication flows, cart logic, and localization from
   the shared bundle.
 - **Offline-friendly UX:** Secure tokens are cached in Expo SecureStore with background refresh
-  logic so shoppers remain signed in across cold starts.
+  logic so shoppers remain signed in across cold starts. On app restart, the bootstrap layer checks
+  whether the stored access token is expired and silently refreshes it before fetching the user
+  profile. Network errors fall back to cached user data; a `401` triggers re-authentication.
+- **Proactive session heartbeat:** The app calls the refresh-token endpoint every 10 minutes and on
+  each app foreground event to keep the session alive within the 30-day sliding window. The backend
+  keep-alive endpoint accepts `Authorization: Bearer <refresh-token>` in addition to cookies, so
+  the heartbeat works in mobile runtimes where cookies may not be propagated automatically.
 - **Full shopping journey:** The app surfaces the entire catalogue, promotional sliders, cart,
   checkout, order history, profile management (including GDPR data export and account deletion), and
   transactional policy screens.
@@ -1843,7 +1849,7 @@ Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
 
 - Authentication
   - Short-lived access tokens + rotating refresh tokens stored in Redis (per-device `jti`).
-  - Sliding 30-day maximum session window (`session_start:<userId>`).
+  - Sliding 30-day session window (`session_active_since:<userId>`) — extended on every activity.
   - CSRF protection for state-changing endpoints and secure cookie configuration (`SameSite=None`,
     `Secure`, `HttpOnly`).
   - Mobile-aware keep-alive and activity detection to improve session persistence on phones.
@@ -4628,8 +4634,9 @@ In `product.controller.js` we use a single helper:
   - `access token` cookie, short-lived (e.g., 15 minutes).
   - `refresh token` cookie, long-lived (sliding, e.g., up to 30 days).
   - Server stores the refresh token value keyed by `refresh_token:<userId>:<jti>` in Redis.
-  - A `session_start:<userId>` key is set in Redis to implement a **maximum sliding lifetime**
-    (default 30 days).
+  - A `session_active_since:<userId>` key is set in Redis to track the current active session
+    window (default 30 days). Activity resets the expiry, implementing a **sliding window** rather
+    than a hard cap.
 
 - Token rotation:
   - `/api/auth/refresh-token` validates the cookie against Redis and atomically rotates to a new
@@ -4638,19 +4645,23 @@ In `product.controller.js` we use a single helper:
     (`auth.route.js`) to limit brute-force refresh attempts.
 
 - Sliding window:
-  - Each successful refresh or keep-alive `EXPIRE`s the `session_start:<userId>` key for another 30
-    days.
-  - If a user is inactive for 30 days (no refresh / keep-alive), `session_start` expires — server
-    rejects further refreshes and requires re-login.
+  - Each successful refresh or keep-alive `EXPIRE`s the `session_active_since:<userId>` key for
+    another 30 days, extending the session as long as the user stays active.
+  - If a user is inactive for 30 days (no refresh / keep-alive), `session_active_since` expires —
+    server rejects further refreshes and requires re-login.
 
 - Session invalidation:
   - **Password reset**, **`unlinkSocial`**, and **profile password change** all invalidate every
-    existing refresh token for the user (all `refresh_token:<userId>:*` keys deleted) and clear the
-    session heartbeat key before issuing new credentials. This ensures a compromised token cannot
+    existing refresh token for the user (all `refresh_token:<userId>:*` keys deleted) and clear
+    both the access-token and refresh-token cookies. The `session_active_since:<userId>` heartbeat
+    key is also removed before issuing new credentials. This ensures a compromised token cannot
     survive a password change.
-  - `keepAlive` verifies the `session_start:<userId>` Redis key exists before minting a new access
-    token; if the key has expired (inactive session), the request is rejected and the client must
-    re-authenticate.
+  - `keepAlive` verifies the `session_active_since:<userId>` Redis key exists before minting a new
+    access token; if the key has expired (inactive session), the request is rejected and the client
+    must re-authenticate.
+  - On logout, after revoking the current device's refresh token, the server checks whether any
+    other devices still hold active refresh tokens for this user. If none remain,
+    `session_active_since:<userId>` is also deleted.
 
 - Email enumeration prevention:
   - `POST /api/auth/login` returns a generic `401 Unauthorized` for both unknown email addresses and
@@ -4664,14 +4675,33 @@ In `product.controller.js` we use a single helper:
     database. Comparison at verification time also uses the hash, so a database dump cannot be used
     to verify arbitrary addresses without the original token.
 
-- Mobile friendliness:
-  - Frontend implements mobile-aware keep-alive intervals and additional activity listeners
-    (touchstart, focus) to counteract mobile background throttling.
-  - The server provides both `/auth/refresh-token` and `/auth/keep-alive` paths — keep-alive
-    refreshes cookie TTLs and can issue a fresh access token.
+- Keep-alive authentication:
+  - `GET /auth/keep-alive` does **not** require a pre-issued access token. The handler
+    self-authenticates by cryptographically verifying the refresh JWT and issuing a fresh access
+    token. Only a valid refresh token (httpOnly cookie or `Authorization: Bearer <token>` header)
+    is needed.
 
-**UX rule implemented:** sessions persist for up to 30 days of inactivity; any visit/activity
-refreshes the 30-day window.
+- Redis resilience in keep-alive:
+  - If Redis returns a network error during a `keepAlive` call, the server responds with `503
+    Service Unavailable` so clients can retry rather than logging out.
+  - If the refresh-token key is absent from Redis (cache miss) but the JWT signature is valid, the
+    handler re-stores the token in Redis (cache-heal) instead of issuing a `401`. This prevents
+    spurious logouts caused by Redis eviction or brief unavailability.
+
+- Mobile friendliness:
+  - The mobile app runs a proactive session heartbeat: every 10 minutes and on app foreground, it
+    calls the refresh-token endpoint to keep the session alive within the 30-day sliding window.
+  - `GET /auth/keep-alive` accepts both httpOnly cookie refresh tokens and `Authorization: Bearer
+    <refresh-token>` headers, so mobile clients can call it without relying on cookies.
+  - On app restart, mobile bootstrap checks whether the stored access token is expired and silently
+    refreshes it before fetching the user profile. Network errors fall back to cached user data; a
+    `401` response triggers re-authentication rather than falling back to the cache.
+  - Web frontend also implements mobile-aware keep-alive intervals and additional activity
+    listeners (touchstart, focus) to counteract background throttling on mobile browsers.
+
+**UX rule implemented:** sessions persist for the full 30-day sliding window — any activity
+(refresh, keep-alive) resets the clock. Redis resilience ensures transient cache issues never
+cause an unnecessary logout.
 
 ---
 
@@ -4735,8 +4765,15 @@ refreshes the 30-day window.
 
 ## Security & observability
 
-- Cookies: `HttpOnly`, `Secure`, `SameSite=None` (when cross-site), and domain configured to allow
-  cross-subdomain cookies for frontend + API.
+- Cookies: `HttpOnly`, `SameSite=None` (when cross-site), and domain configured to allow
+  cross-subdomain cookies for frontend + API. The `Secure` flag is computed dynamically per
+  request via `isSecureCookie(req)`: it is set when `SameSite=None`, when the request is served
+  over HTTPS (`req.secure`), or when `NODE_ENV=production`. All cookie option sets are factory
+  functions that accept the request object, ensuring correct behavior in staging and preview
+  environments served over HTTPS.
+- **Session invalidation on credential change:** password reset and `unlinkSocial` immediately
+  clear both the access-token and refresh-token cookies in addition to revoking all Redis tokens,
+  fully signing out the user on all cookie-bearing clients.
 - **CSRF:** `csrf-csrf` (double-submit cookie pattern) replaces the removed `csurf` dependency. The
   `X-Mobile-Client` CSRF bypass has been removed; all clients must go through the standard
   double-submit flow. The `/api/csrf-token` endpoint issues the CSRF cookie.
@@ -5094,9 +5131,11 @@ when both are present, the DB value always wins.
 **Authentication & cookies**
 
 ```
-ACCESS_TOKEN_EXPIRE
+ACCESS_TOKEN_EXPIRE                # JWT expiry for access tokens (optional; default: 15m)
 ACCESS_TOKEN_SECRET
-REFRESH_TOKEN_EXPIRE
+REFRESH_TOKEN_EXPIRE               # Controls JWT expiry, cookie maxAge, and Redis key TTL
+                                   # simultaneously — change only this one value to keep all
+                                   # three in sync. (optional; default: 30d)
 SESSION_SECRET
 SESSION_REDIS_PREFIX
 REFRESH_TOKEN_SECRET
@@ -5551,7 +5590,8 @@ REFRESH_TOKEN_SECRET=changeme_refresh_secret
 SESSION_SECRET=changeme_session_secret
 
 ACCESS_TOKEN_EXPIRE=15m
-REFRESH_TOKEN_EXPIRE=7d
+# Controls JWT expiry, cookie maxAge, and Redis key TTL — change only this one value.
+REFRESH_TOKEN_EXPIRE=30d
 MAX_SESSION_LIFETIME_DAYS=30
 CSRF_SECRET=changeme_csrf
 COOKIE_SECRET=changeme_cookie_secret
@@ -5832,8 +5872,8 @@ redis-cli get "session:dev:somekey"
 # Delete all dev session keys (careful!)
 redis-cli --scan --pattern "session:dev:*" | xargs -r redis-cli del
 
-# Check TTL for session_start
-TTL session_start:<userId>
+# Check TTL for the sliding-window session key
+TTL session_active_since:<userId>
 
 # Get refresh token stored server-side (debug only)
 GET refresh_token:<userId>:<jti>
