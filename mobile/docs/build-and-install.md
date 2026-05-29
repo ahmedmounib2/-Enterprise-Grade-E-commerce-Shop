@@ -125,6 +125,81 @@ unzip -l mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aa
 
 ---
 
+## Verify AAB versionCode/versionName (important for Play Console uploads)
+
+Sometimes Expo/Gradle caches old native values, causing Google Play to reject uploads with:
+
+```txt
+Version code X has already been used
+```
+
+Even if `app.config.js` was updated.
+
+### Install bundletool once
+
+```bash
+mkdir -p ~/tools
+cd ~/tools
+
+wget https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar
+```
+
+### Inspect the generated AAB
+
+```bash
+java -jar ~/tools/bundletool-all-1.17.2.jar dump manifest \
+  --bundle ~/Dev/fullstack/ecommerce-mern-website/mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab \
+  --xpath /manifest/@android:versionCode
+```
+
+Check version name too:
+
+```bash
+java -jar ~/tools/bundletool-all-1.17.2.jar dump manifest \
+  --bundle ~/Dev/fullstack/ecommerce-mern-website/mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab \
+  --xpath /manifest/@android:versionName
+```
+
+Expected example:
+
+```txt
+38
+1.38.0
+```
+
+### If the AAB still contains old values
+
+Expo native Android config is out of sync.
+
+Regenerate native Android files:
+
+```bash
+cd mobile
+
+npx expo prebuild --platform android
+```
+
+Then rebuild cleanly:
+
+```bash
+cd android
+
+./gradlew clean
+rm -rf app/build
+
+./gradlew :app:bundleProdRelease
+```
+
+Re-run the bundletool checks afterward before uploading to Play Console.
+
+### Verify generated file timestamp
+
+```bash
+ls -lah mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab
+```
+
+Always upload the freshly generated `.aab`.
+
 ## Common pitfalls & quick fixes
 
 ### 1) `INSTALL_FAILED_UPDATE_INCOMPATIBLE: ... signatures do not match`

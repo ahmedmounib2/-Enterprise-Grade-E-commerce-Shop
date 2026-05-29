@@ -112,6 +112,7 @@
       - [`GET /api/public/stores/search`](#get-apipublicstoressearch)
       - [Product payload note (`sellerSummary`)](#product-payload-note-sellersummary)
       - [Frontend integration notes](#frontend-integration-notes)
+      - [Store reviews \& rating aggregate](#store-reviews--rating-aggregate)
   - [Deployment surfaces \& release workflow](#deployment-surfaces--release-workflow)
     - [Frontend (Vercel)](#frontend-vercel)
     - [Backend (Railway Docker image)](#backend-railway-docker-image)
@@ -154,6 +155,7 @@
     - [Cron jobs added for COD payout resiliency](#cron-jobs-added-for-cod-payout-resiliency)
       - [1) COD payout reconciliation cron](#1-cod-payout-reconciliation-cron)
       - [2) COD refund details purge cron](#2-cod-refund-details-purge-cron)
+    - [Carrier shipping webhook](#carrier-shipping-webhook)
     - [Key rotation \& webhook replay procedures](#key-rotation--webhook-replay-procedures)
       - [Rotate Stripe webhook secret safely](#rotate-stripe-webhook-secret-safely)
       - [Rotate Chimoney API key safely](#rotate-chimoney-api-key-safely)
@@ -238,6 +240,22 @@
       - [8) Operational notes](#8-operational-notes)
   - [Auth \& session persistence — how it works (plain language)](#auth--session-persistence--how-it-works-plain-language)
   - [Order fulfilment, PDF export \& canceled order labeling](#order-fulfilment-pdf-export--canceled-order-labeling)
+    - [Shipment model](#shipment-model)
+    - [Carrier service abstraction](#carrier-service-abstraction)
+    - [Seller shipment management](#seller-shipment-management)
+    - [Customer order tracking timeline](#customer-order-tracking-timeline)
+    - [Carrier webhook endpoint](#carrier-webhook-endpoint)
+    - [Admin shipment visibility](#admin-shipment-visibility)
+  - [Product Reviews \& Ratings](#product-reviews--ratings)
+    - [Review model](#review-model)
+    - [Profanity filter](#profanity-filter)
+    - [Customer review endpoints](#customer-review-endpoints)
+    - [Seller review endpoint](#seller-review-endpoint)
+    - [Admin review moderation](#admin-review-moderation)
+    - [Email notification on new review](#email-notification-on-new-review)
+    - [Web \& mobile review UI](#web--mobile-review-ui)
+  - [Store Reviews](#store-reviews)
+    - [Store review routes](#store-review-routes)
   - [GDPR \& user data export](#gdpr--user-data-export)
   - [Security \& observability](#security--observability)
     - [Field-level PII encryption](#field-level-pii-encryption)
@@ -1712,6 +1730,18 @@ render public seller identity consistently without an additional lookup in commo
   - `response.data.meta.total` for total count
 - This replaces legacy key paths such as `stores`, `results`, or `count`.
 
+#### Store reviews & rating aggregate
+
+```
+GET /api/stores/:slug/reviews           — public; published store reviews; paginated; sortable.
+GET /api/stores/:slug/rating-aggregate  — public; average rating, total count, and 1–5 star
+                                          distribution for the store.
+```
+
+The `StorefrontPage.jsx` component renders the rating aggregate badge and review list inline.
+Eligibility: the authenticated user must have at least one `delivered` order from the store. One
+review per customer per store. See [Store Reviews](#store-reviews) for the full model spec.
+
 ---
 
 ## Deployment surfaces & release workflow
@@ -1735,8 +1765,10 @@ render public seller identity consistently without an additional lookup in commo
 
 ### Backend (Railway Docker image)
 
-- Railway deploys the API using the root [`Dockerfile`](Dockerfile). It installs only the backend
-  workspace and runs `backend/src/server.js` in production mode.
+- Railway deploys the API using the root [`Dockerfile`](Dockerfile). It installs the backend
+  workspace **and** the `shared/` workspace (required for `@eshop/locales` and
+  `shared/profanity/profanityFilter.js` with its `bad-words` dependency), then runs
+  `backend/src/server.js` in production mode.
 - Useful commands:
 
   ```bash
@@ -1828,6 +1860,21 @@ Refer to [`mobile/env.md`](mobile/env.md) for the full run-mode matrix and env p
 - **Full shopping journey:** The app surfaces the entire catalogue, promotional sliders, cart,
   checkout, order history, profile management (including GDPR data export and account deletion), and
   transactional policy screens.
+- **Return request (mobile parity):** `ReturnRequestModal` (`mobile/src/components/`) provides the
+  full return form on mobile: reason picker, notes textarea, evidence photo upload
+  (expo-image-picker), and COD bank fields rendered conditionally on payment method. Uses
+  `useReturnRequestForm`, `useReturnReasons`, and `useCodRefundConfig` hooks. Wired into
+  `OrderHistoryPage.js` via the "Request Refund" button in `OrderDetailsModal`. Posts FormData to
+  the same backend endpoint as web.
+- **StorefrontScreen:** `mobile/src/screens/StorefrontScreen.js` (deep-link route `stores/:slug`)
+  shows the store banner, logo, name, description, rating aggregate, top-level category cards with
+  breadcrumb drill-down, store-scoped search bar, a 2-column product grid (FlatList), About section,
+  and a Policies modal. Registered in `AppNavigator.js`.
+- **Storefront link on ProductScreen:** `ProductScreen.js` shows the store logo and name below the
+  product title as a touchable that navigates to `StorefrontScreen` with the store slug.
+- **Radial gradient background:** `ThemeRadialBackground` is applied as a full-screen overlay in
+  `AppNavigator.js`, providing the emerald gradient that matches the web frontend across all
+  screens.
 - **Deep-link aware navigation:** Any email CTA (reset password, mailing confirmation, OAuth
   completion) can launch straight into the appropriate native screen thanks to the linking config
   described above.
@@ -1923,6 +1970,14 @@ Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
 
 - Order listing, status changes, PDF export for fulfilment/labeling, canceled order labeling and
   audit trails.
+- **Carrier shipping integration** — dedicated Shipment model (separate from Order), provider
+  adapter pattern (disabled/manual/Aramex), seller shipment creation UI with label generation,
+  visual customer tracking timeline (`OrderShipmentTimeline`), carrier webhook hub with HMAC
+  verification, and admin shipment visibility panel.
+- **Product & store reviews** — purchase-gated review submission (one per order line), 1–5 star
+  rating with aggregate denormalization on Product and Store, automated profanity/link filter
+  (shared across web, mobile, and backend), admin moderation panel (flag/reinstate/hide), seller
+  review inbox, and email notification to seller on publish.
 - **Fully responsive Admin Dashboard** — manage orders, add products, edit variants, and run the
   store from a **phone or tablet** (mobile-friendly layouts and inputs).
 - Privacy & Compliance
@@ -2652,6 +2707,20 @@ CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}
   1. Seed order with `codRefund.detailsEncrypted` set and expired `detailsExpiresAt`.
   2. Run purge job.
   3. Verify encrypted payload is null and status marked expired while summaries remain.
+
+### Carrier shipping webhook
+
+`POST /api/webhooks/shipping/:provider` is the generic carrier webhook hub. Each supported carrier
+posts status updates here. Security:
+
+- HMAC-SHA256 signature verification using `ARAMEX_WEBHOOK_SECRET` (or the provider-specific secret
+  variable).
+- Idempotent deduplication by `(trackingNumber, carrierStatusRaw, eventTimestamp)` with a 24-hour
+  Redis TTL — duplicate deliveries are silently ignored.
+- Automatically transitions `Order.status` to `delivered` when the carrier confirms delivery.
+
+To rotate the Aramex webhook secret, update `ARAMEX_WEBHOOK_SECRET` and re-register the endpoint URL
+in the Aramex developer console at `https://<your-backend-domain>/api/webhooks/shipping/aramex`.
 
 ### Key rotation & webhook replay procedures
 
@@ -4766,6 +4835,199 @@ an unnecessary logout.
 - PDF export utility is implemented server-side (PDF generation libraries) and exposed to the admin
   for download/printing.
 
+### Shipment model
+
+The dedicated `Shipment` model (`backend/src/models/shipment.model.js`) is stored separately from
+the `Order` document, supporting multi-store orders where each store ships independently.
+
+```
+Fields
+  orderId          — reference to the parent Order
+  storeId          — the store fulfilling this shipment
+  sellerId         — owning seller
+  itemIndexes      — which order line items are covered
+  carrier          — carrier name (e.g. "aramex", "manual")
+  carrierService   — service level (e.g. "express", "ground")
+  trackingNumber   — carrier-issued tracking number
+  trackingUrl      — public carrier tracking page URL
+  labelUrl         — pre-signed label download URL (server-side only; stripped from customer API)
+  labelExpiresAt   — label link TTL
+  shipmentStatus   — enum: created → label_printed → picked_up → in_transit →
+                     out_for_delivery → delivered → returned → exception → cancelled
+  carrierStatusRaw — raw carrier status string for debugging
+  source           — "manual" (seller-entered) or "api" (carrier-generated)
+  shippedAt        — timestamp of first shipment (also stamped on Order.shippedAt)
+  deliveredAt      — confirmed delivery timestamp
+  lastSyncedAt     — last carrier webhook sync
+  providerMetadata — carrier-specific response data (arbitrary JSON)
+  events[]         — append-only timeline of carrier status events
+  createdBy        — user who created the shipment record
+```
+
+Creating the first shipment on an order transitions the order from `processing` → `dispatched` and
+stamps `Order.shippedAt`.
+
+### Carrier service abstraction
+
+The shipping layer follows the same adapter-map pattern as COD payouts
+(`backend/src/services/shipping/`):
+
+- `index.js` — dispatcher: resolves the active provider from `SHIPPING_PROVIDER` and delegates to
+  the matching adapter.
+- `providers/index.js` — adapter map keyed by provider name.
+- `providers/manual.adapter.js` — accepts caller-supplied tracking number; no external API call.
+- `providers/aramex.adapter.js` — Aramex Shipping API integration (sandbox: create shipment, track
+  shipment, status mapping).
+- `providers/disabled.adapter.js` — returns a safe `{ ok: false }` no-op without throwing; default
+  for local development.
+
+Adapters share a normalized result shape, idempotency keys, and retry-with-backoff. Set
+`SHIPPING_PROVIDER=disabled` for local development, `manual` for operator-entered tracking, or
+`aramex` for full carrier API integration.
+
+### Seller shipment management
+
+- `POST /seller/orders/:id/shipments` — create a shipment. Sellers can enter a tracking number +
+  carrier manually, or trigger label generation via the carrier API using the "Generate Label"
+  button in the `ShipmentForm` component (`frontend/src/components/SellerOrdersPanel.jsx`).
+- `GET /seller/orders/:id/shipments` — list all shipments on an order.
+- Zustand store actions: `fetchShipments`, `createShipmentManual`, `createShipmentApi` (with
+  optimistic update and rollback on error).
+
+### Customer order tracking timeline
+
+- `GET /api/orders/:id/shipments` — owner-only; returns shipment data without `labelUrl`.
+- `OrderShipmentTimeline` component (`frontend/src/components/OrderShipmentTimeline.jsx`) replaces
+  the text-only order status with a visual horizontal stepper:
+  `processing → shipped → in_transit → out_for_delivery → delivered`.
+- Supports multiple shipments per order (multi-store orders).
+- Shows "Track on carrier site" link when `trackingUrl` is present.
+- i18n keys: `orderModal.shipment.*` across all 4 locales.
+
+### Carrier webhook endpoint
+
+- `POST /api/webhooks/shipping/:provider` — generic webhook hub for incoming carrier status updates.
+- HMAC signature verification mirrors the Chimoney webhook pattern.
+- Idempotent deduplication by `(trackingNumber, carrierStatusRaw, eventTimestamp)`.
+- Auto-transitions `Order.status` to `delivered` when the carrier confirms delivery.
+
+### Admin shipment visibility
+
+- `GET /api/admin/shipments` — paginated list with filters (status, storeId, carrier, date range).
+- `OrderTab.jsx` (`frontend/src/pages/AdminPage.jsx`) shows a shipment badge and an expander row per
+  order line.
+
+---
+
+## Product Reviews & Ratings
+
+### Review model
+
+The `Review` model (`backend/src/models/review.model.js`) stores customer feedback with the
+following fields:
+
+```
+productId    — reviewed product
+storeId      — store that sold the product
+sellerId     — seller being reviewed
+customerId   — reviewer
+orderId      — purchase that gates eligibility
+rating       — 1–5 integer
+comment      — up to 1 000 characters
+status       — published | flagged | hidden
+flagReason   — reason set by automated filter or admin
+hiddenBy     — admin who hid the review
+hiddenAt     — hide timestamp
+editedAt     — last edit timestamp
+```
+
+Compound unique index `{ customerId, productId, orderId }` enforces one review per purchase. Repeat
+purchases earn separate reviews.
+
+A denormalized `ratingAggregate` object (average, count, distribution 1–5) is stored on the
+`Product` document and recomputed whenever a review's status changes.
+
+### Profanity filter
+
+`shared/profanity/profanityFilter.js` is a shared utility consumed by both the backend and the
+mobile/web frontends.
+
+- Detects profanity via `bad-words` with a custom multi-language blocklist covering Arabic, Arabic
+  romanisation, Spanish, and French, plus ethnic slurs.
+- Also rejects links, email addresses, and phone numbers embedded in review text.
+- **Client side:** blocks form submission with a toast error before the request is sent.
+- **Server side:** publishes the review immediately if clean; sets `status=flagged` if dirty (no
+  manual approval queue for every review — only flagged ones require admin attention).
+
+### Customer review endpoints
+
+```
+POST /api/reviews                       — create a review; verifies purchase, runs profanity
+                                          check, publishes or flags.
+GET  /api/products/:id/reviews          — public; published reviews only; paginated; sortable
+                                          (newest / highest / lowest).
+GET  /api/products/:id/rating-aggregate — public; average, count, and 1–5 distribution.
+GET  /api/reviews/eligibility           — authenticated; returns whether the user may review a
+                                          product (has a qualifying delivered order).
+```
+
+### Seller review endpoint
+
+```
+GET /api/seller/reviews   — seller-scoped; all statuses; paginated.
+                            Sellers see all reviews on their products regardless of status.
+```
+
+### Admin review moderation
+
+```
+GET /api/admin/reviews?status=flagged    — list flagged reviews.
+PUT /api/admin/reviews/:id               — reinstate (flagged → published) or hide
+                                           (published → hidden); triggers rating aggregate
+                                           recomputation.
+```
+
+The `AdminReviewsPanel` component (`frontend/src/pages/AdminPage.jsx`) provides a filter bar, table
+with inline reinstate/hide actions, and pagination. A "Reviews" tab has been added to the Admin
+Dashboard.
+
+i18n keys: `admin.reviews.*` across all 4 locales.
+
+### Email notification on new review
+
+`sendNewReviewToSellerEmail()` in `backend/src/lib/email.js` fires when a review is published (not
+when it is flagged). The email includes the product name, rating, comment excerpt, and a direct link
+to the seller dashboard reviews view.
+
+### Web & mobile review UI
+
+- **Web:** `RatingAggregate`, `ReviewList`, and `ReviewForm` components are embedded in
+  `ProductPage.jsx`. The submission form is gated by eligibility and runs the profanity check before
+  sending the request.
+- **Mobile:** equivalent inline review UI on `ProductScreen.js`.
+- i18n keys: `reviews.*` across all 4 locales.
+
+---
+
+## Store Reviews
+
+The `Review` model uses a `target` discriminator (`product` | `store`) to support store-level
+reviews alongside product reviews.
+
+### Store review routes
+
+```
+GET /api/stores/:slug/reviews           — public; published store reviews; paginated.
+GET /api/stores/:slug/rating-aggregate  — public; average, count, and 1–5 distribution.
+```
+
+**Eligibility:** a customer must have at least one `delivered` order from the store (no `orderId` in
+the unique key — one review per customer per store).
+
+A denormalized `ratingAggregate` is also stored on the `Store` model and updated on status changes.
+
+The customer-facing review UI is embedded in `StorefrontPage.jsx`.
+
 ---
 
 ## GDPR & user data export
@@ -5257,6 +5519,29 @@ KYC_DOCUMENT_RETENTION_DAYS        # days before archived seller documents are h
                                    # by the purge script (default: 2555 = 7 years)
 USER_DELETION_RETENTION_DAYS       # days before soft-deleted users are hard-deleted
                                    # by the purge script (default: 30)
+```
+
+**Shipping / Carrier**
+
+```
+SHIPPING_PROVIDER                  # Active carrier adapter: 'disabled' | 'manual' | 'aramex'
+                                   # 'disabled' (default) returns { ok: false } without throwing
+                                   # — safe for local dev. 'manual' accepts caller-supplied
+                                   # tracking numbers. 'aramex' calls the Aramex Shipping API.
+                                   # REQUIRED IN PRODUCTION (set to 'manual' or 'aramex')
+
+# Aramex credentials — required when SHIPPING_PROVIDER=aramex
+ARAMEX_USERNAME                    # Aramex account username
+ARAMEX_PASSWORD                    # Aramex account password
+ARAMEX_ACCOUNT_NUMBER              # Aramex account number
+ARAMEX_ACCOUNT_PIN                 # Aramex account PIN
+ARAMEX_ACCOUNT_ENTITY              # Aramex entity code
+ARAMEX_ACCOUNT_COUNTRY_CODE        # ISO 3166-1 alpha-2 country code for the Aramex account
+ARAMEX_BASE_URL                    # Aramex API base URL
+                                   # Sandbox: https://ws.dev.aramex.net
+                                   # Production: https://ws.aramex.net
+ARAMEX_WEBHOOK_SECRET              # HMAC secret for validating incoming Aramex webhook callbacks
+                                   # REQUIRED IN PRODUCTION when SHIPPING_PROVIDER=aramex
 ```
 
 **Payment provider + COD refund/payout policy**

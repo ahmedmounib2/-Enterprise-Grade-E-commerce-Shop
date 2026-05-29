@@ -237,6 +237,9 @@ Any UI change must support all existing themes (including light/dark/night) in t
 - Validate themed states for changed components/screens.
 - If a component cannot be made theme-compliant within scope, pause and request explicit approval
   before merging.
+- Every new component or screen must use only existing theme tokens / CSS variables / DaisyUI
+  classes for colors, backgrounds, borders, and shadows. Verify the component renders correctly in
+  both light and dark mode before committing.
 
 ## 6. Localization (i18n) Requirements
 
