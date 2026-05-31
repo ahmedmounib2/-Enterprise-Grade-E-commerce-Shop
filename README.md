@@ -61,6 +61,13 @@
       - [Admin review workflow (store profile + policy updates)](#admin-review-workflow-store-profile--policy-updates)
       - [Storefront policy rendering (public store page + checkout)](#storefront-policy-rendering-public-store-page--checkout)
       - [Pause store (Hide All) behavior](#pause-store-hide-all-behavior)
+    - [Seller store closure lifecycle](#seller-store-closure-lifecycle)
+      - [Phase 1 — Eligibility check \& closure request](#phase-1--eligibility-check--closure-request)
+      - [Phase 2 — Immediate deactivation (soft close)](#phase-2--immediate-deactivation-soft-close)
+      - [Phase 3 — Waiting period \& permanent deletion (finalizer job)](#phase-3--waiting-period--permanent-deletion-finalizer-job)
+      - [Admin override](#admin-override)
+      - [Closure email notifications](#closure-email-notifications)
+      - [i18n](#i18n)
     - [Seller product creation \& admin moderation (end-to-end)](#seller-product-creation--admin-moderation-end-to-end)
       - [Flow overview (from seller draft to storefront)](#flow-overview-from-seller-draft-to-storefront)
       - [Product creation + moderation pipeline flowchart](#product-creation--moderation-pipeline-flowchart)
@@ -155,6 +162,7 @@
     - [Cron jobs added for COD payout resiliency](#cron-jobs-added-for-cod-payout-resiliency)
       - [1) COD payout reconciliation cron](#1-cod-payout-reconciliation-cron)
       - [2) COD refund details purge cron](#2-cod-refund-details-purge-cron)
+      - [3) Dispute SLA escalation cron](#3-dispute-sla-escalation-cron)
     - [Carrier shipping webhook](#carrier-shipping-webhook)
     - [Key rotation \& webhook replay procedures](#key-rotation--webhook-replay-procedures)
       - [Rotate Stripe webhook secret safely](#rotate-stripe-webhook-secret-safely)
@@ -256,6 +264,16 @@
     - [Web \& mobile review UI](#web--mobile-review-ui)
   - [Store Reviews](#store-reviews)
     - [Store review routes](#store-review-routes)
+  - [Dispute Resolution](#dispute-resolution)
+    - [Dispute model](#dispute-model)
+    - [Customer dispute flow](#customer-dispute-flow)
+    - [Seller dispute endpoints](#seller-dispute-endpoints)
+    - [Admin dispute management](#admin-dispute-management)
+    - [SLA enforcement](#sla-enforcement)
+    - [Stripe chargeback integration](#stripe-chargeback-integration)
+    - [Evidence upload](#evidence-upload)
+    - [Email notifications (disputes)](#email-notifications-disputes)
+    - [i18n keys (disputes)](#i18n-keys-disputes)
   - [GDPR \& user data export](#gdpr--user-data-export)
   - [Security \& observability](#security--observability)
     - [Field-level PII encryption](#field-level-pii-encryption)
@@ -418,6 +436,14 @@ until you are ready to launch in production, then flip it to `true` in `.env.pro
   - `FEATURE_MULTI_SELLER=true`
   - `FEATURE_SELLER_KYC=true`
   - `FEATURE_SELLER_ORDERS=true`
+  - `FEATURE_SELLER_CLOSURE_V1=true` — enables the seller-initiated store closure flow (eligibility
+    check, closure request, pending-closure UI, and the finalizer cron job). When unset or `false`,
+    all `/api/seller/close-store/*` and `/api/admin/sellers/:id/close-store` routes are inaccessible
+    and the dashboard panel is hidden.
+  - `FEATURE_DISPUTES_V1=true` — enables the full dispute-resolution surface: all
+    `/api/disputes/*`, `/api/seller/disputes/*`, and `/api/admin/disputes/*` routes, the SLA
+    escalation cron, and all dispute-related panels on web and mobile. When unset or `false`, dispute
+    routes are inaccessible and all dispute UI is hidden.
 - **Silent-off behaviour:** when `FEATURE_MULTI_SELLER` is unset (or any value other than `"true"`),
   the entire seller marketplace surface is silently disabled — `/api/seller/*`, `/api/sellers/*`,
   `/api/stores/*`, and `/api/public/stores/*` routes all return 404 or are never registered. A fresh
@@ -517,8 +543,12 @@ flowchart TD
 - **Seller** is the primary identity for onboarding. Key fields include:
   - `ownerUserId` (ownership linkage to the user)
   - `businessName` / `slug`
-  - `status` (`active` / `inactive`)
+  - `status` (`active` / `inactive` / `suspended`)
   - `kyc.status` (`draft`, `pending`, `verified`, `rejected`, `action_required`)
+  - `closure` — nested object tracking the store closure lifecycle; includes `status` (`active` /
+    `pending_closure` / `closed_archived`), `initiatedAt`, `scheduledFor`, `actor` (`self` /
+    `admin`), `actorUserId`, `reason`, `closedAt`, `adminOverride`, and `notificationEmail`.
+    Compound index on `{ 'closure.status': 1, 'closure.scheduledFor': 1 }`.
   - `application` (normalized KYC + business data payload)
   - `application.banking` (encrypted with `SELLER_DATA_SECRET` to minimize exposure at rest)
 - **Store** represents the customer-facing storefront and is **created only after approval**. Store
@@ -652,7 +682,8 @@ readiness, and payout setup stay aligned:
 
 Sellers in `draft`, `pending`, `action_required`, or `rejected` KYC states may withdraw their
 application via the `/withdraw` endpoint. Verified sellers (`kyc.status === 'verified'`) receive
-`422` and must use a dedicated "close account" flow instead.
+`422` and must use the dedicated store closure flow instead (see
+[Seller store closure lifecycle](#seller-store-closure-lifecycle)).
 
 Withdrawal does **not** hard-delete documents. The controller sets `lifecycleStatus='archived'`,
 `archiveReason='withdrawn'`, and `supersededAt=now` on seller documents. All document queries filter
@@ -667,7 +698,8 @@ control the window (default `2555`, equivalent to 7 years).
 **`SellerLifecycleAudit`** (`backend/src/models/sellerLifecycleAudit.model.js`) — append-only record
 of every admin decision in the seller lifecycle. Covered actions include: KYC
 verify/reject/action_required, bank-update approve/reject, store review, payout-hold toggle,
-reserve-tier change, and store-status change. Each record captures actor, action, `fromStatus`,
+reserve-tier change, store-status change, and store closure lifecycle events (`closure_initiated`,
+`closure_cancelled`, `closure_finalized`). Each record captures actor, action, `fromStatus`,
 `toStatus`, notes, a data snapshot, and the actor's IP address.
 
 **`SellerProfileAccessAudit`** (`backend/src/models/sellerProfileAccessAudit.model.js`) —
@@ -971,6 +1003,103 @@ the store, the payout hold is released. Seller self-pause does **not** affect `p
 **In-flight checkout contract:** Pausing a store hides products from new carts and prevents new
 checkout sessions from including that store’s items. It does **not** cancel in-flight checkout
 sessions that were already initiated before the pause.
+
+### Seller store closure lifecycle
+
+A verified seller can permanently close their store while keeping their user account active for
+shopping. Store closure is distinct from user account deletion: deletion removes the user and all
+linked seller data in one transaction; store closure closes only the seller/store while the user
+account continues to function. See also [GDPR & user data export](#gdpr--user-data-export).
+
+The feature is gated by `FEATURE_SELLER_CLOSURE_V1`.
+
+#### Phase 1 — Eligibility check & closure request
+
+- `GET /api/seller/close-store/eligibility` — evaluates whether the seller can initiate closure.
+  Checks: active product listings, recent orders within the waiting period, pending payouts, open
+  refund requests, and open disputes. Returns `{ eligible, reasons, earliestClosureAt }`.
+- `POST /api/seller/close-store` — validates the store slug confirmation and acknowledgement, then
+  calls the closure service. Requires `FEATURE_SELLER_CLOSURE_V1` to be enabled.
+- `GET /api/seller/close-store/status` — returns the current closure state for the seller's store.
+- **Seller dashboard UI:** "Close Store" panel in the Account Management section, containing an
+  eligibility checklist, a typed-slug confirmation input, and an optional reason field. A
+  pending-closure banner is displayed at the top of the seller dashboard while `closure.status` is
+  `pending_closure`.
+- **Waiting period:** `SELLER_CLOSURE_WAITING_DAYS` (default `90`) controls how many days of recent
+  order history must be clear before closure is permitted.
+
+#### Phase 2 — Immediate deactivation (soft close)
+
+On `POST /api/seller/close-store`, the `initiateStoreClosure` service executes a single MongoDB
+transaction that:
+
+1. Sets `closure.status = 'pending_closure'` and `seller.status = 'suspended'`.
+2. Hides all storefronts and products (`pausedByStore: true`).
+3. Enables a payout hold (`payoutHoldReason: 'store_closure_pending'`).
+4. Triggers a final settlement reconciliation pass.
+5. Writes a `SellerLifecycleAudit` row with action `closure_initiated`.
+
+**`blockIfPendingClosure` middleware** (`backend/src/middleware/seller.middleware.js`) returns
+`423 Locked` on all mutating seller routes (products, orders, subscriptions, store settings, payment
+methods) while closure is pending. Read-only `GET` requests remain allowed.
+
+**Cancel closure:** `POST /api/seller/close-store/cancel` reverses all Phase 2 effects. Self-serve
+cancel is allowed only outside a 24-hour pre-deletion lockout window; admin can cancel at any time
+via `POST /api/admin/sellers/:id/closure/cancel`.
+
+#### Phase 3 — Waiting period & permanent deletion (finalizer job)
+
+After `closure.scheduledFor` has passed, the daily `sellerClosureFinalizer` cron job
+(`backend/src/jobs/sellerClosureFinalizer.job.js`) processes each qualifying seller:
+
+1. **Safety re-check** — re-verifies no new orders or disputes arrived during the waiting period.
+2. **PII anonymization** — scrubs seller application fields, Store name, logo, and banner.
+3. **Product handling** — hard-deletes products that appear in no orders; tombstones products that
+   appear in any Order so order history remains resolvable against the anonymized Store record.
+4. **Referential integrity** — Orders retain their `sellerId` / `storeId` references and resolve to
+   the anonymized Store; financial and order records are preserved as required by law.
+5. **Audit** — writes a `SellerLifecycleAudit` row with action `closure_finalized`.
+6. **Email** — sends `sendStoreClosureCompletedEmail` to the pre-anonymization `notificationEmail`.
+
+**Cron schedule:** runs at `02:00 UTC` by default. Override with `SELLER_CLOSURE_FINALIZER_CRON`.
+Disable with `SELLER_CLOSURE_FINALIZER_ENABLED=false`. Job health is tracked via
+`jobHealth.model.js`.
+
+**Env vars:**
+
+```
+SELLER_CLOSURE_WAITING_DAYS          # waiting period before Phase 3 (default: 90 days)
+SELLER_CLOSURE_FINALIZER_CRON        # cron expression for the finalizer job (default: "0 2 * * *")
+SELLER_CLOSURE_FINALIZER_ENABLED     # set to "false" to disable automatic finalizer (default: true)
+```
+
+#### Admin override
+
+- `POST /api/admin/sellers/:id/close-store` — force-close a seller store. Accepts an optional
+  `skipEligibility: true` flag to bypass all eligibility checks. Sends the same
+  `sendStoreClosureInitiatedEmail` as self-serve closure.
+- `POST /api/admin/sellers/:id/closure/cancel` — cancel a pending closure without the 24-hour
+  self-serve lockout restriction.
+- `GET /api/admin/sellers/:id/closure` — retrieve full closure state for admin review.
+- **Admin UI:** "Close store" button in the admin Approved Sellers list, with a reason text input
+  and a force-close toggle that sets `skipEligibility`.
+
+#### Closure email notifications
+
+Three transactional emails are sent during the closure lifecycle (all implemented in
+`backend/src/lib/email.js`):
+
+| Function                         | Trigger                           | Recipient                             |
+| -------------------------------- | --------------------------------- | ------------------------------------- |
+| `sendStoreClosureInitiatedEmail` | Closure initiated (self or admin) | Seller email                          |
+| `sendStoreClosureCancelledEmail` | Closure cancelled (self or admin) | Seller email                          |
+| `sendStoreClosureCompletedEmail` | Phase 3 finalization complete     | Pre-anonymization `notificationEmail` |
+
+#### i18n
+
+24 new translation keys under the `seller.closure.*` namespace were added across all 4 locales
+(`en`, `es`, `fr`, `ar`) in `shared/locales/`. Key groups include eligibility messages, dashboard
+panel labels, confirmation dialog text, and pending-closure banner copy.
 
 ### Seller product creation & admin moderation (end-to-end)
 
@@ -1978,6 +2107,11 @@ Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
   rating with aggregate denormalization on Product and Store, automated profanity/link filter
   (shared across web, mobile, and backend), admin moderation panel (flag/reinstate/hide), seller
   review inbox, and email notification to seller on publish.
+- **Dispute resolution** — post-fulfilment dispute lifecycle (7 state machine statuses), append-only
+  message threads with evidence upload (Cloudinary), seller resolution offers (accept/reject), admin
+  escalation with resolve/close controls, canned response templates, dispute metrics KPIs, 72-hour
+  SLA enforcement cron, and Stripe chargeback webhook integration (`charge.dispute.created/closed`).
+  Gated by `FEATURE_DISPUTES_V1`. Full customer, seller, and admin panels on web and mobile.
 - **Fully responsive Admin Dashboard** — manage orders, add products, edit variants, and run the
   store from a **phone or tablet** (mobile-friendly layouts and inputs).
 - Privacy & Compliance
@@ -2093,6 +2227,20 @@ The webhook handler validates Stripe signatures and supports multiple events:
     - Restores reserved stock for full refunds.
   - On `failed`: marks the refund record `failed` and updates order status; no ledger entries are
     written.
+
+- **`charge.dispute.created`**
+  - Fired by Stripe when a cardholder raises a chargeback on a charge.
+  - Looks up the order by `charge.metadata.orderId` (or by payment intent).
+  - If a platform dispute already exists for that order, attaches `chargeback.provider: 'stripe'`
+    and stores the Stripe dispute ID and amount.
+  - If no platform dispute exists, creates one automatically with `issueType: 'other'` and status
+    `open`, linking it to the order, customer, seller, and store.
+
+- **`charge.dispute.closed`**
+  - Fired by Stripe when a chargeback is resolved.
+  - Maps Stripe outcome to platform resolution: `won` → `no_refund`; `lost` → `refund_full`.
+  - Updates `dispute.chargeback.outcome` and transitions dispute status to `resolved` (if not
+    already closed by admin).
 
 > All webhook processing logs heavily and attempts safe recovery. Non-critical failures (e.g.,
 > email) are logged but don't crash the handler.
@@ -2707,6 +2855,25 @@ CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}
   1. Seed order with `codRefund.detailsEncrypted` set and expired `detailsExpiresAt`.
   2. Run purge job.
   3. Verify encrypted payload is null and status marked expired while summaries remain.
+
+#### 3) Dispute SLA escalation cron
+
+- **File:** `backend/src/jobs/disputeSlaEscalation.job.js`
+- **Scheduler env vars**
+  - `DISPUTE_SLA_ESCALATION_ENABLED` — set to `"false"` to disable (default: `"true"`)
+  - `DISPUTE_SLA_ESCALATION_CRON` — cron expression (default: `"0 8 * * *"` — 08:00 UTC daily)
+- **Purpose**
+  - Finds all non-terminal disputes (`status` not in `resolved`, `closed`, `withdrawn`) where
+    `slaDueAt <= now`.
+  - Appends a system admin message to each flagged dispute thread.
+  - Sends `sendDisputeSlaEscalationEmail` to the admin recipient list once per dispute (guarded by
+    `slaEscalationEmailedAt` to prevent duplicate emails on re-runs).
+- **SLA window:** 72 hours from dispute creation (`slaDueAt = createdAt + 72h`).
+- **How to test**
+  1. Create a dispute and backdate `slaDueAt` to a past timestamp.
+  2. Run the job manually (or set a frequent `DISPUTE_SLA_ESCALATION_CRON` in dev).
+  3. Verify a system message is appended and the escalation email is queued.
+  4. Confirm re-runs do not send a second email (check `slaEscalationEmailedAt` is set).
 
 ### Carrier shipping webhook
 
@@ -4366,10 +4533,10 @@ This section captures the payout resiliency behavior and how to operate it safel
 
 ##### Distributed Redis locks (non-scheduler cron jobs)
 
-Four non-scheduler cron jobs — settlement reconciliation, payout retry, COD payout reconciliation,
-and subscription renewal — now each acquire a Redis distributed lock before executing. This prevents
-duplicate runs across multiple app replicas. Lock keys and TTLs are documented in
-[`docs/settlements-runbook.md`](docs/settlements-runbook.md).
+Five non-scheduler cron jobs — settlement reconciliation, payout retry, COD payout reconciliation,
+subscription renewal, and the seller closure finalizer — now each acquire a Redis distributed lock
+before executing. This prevents duplicate runs across multiple app replicas. Lock keys and TTLs are
+documented in [`docs/settlements-runbook.md`](docs/settlements-runbook.md).
 
 Each job wraps its callback with `wrapCronCallback`, which catches and logs unhandled rejections
 from within the cron body so a single-job failure cannot crash the Node process.
@@ -4412,6 +4579,7 @@ vars.
 | `PAYOUT_RETRY_RUN_ON_BOOT`                        | Run payout retry job once immediately on server start.                           | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
 | `COD_PAYOUT_RECONCILIATION_RUN_ON_BOOT`           | Run COD payout reconciliation job once immediately on server start.              | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
 | `SUBSCRIPTION_RENEWAL_RUN_ON_BOOT`                | Run subscription renewal job once immediately on server start.                   | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
+| `SELLER_CLOSURE_FINALIZER_RUN_ON_BOOT`            | Run seller closure finalizer job once immediately on server start.               | Boolean-like (`true/false`). Default `false`.                                             | See `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT` notes.                                                                           |
 
 #### 3) Recommended value profiles
 
@@ -5030,6 +5198,190 @@ The customer-facing review UI is embedded in `StorefrontPage.jsx`.
 
 ---
 
+## Dispute Resolution
+
+All dispute functionality is gated by `FEATURE_DISPUTES_V1=true`.
+
+### Dispute model
+
+`backend/src/models/dispute.model.js` is the canonical document for every buyer–seller dispute.
+
+```
+Fields
+  orderId             — parent order
+  productId           — disputed product (optional; for item-level disputes)
+  storeId / sellerId  — owning store and seller
+  customerId          — buyer who opened the dispute
+  issueType           — enum: item_not_received | item_not_as_described | item_damaged |
+                         wrong_item | refund_not_received | other
+  description         — up to 2 000 characters
+  evidence[]          — array of { url, mimeType } uploaded at creation
+  status              — 7-value state machine:
+                         open → under_review → awaiting_seller_reply →
+                         awaiting_buyer_reply → resolved | closed | withdrawn
+  messages[]          — append-only thread; each entry has:
+                         authorRole (customer | seller | admin | system),
+                         authorUserId, body (up to 2 000 chars),
+                         attachments[] { url, mimeType }
+  resolution          — { decision, notes, refundOrderId, resolvedBy, resolvedAt }
+  resolutionOffer     — seller/admin proposal: { offerType, amount, notes, status,
+                         offeredBy, offeredAt, respondedAt }
+                         offerType: refund_full | refund_partial | no_refund |
+                                    replacement | other
+                         status:    pending | accepted | rejected
+  chargeback          — { provider: 'stripe', stripeDisputeId, amount, outcome }
+  slaDueAt            — createdAt + 72 hours; used by the SLA escalation cron
+  slaEscalationEmailedAt — guards against duplicate escalation emails
+```
+
+Compound indexes: `{ status, slaDueAt }`, `{ customerId }`, `{ sellerId }`.
+
+`DisputeTemplate` model (`backend/src/models/disputeTemplate.model.js`) stores admin canned
+responses with `title`, `body`, and `category` fields, managed via the template CRUD API.
+
+### Customer dispute flow
+
+**Eligibility:** a dispute may be opened on orders with status `delivered`, `dispatched`,
+`refund_rejected`, or `refunded`. The endpoint rejects duplicate open disputes on the same order.
+
+**Customer endpoints:**
+
+```
+POST /api/disputes                    — create a dispute; ownership check, duplicate prevention,
+                                        optional evidence upload (multer + Cloudinary).
+GET  /api/disputes                    — list own disputes; paginated.
+GET  /api/disputes/:id                — view own dispute including full message thread.
+POST /api/disputes/:id/messages       — append a message with optional evidence upload.
+POST /api/disputes/:id/respond-offer  — accept or reject a seller resolution offer.
+```
+
+**Web UI:**
+
+- `OrderDetailsModal` shows an **Open dispute** button only on eligible order statuses and hides it
+  when an active dispute already exists.
+- Dispute creation form, dispute list page (`/profile/disputes`), and dispute detail page with the
+  full message thread, reply form with file upload, and a resolution offer accept/reject card.
+
+**Mobile UI:**
+
+- `OrderHistoryPage` shows an equivalent **Open dispute** CTA on eligible orders.
+- `DisputeForm`, `DisputeListScreen`, `DisputeDetailScreen` with evidence upload and a full-screen
+  image viewer for attachments.
+
+**i18n keys:** `disputes.form.*`, `disputes.detail.*`, `disputes.list.*`, `disputes.issueTypes.*`,
+`disputes.statuses.*`, `disputes.offer.*`, `orderModal.openDispute`, `profilePage.myDisputes`
+across all 4 locales.
+
+### Seller dispute endpoints
+
+```
+GET  /api/seller/disputes             — list disputes against own store; paginated.
+GET  /api/seller/disputes/:id         — view single dispute (ownership enforced).
+POST /api/seller/disputes/:id/messages — reply with optional evidence upload.
+POST /api/seller/disputes/:id/offer   — propose a resolution offer (offerType + optional amount
+                                         and notes). One pending offer allowed at a time.
+```
+
+**Web UI:** `SellerDisputesPanel` in `SellerDashboardPage` — a **Disputes** tab with expandable
+rows showing the message thread, a reply form with file upload, and an **Offer resolution** button
+that opens a modal to submit an offer.
+
+**i18n keys:** `seller.disputes.*`, `seller.tabs.disputes` across all 4 locales.
+
+### Admin dispute management
+
+```
+GET    /api/admin/disputes                    — list all disputes; filterable by status, sellerId,
+                                               issueType; sorted by slaDueAt ascending.
+GET    /api/admin/disputes/:id                — view any dispute.
+PATCH  /api/admin/disputes/:id/status         — transition status through the state machine.
+POST   /api/admin/disputes/:id/messages       — add a message with optional evidence upload.
+POST   /api/admin/disputes/:id/resolve        — resolve: set decision, notes, and optional refund
+                                               trigger (creates a refund order).
+POST   /api/admin/disputes/:id/close          — force-close with notes.
+GET    /api/admin/disputes/metrics            — aggregate metrics: volume, resolution rate, average
+                                               resolution time; breakdowns by store, seller,
+                                               issueType, and month.
+GET    /api/admin/disputes/templates          — list canned response templates.
+POST   /api/admin/disputes/templates          — create a template.
+PUT    /api/admin/disputes/templates/:id      — update a template.
+DELETE /api/admin/disputes/templates/:id      — delete a template.
+```
+
+**Web UI:** `AdminDisputesPanel` in `AdminPage` — a **Disputes** tab containing:
+
+- Metrics KPI cards (volume, resolution rate, average resolution time).
+- Filter bar (status, issueType, seller).
+- Dispute table sorted by SLA due date; expandable rows with full message thread.
+- Status transition buttons (move dispute through the state machine).
+- **Resolve** modal with decision selector and refund toggle.
+- **Close** modal with notes field.
+- Reply form with file upload and a template selector (inserts a canned response body).
+- **Manage templates** modal for CRUD on `DisputeTemplate` records.
+
+**i18n keys:** `admin.disputes.*`, `admin.disputes.metrics.*`, `admin.disputes.templates.*`,
+`adminPage.tabs.disputes` across all 4 locales.
+
+### SLA enforcement
+
+A daily cron (`disputeSlaEscalation.job.js`, default 08:00 UTC) finds non-terminal disputes where
+`slaDueAt <= now`, appends a system message, and emails the admin list once per dispute (guarded by
+`slaEscalationEmailedAt`). See [Cron Jobs — Dispute SLA escalation cron](#3-dispute-sla-escalation-cron)
+for scheduler env vars and test instructions.
+
+### Stripe chargeback integration
+
+Handled inside the existing `stripeWebhook` controller. See
+[Stripe webhooks — chargeback events](#stripe-webhooks--async-handling--stripewebhook) for the
+full event logic for `charge.dispute.created` and `charge.dispute.closed`.
+
+### Evidence upload
+
+`disputeUpload.middleware.js` wraps multer and is applied to:
+
+- `POST /api/disputes` (creation evidence)
+- `POST /api/disputes/:id/messages` (customer message attachments)
+- `POST /api/seller/disputes/:id/messages` (seller message attachments)
+- `POST /api/admin/disputes/:id/messages` (admin message attachments)
+
+Files are processed and uploaded to Cloudinary. The resulting URLs and MIME types are stored in
+`dispute.evidence[]` (creation) or `message.attachments[]` (message replies).
+
+### Email notifications (disputes)
+
+All dispute email helpers live in `backend/src/lib/email.js`:
+
+| Function                          | Trigger                                      | Recipient          |
+| --------------------------------- | -------------------------------------------- | ------------------ |
+| `sendDisputeOpenedEmail`          | Dispute created                              | Seller + Admin     |
+| `sendDisputeMessageEmail`         | New message added to thread                  | Opposing party     |
+| `sendDisputeAwaitingReplyEmail`   | Status transitions to `awaiting_*_reply`     | Relevant party     |
+| `sendDisputeResolvedEmail`        | Dispute resolved or closed                   | Customer + Seller  |
+| `sendDisputeSlaEscalationEmail`   | SLA cron: `slaDueAt` passed, not yet emailed | Admin recipient list |
+
+### i18n keys (disputes)
+
+New translation keys added across all 4 locales (`en`, `es`, `fr`, `ar`) in `shared/locales/`:
+
+```
+disputes.form.*          — creation form labels, placeholders, validations
+disputes.detail.*        — detail page labels, status badges, timeline
+disputes.list.*          — list page headings, empty state, pagination
+disputes.issueTypes.*    — human-readable labels for the 6 issue type enum values
+disputes.statuses.*      — human-readable labels for the 7 status enum values
+disputes.offer.*         — resolution offer card, accept/reject buttons, offer types
+orderModal.openDispute   — "Open dispute" CTA in order details modal
+profilePage.myDisputes   — "My disputes" link in the profile navigation
+seller.disputes.*        — seller disputes panel labels and actions
+seller.tabs.disputes     — "Disputes" tab label in the seller dashboard
+admin.disputes.*         — admin disputes panel labels, filter bar, modals
+admin.disputes.metrics.* — KPI card labels and breakdowns
+admin.disputes.templates.* — canned response template management labels
+adminPage.tabs.disputes  — "Disputes" tab label in the admin dashboard
+```
+
+---
+
 ## GDPR & user data export
 
 **Consent logging**
@@ -5075,6 +5427,23 @@ The customer-facing review UI is embedded in `StorefrontPage.jsx`.
   - `consentLogs` — full consent history.
   - `subscriber` — newsletter subscription record.
   - `deletionAudit` — `UserDeletionAudit` entries for this user.
+
+**Store closure vs. account deletion**
+
+Store closure and user account deletion are separate, coexisting paths:
+
+|                       | User account deletion                                                      | Seller store closure                                                                        |
+| --------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| **Trigger**           | `DELETE /api/users/me`                                                     | `POST /api/seller/close-store`                                                              |
+| **Scope**             | Removes the user record and all linked seller data in a single transaction | Closes the seller/store only; the user account stays active for shopping                    |
+| **User account**      | Soft-deleted; purged after `USER_DELETION_RETENTION_DAYS`                  | Untouched — user can continue to log in and shop                                            |
+| **PII anonymization** | Immediate (within the deletion transaction)                                | Deferred to Phase 3 (finalizer cron, after the waiting period)                              |
+| **Financial records** | Retained per legal obligations                                             | Retained per legal obligations                                                              |
+| **Data export**       | Available until deletion completes                                         | Available; a seller with `pending_closure` status can still call `GET /api/users/me/export` |
+
+Personal data is anonymized at Phase 3 of store closure; financial and order records are retained as
+required by law. Orders continue to resolve to the anonymized Store record so historical order
+history remains consistent.
 
 ---
 
@@ -5519,6 +5888,14 @@ KYC_DOCUMENT_RETENTION_DAYS        # days before archived seller documents are h
                                    # by the purge script (default: 2555 = 7 years)
 USER_DELETION_RETENTION_DAYS       # days before soft-deleted users are hard-deleted
                                    # by the purge script (default: 30)
+SELLER_CLOSURE_WAITING_DAYS        # waiting period (in days) between closure initiation and
+                                   # permanent Phase 3 deletion (default: 90)
+                                   # Dev: shorten to 1 or 0 for fast local testing
+SELLER_CLOSURE_FINALIZER_CRON      # cron expression for the sellerClosureFinalizer daily job
+                                   # (default: "0 2 * * *" — 02:00 UTC)
+                                   # Dev: "* * * * *" to trigger every minute for testing
+SELLER_CLOSURE_FINALIZER_ENABLED   # set to "false" to disable automatic finalizer scheduling
+                                   # (default: "true"); safe to disable during incident response
 ```
 
 **Shipping / Carrier**
@@ -5747,6 +6124,18 @@ PAYMENT_GRACE_ENABLED                # default true; set false to skip grace per
 PAYMENT_GRACE_PERIOD_DAYS            # default 7; days the seller has to fix payment before downgrade
 ```
 
+**Dispute SLA escalation**
+
+```
+FEATURE_DISPUTES_V1                      # set to "true" to enable all dispute routes and UI
+                                          # (default: unset / disabled)
+DISPUTE_SLA_ESCALATION_ENABLED           # set to "false" to disable the SLA escalation cron
+                                          # (default: "true")
+DISPUTE_SLA_ESCALATION_CRON             # cron expression for the SLA escalation job
+                                          # (default: "0 8 * * *" — 08:00 UTC daily)
+                                          # Dev: "* * * * *" to trigger every minute for testing
+```
+
 **Cron job boot-kickoff and ops alerting**
 
 ```
@@ -5755,6 +6144,8 @@ SETTLEMENT_RECONCILIATION_RUN_ON_BOOT    # run settlement reconciliation on serv
 PAYOUT_RETRY_RUN_ON_BOOT                 # run payout retry job on server start
 COD_PAYOUT_RECONCILIATION_RUN_ON_BOOT   # run COD payout reconciliation on server start
 SUBSCRIPTION_RENEWAL_RUN_ON_BOOT         # run subscription renewal on server start
+SELLER_CLOSURE_FINALIZER_RUN_ON_BOOT     # run seller closure finalizer once on server start
+                                          # (default false; set true only on single-instance deploys)
 
 # Ops alerting
 OPS_SLACK_WEBHOOK                        # optional Slack incoming webhook URL for job-health alerts
@@ -6051,6 +6442,11 @@ SHIPPING_COST=70
 MAX_UPLOAD_FILES=120 # allows ~50 gallery + variant images with retry headroom
 # optionally raise this if you use very large originals
 MAX_UPLOAD_MB=25
+
+# Disputes
+FEATURE_DISPUTES_V1=true
+DISPUTE_SLA_ESCALATION_ENABLED=true
+DISPUTE_SLA_ESCALATION_CRON=* * * * *
 
 # Local HTTPS cert usage flags (optional)
 USE_LOCAL_HTTPS=true

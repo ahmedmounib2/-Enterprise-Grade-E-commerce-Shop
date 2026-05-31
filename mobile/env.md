@@ -127,15 +127,12 @@ headers).
 | `MAIL_CONFIRM_WEB_URL`       | Optional HTTPS override used inside confirmation emails.       | `https://shop.example.com/mailing/confirm`             |
 | `MOBILE_OAUTH_REDIRECT_URI`  | Custom-scheme deep link for OAuth return.                      | `eshop://oauth`                                        |
 
-<<<<<<< HEAD
-=======
 > **Branding tip:** The public-facing app name shown in the Google Play Console (e.g. "Ecommerce")
 > can differ from the internal deep-link scheme (`eshop://…`). Only change the scheme and the values
 > above if you intend to rebrand all mobile links and have also updated `mobile/app.config.js`, the
 > published Android intent filters, and any emails that reference these URIs. Simply renaming the
 > store listing does **not** require touching the scheme or redirect values.
->
->>>>>>> cb031d8cd6143f207d0d0436d858ba127cfe99aa
+
 ### Shared contracts
 
 - Keep Vercel and Railway `PUBLIC_CLIENT_FALLBACK_URL` synchronized.
@@ -148,11 +145,12 @@ headers).
 
 The Expo app reads `EXPO_PUBLIC_API_BASE_URL` from `.env` in `mobile/`. Three presets are provided:
 
-| Profile    | File          | `EXPO_PUBLIC_API_BASE_URL`                | Use for                                                             |
-| ---------- | ------------- | ----------------------------------------- | ------------------------------------------------------------------- |
-| Emulator   | `.env.emu`    | `http://10.0.2.2:5001/api`                | Android emulator hitting backend on host machine via special alias. |
-| LAN device | `.env.lan`    | `http://<local-ip>:5001/api`              | Physical device on same Wi-Fi calling local backend.                |
-| Tunnel     | `.env.tunnel` | `https://<your-ngrok>.ngrok-free.app/api` | Physical device over HTTPS via ngrok tunnel (default for sharing).  |
+| Profile    | File              | `EXPO_PUBLIC_API_BASE_URL`                | Use for                                                                                               |
+| ---------- | ----------------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Emulator   | `.env.emu`        | `http://10.0.2.2:5001/api`                | Android emulator hitting backend on host machine via special alias.                                   |
+| LAN device | `.env.lan`        | `http://<local-ip>:5001/api`              | Physical device on same Wi-Fi calling local backend.                                                  |
+| Tunnel     | `.env.tunnel`     | `https://<your-ngrok>.ngrok-free.app/api` | Physical device over HTTPS via ngrok tunnel (default for sharing).                                    |
+| Production | `.env.production` | `https://api.ahmedmonib-eshop-demo.com`   | Final release builds targeting the live Railway API (leave off `/api`; the mobile client appends it). |
 
 Switch between them with the helper scripts (run from repo root):
 
@@ -160,10 +158,23 @@ Switch between them with the helper scripts (run from repo root):
 npm -w mobile run env:emu
 npm -w mobile run env:lan
 npm -w mobile run env:tunnel
+npm -w mobile run env:production
 ```
 
 > Whenever you edit a profile, restart Metro with `-c` (`npx expo start --tunnel -c`) to bust the
 > cache.
+
+For a **release build**, always run `npm -w mobile run env:production` (from the repo root) before
+invoking Gradle or EAS. The script copies `.env.production` into `mobile/.env`, embedding the public
+Railway hostname inside the bundle, and mirrors any `.cer` files under `mobile/certs/` into
+`android/app/src/main/assets/` so the `react-native-ssl-pinning` module can initialize. If pinning
+is enabled but the requested certificates are missing, the helper now aborts with a descriptive
+error so you never accidentally ship a build that will throw `Network request failed` on every API
+call. The mobile API client trims trailing slashes and automatically appends `/api`, so the
+production profile deliberately omits the suffix—this keeps the setting in sync with Railway's
+`SERVER_URL` value. Run
+`npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api` to snapshot
+the current production certificate before switching to the production profile.
 
 ### Transport security & pinning
 
@@ -356,11 +367,39 @@ Sanity checks:
 
 ### Release checklist
 
-- [ ] Verify Vercel deploy succeeded (`npx vercel --prod --yes` if pushing manually).
-- [ ] Ensure Railway env vars match the latest deep-link scheme/fallback URLs.
-- [ ] Send yourself a reset email and test on both web and mobile.
-- [ ] Update any docs if env defaults or URLs changed.
-- [ ] Tag the commit and share tunnel/API URLs with the team if remote QA is needed.
+- [ ] Verify Vercel (web) and Railway (API) deployments are healthy.
+- [ ] Refresh the pinned TLS certificate before each store submission:
+
+  ```bash
+  npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api
+  ```
+
+- [ ] Switch the Expo env to production (this also mirrors the `.cer` files into
+      `android/app/src/main/assets/`). Run it **again** after any `expo prebuild --clean` because
+      Expo wipes the assets folder:
+
+  ```bash
+  npm -w mobile run env:production
+  ```
+
+- [ ] Optional: regenerate native code if config changed:
+
+  ```bash
+  npm -w mobile run expo-prebuild -- --clean
+  npm -w mobile run env:production   # rerun immediately after prebuild
+  ```
+
+- [ ] Build fresh release artifacts and archive the mapping file:
+
+  ```bash
+  cd mobile/android
+  ./gradlew clean bundleRelease
+  ./gradlew assembleRelease          # optional for APK sideloading
+  ```
+
+- [ ] Smoke-test on a device/emulator using the release APK (login, stock/restock, checkout).
+- [ ] Upload the new AAB + `mapping.txt` to the Play Console and roll out to testers.
+- [ ] Tag the release commit and note the artifact locations for future reference.
 
 ---
 
@@ -380,6 +419,155 @@ Sanity checks:
   `🔗` messages; ensure `extractResetParams` still matches the scheme.
 - **ngrok shuts down** → Keep the terminal open or upgrade plan; update `.env.tunnel` when the
   domain changes.
+
+### Expo tunnel fails with `session closed` or `remote gone away`
+
+Symptoms:
+
+```bash
+npx expo start --tunnel
+```
+
+fails with:
+
+```text
+CommandError: failed to start tunnel
+
+session closed
+```
+
+or:
+
+```text
+CommandError: failed to start tunnel
+
+remote gone away
+```
+
+#### Root cause
+
+A common cause is being logged out of Expo/EAS.
+
+Check your login status:
+
+```bash
+npx expo whoami
+```
+
+If you see:
+
+```text
+Not logged in
+```
+
+log in again:
+
+```bash
+npx expo login
+```
+
+Verify:
+
+```bash
+npx expo whoami
+```
+
+Expected output:
+
+```text
+<your-expo-username>
+```
+
+Then restart Metro:
+
+```bash
+cd mobile
+
+npx expo start --tunnel --dev-client --clear
+```
+
+Expected output:
+
+```text
+Tunnel connected.
+Tunnel ready.
+```
+
+and a URL similar to:
+
+```text
+exp+eshop-mobile://expo-development-client/?url=https://<id>.exp.direct
+```
+
+#### Reproducible tunnel startup checklist
+
+1. Verify Expo login:
+
+```bash
+npx expo whoami
+```
+
+1. Verify device is connected:
+
+```bash
+adb devices -l
+```
+
+1. Start backend/frontend:
+
+```bash
+npm run dev
+```
+
+1. Ensure the desired mobile environment is active:
+
+```bash
+npm -w mobile run env:tunnel
+```
+
+1. Start Expo tunnel:
+
+```bash
+cd mobile
+
+npx expo start --tunnel --dev-client --clear
+```
+
+1. Scan the QR code with the installed development build.
+
+#### Additional diagnostics
+
+Check Expo account:
+
+```bash
+npx expo whoami
+```
+
+Enable verbose logging:
+
+```bash
+EXPO_DEBUG=1 npx expo start --tunnel
+```
+
+Clear Expo cache:
+
+```bash
+rm -rf .expo
+npx expo start --tunnel --clear
+```
+
+#### Notes
+
+- The API ngrok tunnel and the Expo tunnel are separate systems.
+- A healthy ngrok session does not guarantee Expo tunnel connectivity.
+- A healthy ngrok session does not guarantee Expo tunnel connectivity.
+- If tunnel mode suddenly stops working after previously working, always run:
+
+```bash
+npx expo whoami
+```
+
+before troubleshooting networking or ngrok.
 
 ---
 

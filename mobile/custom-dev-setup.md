@@ -125,7 +125,11 @@ EOF_LOCAL
 
 ```powershell
 usbipd list
-usbipd bind   --busid <BUSID>
+
+# first time only
+usbipd bind --busid <BUSID>
+
+# every reconnect / after reboot
 usbipd attach --wsl --busid <BUSID> --auto-attach
 ```
 
@@ -314,6 +318,10 @@ npm run dev
 # frontend → https://localhost:5173
 
 # 2) Expose API via ngrok and sync the env
+#  The backend listens on HTTPS locally. Ngrok must forward to
+#  https://localhost:5001, otherwise requests will fail with
+#  ERR_NGROK_3004 and the mobile app will receive HTTP 503 errors.
+
 npx ngrok http https://localhost:5001
 npm -w mobile run env:tunnel   # writes .env for the tunnel URL
 
@@ -448,6 +456,44 @@ npx expo run:android --variant internalDebug
   links still include `deepLink`.
 - **ngrok restarts** → Keep the terminal open; run `npm -w mobile run env:tunnel` after each
   restart.
+
+- **ngrok returns ERR_NGROK_3004**
+
+  Symptoms:
+
+  ```text
+  ERR_NGROK_3004
+  The server returned an invalid or incomplete HTTP response
+  ```
+
+  Mobile app may also show:
+
+  ```text
+  Login failed
+  Status code 503
+  ```
+
+  Verify the backend protocol:
+
+  ```bash
+  curl -vk https://localhost:5001
+  ```
+
+  If the backend is serving HTTPS, start ngrok with:
+
+  ```bash
+  ngrok http https://localhost:5001
+  ```
+
+  Do NOT use:
+
+  ```bash
+  ngrok http http://localhost:5001
+  ```
+
+  when the backend is configured for HTTPS.
+
+  when the backend is configured for HTTPS.
 
 ---
 
