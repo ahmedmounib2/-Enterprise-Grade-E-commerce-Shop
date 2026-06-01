@@ -239,21 +239,21 @@ All cron jobs in the settlement and payout subsystem acquire a Redis distributed
 executing so that concurrent instances in a multi-replica deployment do not run the same job
 simultaneously. Each job uses a distinct lock key:
 
-| Job                          | Lock key                              | Default TTL (seconds) | RUN_ON_BOOT env var                              |
-| ---------------------------- | ------------------------------------- | --------------------- | ------------------------------------------------ |
-| Settlement scheduler         | `lock:settlement_scheduler`           | 120                   | _(scheduler is boot-triggered via `SETTLEMENT_AUTO_EXECUTE`)_ |
-| Settlement reconciliation    | `lock:settlement_reconciliation`      | 120                   | `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT`          |
-| Payout retry                 | `lock:settlement_payout_retry`        | 120                   | `PAYOUT_RETRY_RUN_ON_BOOT`                       |
-| COD payout reconciliation    | `lock:cod_payout_reconciliation`      | 120                   | `COD_PAYOUT_RECONCILIATION_RUN_ON_BOOT`          |
-| Subscription renewal         | `lock:subscription_renewal`           | 120                   | `SUBSCRIPTION_RENEWAL_RUN_ON_BOOT`               |
+| Job                       | Lock key                         | Default TTL (seconds) | RUN_ON_BOOT env var                                           |
+| ------------------------- | -------------------------------- | --------------------- | ------------------------------------------------------------- |
+| Settlement scheduler      | `lock:settlement_scheduler`      | 120                   | _(scheduler is boot-triggered via `SETTLEMENT_AUTO_EXECUTE`)_ |
+| Settlement reconciliation | `lock:settlement_reconciliation` | 120                   | `SETTLEMENT_RECONCILIATION_RUN_ON_BOOT`                       |
+| Payout retry              | `lock:settlement_payout_retry`   | 120                   | `PAYOUT_RETRY_RUN_ON_BOOT`                                    |
+| COD payout reconciliation | `lock:cod_payout_reconciliation` | 120                   | `COD_PAYOUT_RECONCILIATION_RUN_ON_BOOT`                       |
+| Subscription renewal      | `lock:subscription_renewal`      | 120                   | `SUBSCRIPTION_RENEWAL_RUN_ON_BOOT`                            |
 
 **RUN_ON_BOOT semantics:** each `*_RUN_ON_BOOT` variable defaults to `false`. When `false`, the job
 only runs on its configured cron schedule — safe for multi-replica deployments where process startup
-is not synchronized. Set to `true` only in single-instance environments (e.g., local dev or
-one-off migration deploys) where you need an immediate first run on server start.
+is not synchronized. Set to `true` only in single-instance environments (e.g., local dev or one-off
+migration deploys) where you need an immediate first run on server start.
 
-All jobs use `SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY` semantics: `skip_cycle` (default/production)
-or `run_unlocked` (dev/test convenience). Keep `skip_cycle` in production for all financial jobs.
+All jobs use `SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY` semantics: `skip_cycle` (default/production) or
+`run_unlocked` (dev/test convenience). Keep `skip_cycle` in production for all financial jobs.
 
 ---
 
@@ -642,7 +642,25 @@ month releases are now correctly included when their hold period has elapsed.
 
 ---
 
-## 9) Processor fee recovery
+## 9) Payout and refund notifications
+
+When `FEATURE_IN_APP_NOTIFICATIONS=true`, settlement and refund operations fire in-app
+notifications **in addition to** the transactional emails described in the main README.
+
+| Event                          | Email function               | Notification type    | Recipient  |
+| ------------------------------ | ---------------------------- | -------------------- | ---------- |
+| Settlement payout marked `paid`  | `sendPayoutCompletedEmail`   | `payout_completed`   | Seller     |
+| Settlement payout marked `failed`| `sendPayoutFailedEmail`      | `payout_failed`      | Seller     |
+| Refund approved                | `sendRefundApprovedCustomerEmail` / `...SellerEmail` | `refund_approved` | Customer + Seller |
+| Refund rejected                | `sendRefundRejectedCustomerEmail` / `...SellerEmail` | `refund_rejected` | Customer + Seller |
+
+Both the email and the notification are fire-and-forget: a failure in one never suppresses the
+other. Notification delivery is handled by `fireNotification()` in
+`backend/src/services/notification/notification.service.js`.
+
+---
+
+## 10) Processor fee recovery
 
 When the actual payment processor fee differs from the estimate posted at order time,
 `recordProcessorFeeRecovery` posts corrective ledger entries:

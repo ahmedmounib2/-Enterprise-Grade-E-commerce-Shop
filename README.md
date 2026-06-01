@@ -248,6 +248,7 @@
       - [8) Operational notes](#8-operational-notes)
   - [Auth \& session persistence — how it works (plain language)](#auth--session-persistence--how-it-works-plain-language)
   - [Order fulfilment, PDF export \& canceled order labeling](#order-fulfilment-pdf-export--canceled-order-labeling)
+    - [Order status transition enforcement](#order-status-transition-enforcement)
     - [Shipment model](#shipment-model)
     - [Carrier service abstraction](#carrier-service-abstraction)
     - [Seller shipment management](#seller-shipment-management)
@@ -274,6 +275,15 @@
     - [Evidence upload](#evidence-upload)
     - [Email notifications (disputes)](#email-notifications-disputes)
     - [i18n keys (disputes)](#i18n-keys-disputes)
+  - [Transactional email system](#transactional-email-system)
+  - [In-app notification centre](#in-app-notification-centre)
+    - [Notification model](#notification-model)
+    - [REST API](#rest-api)
+    - [Web bell UI](#web-bell-ui)
+    - [Mobile bell UI](#mobile-bell-ui)
+    - [Wiring new notification types](#wiring-new-notification-types)
+  - [Admin user management](#admin-user-management)
+  - [Admin audit-log dashboard](#admin-audit-log-dashboard)
   - [GDPR \& user data export](#gdpr--user-data-export)
   - [Security \& observability](#security--observability)
     - [Field-level PII encryption](#field-level-pii-encryption)
@@ -440,10 +450,17 @@ until you are ready to launch in production, then flip it to `true` in `.env.pro
     check, closure request, pending-closure UI, and the finalizer cron job). When unset or `false`,
     all `/api/seller/close-store/*` and `/api/admin/sellers/:id/close-store` routes are inaccessible
     and the dashboard panel is hidden.
-  - `FEATURE_DISPUTES_V1=true` — enables the full dispute-resolution surface: all
-    `/api/disputes/*`, `/api/seller/disputes/*`, and `/api/admin/disputes/*` routes, the SLA
-    escalation cron, and all dispute-related panels on web and mobile. When unset or `false`, dispute
-    routes are inaccessible and all dispute UI is hidden.
+  - `FEATURE_DISPUTES_V1=true` — enables the full dispute-resolution surface: all `/api/disputes/*`,
+    `/api/seller/disputes/*`, and `/api/admin/disputes/*` routes, the SLA escalation cron, and all
+    dispute-related panels on web and mobile. When unset or `false`, dispute routes are inaccessible
+    and all dispute UI is hidden.
+  - `FEATURE_IN_APP_NOTIFICATIONS=true` — enables the in-app notification centre: REST endpoints at
+    `/api/notifications/*`, the bell icon with unread badge in the Navbar, the dropdown panel and
+    full-list page on web (60-second polling), and the bottom sheet with AppState-aware polling on
+    mobile. When unset or `false`, all notification routes return 404 and the bell UI is hidden.
+  - `FEATURE_ADMIN_AUDIT_DASHBOARD=true` — enables the admin audit-log tab surfacing five audit
+    types: seller lifecycle, seller profile access, COD refund access, user deletion, and document
+    access. When unset or `false`, audit endpoints and the dashboard tab are inaccessible.
 - **Silent-off behaviour:** when `FEATURE_MULTI_SELLER` is unset (or any value other than `"true"`),
   the entire seller marketplace surface is silently disabled — `/api/seller/*`, `/api/sellers/*`,
   `/api/stores/*`, and `/api/public/stores/*` routes all return 404 or are never registered. A fresh
@@ -2099,6 +2116,9 @@ Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
 
 - Order listing, status changes, PDF export for fulfilment/labeling, canceled order labeling and
   audit trails.
+- **Order status transition enforcement** — backend `ALLOWED_TRANSITIONS` map blocks invalid status
+  jumps; seller/admin dropdowns surface only the next valid statuses; COD orders in early statuses
+  can be cancelled without requiring payout details; friendly error toasts replace raw crashes.
 - **Carrier shipping integration** — dedicated Shipment model (separate from Order), provider
   adapter pattern (disabled/manual/Aramex), seller shipment creation UI with label generation,
   visual customer tracking timeline (`OrderShipmentTimeline`), carrier webhook hub with HMAC
@@ -2112,6 +2132,21 @@ Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
   escalation with resolve/close controls, canned response templates, dispute metrics KPIs, 72-hour
   SLA enforcement cron, and Stripe chargeback webhook integration (`charge.dispute.created/closed`).
   Gated by `FEATURE_DISPUTES_V1`. Full customer, seller, and admin panels on web and mobile.
+- **Transactional email system** — 11 event-driven emails for order shipped/delivered, refund
+  approved/rejected (customer + seller copy), payout completed/failed, product moderation
+  (approved/rejected/action required), and KYC status changes. All use fire-and-forget delivery via
+  Resend; anonymised customers are silently skipped; failures never block the parent operation.
+- **In-app notification centre** — `Notification` model with i18n-key-based rendering (22 types).
+  Web bell with red badge, dropdown panel, 60 s polling, and click-to-open detail modal. Mobile bell
+  with bottom sheet and AppState-aware polling. Gated by `FEATURE_IN_APP_NOTIFICATIONS`.
+- **Admin user management** — list, suspend, unsuspend, and delete users from the admin panel.
+  Suspended accounts cannot log in and have sessions immediately invalidated. Admins cannot act on
+  themselves or other admins. Schema additions: `suspendedAt`, `suspendedReason`, `suspendedBy`,
+  `lastLoginAt`.
+- **Admin audit-log dashboard** — read-only tab exposing five audit types (seller lifecycle, seller
+  profile access, COD refund access, user deletion, document access) with date-range filtering,
+  pagination, CSV export, and batch-resolved human-readable identifiers. Gated by
+  `FEATURE_ADMIN_AUDIT_DASHBOARD`.
 - **Fully responsive Admin Dashboard** — manage orders, add products, edit variants, and run the
   store from a **phone or tablet** (mobile-friendly layouts and inputs).
 - Privacy & Compliance
@@ -5003,6 +5038,27 @@ an unnecessary logout.
 - PDF export utility is implemented server-side (PDF generation libraries) and exposed to the admin
   for download/printing.
 
+### Order status transition enforcement
+
+The backend enforces a strict `ALLOWED_TRANSITIONS` map that defines which status moves are legal
+for each order state. Attempts to jump directly from `order_placed` to `delivered` (or any other
+invalid hop) are rejected with a 400 error before any database write occurs.
+
+**Frontend behaviour:**
+
+- The `OrderRow` status dropdown in the seller and admin panels renders only the statuses that are
+  valid next steps for the current order state, preventing operators from attempting invalid
+  transitions in the first place.
+- When a backend validation error is returned, a friendly toast message is shown instead of the raw
+  error object that previously crashed the UI.
+
+**COD cancellation fix:**
+
+COD orders in early statuses (`order_placed`, `processing`) can now be cancelled without requiring
+the seller to have completed COD payout bank details. The eligibility check for COD-specific payout
+fields is skipped until the order has reached a stage where a refund disbursement is actually
+needed.
+
 ### Shipment model
 
 The dedicated `Shipment` model (`backend/src/models/shipment.model.js`) is stored separately from
@@ -5269,8 +5325,8 @@ POST /api/disputes/:id/respond-offer  — accept or reject a seller resolution o
   image viewer for attachments.
 
 **i18n keys:** `disputes.form.*`, `disputes.detail.*`, `disputes.list.*`, `disputes.issueTypes.*`,
-`disputes.statuses.*`, `disputes.offer.*`, `orderModal.openDispute`, `profilePage.myDisputes`
-across all 4 locales.
+`disputes.statuses.*`, `disputes.offer.*`, `orderModal.openDispute`, `profilePage.myDisputes` across
+all 4 locales.
 
 ### Seller dispute endpoints
 
@@ -5282,9 +5338,9 @@ POST /api/seller/disputes/:id/offer   — propose a resolution offer (offerType 
                                          and notes). One pending offer allowed at a time.
 ```
 
-**Web UI:** `SellerDisputesPanel` in `SellerDashboardPage` — a **Disputes** tab with expandable
-rows showing the message thread, a reply form with file upload, and an **Offer resolution** button
-that opens a modal to submit an offer.
+**Web UI:** `SellerDisputesPanel` in `SellerDashboardPage` — a **Disputes** tab with expandable rows
+showing the message thread, a reply form with file upload, and an **Offer resolution** button that
+opens a modal to submit an offer.
 
 **i18n keys:** `seller.disputes.*`, `seller.tabs.disputes` across all 4 locales.
 
@@ -5326,14 +5382,15 @@ DELETE /api/admin/disputes/templates/:id      — delete a template.
 
 A daily cron (`disputeSlaEscalation.job.js`, default 08:00 UTC) finds non-terminal disputes where
 `slaDueAt <= now`, appends a system message, and emails the admin list once per dispute (guarded by
-`slaEscalationEmailedAt`). See [Cron Jobs — Dispute SLA escalation cron](#3-dispute-sla-escalation-cron)
-for scheduler env vars and test instructions.
+`slaEscalationEmailedAt`). See
+[Cron Jobs — Dispute SLA escalation cron](#3-dispute-sla-escalation-cron) for scheduler env vars and
+test instructions.
 
 ### Stripe chargeback integration
 
 Handled inside the existing `stripeWebhook` controller. See
-[Stripe webhooks — chargeback events](#stripe-webhooks--async-handling--stripewebhook) for the
-full event logic for `charge.dispute.created` and `charge.dispute.closed`.
+[Stripe webhooks — chargeback events](#stripe-webhooks--async-handling--stripewebhook) for the full
+event logic for `charge.dispute.created` and `charge.dispute.closed`.
 
 ### Evidence upload
 
@@ -5351,34 +5408,233 @@ Files are processed and uploaded to Cloudinary. The resulting URLs and MIME type
 
 All dispute email helpers live in `backend/src/lib/email.js`:
 
-| Function                          | Trigger                                      | Recipient          |
-| --------------------------------- | -------------------------------------------- | ------------------ |
-| `sendDisputeOpenedEmail`          | Dispute created                              | Seller + Admin     |
-| `sendDisputeMessageEmail`         | New message added to thread                  | Opposing party     |
-| `sendDisputeAwaitingReplyEmail`   | Status transitions to `awaiting_*_reply`     | Relevant party     |
-| `sendDisputeResolvedEmail`        | Dispute resolved or closed                   | Customer + Seller  |
-| `sendDisputeSlaEscalationEmail`   | SLA cron: `slaDueAt` passed, not yet emailed | Admin recipient list |
+| Function                        | Trigger                                      | Recipient            |
+| ------------------------------- | -------------------------------------------- | -------------------- |
+| `sendDisputeOpenedEmail`        | Dispute created                              | Seller + Admin       |
+| `sendDisputeMessageEmail`       | New message added to thread                  | Opposing party       |
+| `sendDisputeAwaitingReplyEmail` | Status transitions to `awaiting_*_reply`     | Relevant party       |
+| `sendDisputeResolvedEmail`      | Dispute resolved or closed                   | Customer + Seller    |
+| `sendDisputeSlaEscalationEmail` | SLA cron: `slaDueAt` passed, not yet emailed | Admin recipient list |
 
 ### i18n keys (disputes)
 
 New translation keys added across all 4 locales (`en`, `es`, `fr`, `ar`) in `shared/locales/`:
 
 ```
-disputes.form.*          — creation form labels, placeholders, validations
-disputes.detail.*        — detail page labels, status badges, timeline
-disputes.list.*          — list page headings, empty state, pagination
-disputes.issueTypes.*    — human-readable labels for the 6 issue type enum values
-disputes.statuses.*      — human-readable labels for the 7 status enum values
-disputes.offer.*         — resolution offer card, accept/reject buttons, offer types
-orderModal.openDispute   — "Open dispute" CTA in order details modal
-profilePage.myDisputes   — "My disputes" link in the profile navigation
-seller.disputes.*        — seller disputes panel labels and actions
-seller.tabs.disputes     — "Disputes" tab label in the seller dashboard
-admin.disputes.*         — admin disputes panel labels, filter bar, modals
-admin.disputes.metrics.* — KPI card labels and breakdowns
+disputes.form.*            — creation form labels, placeholders, validations
+disputes.detail.*          — detail page labels, status badges, timeline
+disputes.list.*            — list page headings, empty state, pagination
+disputes.issueTypes.*      — human-readable labels for the 6 issue type enum values
+disputes.statuses.*        — human-readable labels for the 7 status enum values
+disputes.offer.*           — resolution offer card, accept/reject buttons, offer types
+orderModal.openDispute     — "Open dispute" CTA in order details modal
+profilePage.myDisputes     — "My disputes" link in the profile navigation
+seller.disputes.*          — seller disputes panel labels and actions
+seller.tabs.disputes       — "Disputes" tab label in the seller dashboard
+admin.disputes.*           — admin disputes panel labels, filter bar, modals
+admin.disputes.metrics.*   — KPI card labels and breakdowns
 admin.disputes.templates.* — canned response template management labels
-adminPage.tabs.disputes  — "Disputes" tab label in the admin dashboard
+adminPage.tabs.disputes    — "Disputes" tab label in the admin dashboard
 ```
+
+---
+
+## Transactional email system
+
+All transactional emails are implemented in `backend/src/lib/email.js` via the private
+`sendTransactionalEmail()` helper. Resend is the active provider (`RESEND_API_KEY`); SendGrid is
+available as a drop-in fallback by swapping the import. Translations are resolved with
+`getNestedTranslation` from `@eshop/locales` so email copy stays in sync with the UI locale files.
+
+**Delivery behaviour:**
+
+- All calls are fire-and-forget — email failures are logged but never propagate to the caller.
+- Anonymised customers (soft-deleted users with no email) are silently skipped.
+- Failures never block the parent operation (order update, refund, payout execution, moderation
+  decision, etc.).
+
+**Event catalogue (in addition to earlier order-confirmation and dispute emails):**
+
+| Function                          | Trigger                             | Recipient |
+| --------------------------------- | ----------------------------------- | --------- |
+| `sendOrderShippedEmail`           | Order status → `dispatched`         | Customer  |
+| `sendOrderDeliveredEmail`         | Order status → `delivered`          | Customer  |
+| `sendRefundApprovedCustomerEmail` | Refund approved                     | Customer  |
+| `sendRefundRejectedCustomerEmail` | Refund rejected                     | Customer  |
+| `sendRefundApprovedSellerEmail`   | Refund approved                     | Seller    |
+| `sendRefundRejectedSellerEmail`   | Refund rejected                     | Seller    |
+| `sendPayoutCompletedEmail`        | Settlement payout marked `paid`     | Seller    |
+| `sendPayoutFailedEmail`           | Settlement payout marked `failed`   | Seller    |
+| `sendProductApprovedEmail`        | Admin approves a pending product    | Seller    |
+| `sendProductRejectedEmail`        | Admin rejects a pending product     | Seller    |
+| `sendProductActionRequiredEmail`  | Admin flags product needing changes | Seller    |
+
+**i18n keys:** all new email copy lives under `email.transactional.*` in all 4 locale files (`en`,
+`ar`, `es`, `fr`) in `shared/locales/`.
+
+**Wiring locations:**
+
+- Order status hook (`orderStatusChanged`) — fires shipped and delivered emails.
+- Refund controllers — fire refund approved/rejected emails for customer and seller.
+- Settlement execution service — fires payout completed/failed emails.
+- Manual payout service — fires payout completed/failed emails.
+- Product moderation controller — fires product approved/rejected/action-required emails.
+- KYC review controller — fires KYC approval/rejection emails (pre-existing wiring extended).
+
+For the full notification counterpart that fires alongside every email, see
+[In-app notification centre](#in-app-notification-centre).
+
+---
+
+## In-app notification centre
+
+Gated by `FEATURE_IN_APP_NOTIFICATIONS=true`.
+
+### Notification model
+
+`backend/src/models/notification.model.js` stores per-user notification documents.
+
+```
+Fields
+  userId      — recipient (indexed)
+  type        — one of 22 enum values (order_shipped, order_delivered, refund_approved,
+                 refund_rejected, payout_completed, payout_failed, product_approved,
+                 product_rejected, product_action_required, kyc_approved, kyc_rejected,
+                 store_closed, store_closure_cancelled, store_closure_completed,
+                 new_review, dispute_opened, dispute_message, dispute_resolved,
+                 dispute_escalated, order_cancelled, new_order, new_dispute)
+  titleKey    — i18n key resolved client-side (e.g. "notifications.order_shipped.title")
+  bodyKey     — i18n key resolved client-side
+  variables   — interpolation map (orderId, amount, productName, etc.)
+  read        — boolean; false by default
+  createdAt   — timestamp
+```
+
+Rendering is done client-side by calling `t(titleKey, variables)` — switching the UI language
+instantly updates all notification text without re-fetching from the server.
+
+i18n keys live under `notifications.*` across all 4 locale files.
+
+### REST API
+
+All routes require authentication. Unread count is Redis-cached with a short TTL and invalidated on
+write.
+
+```
+GET  /api/notifications               — paginated list, unread first
+GET  /api/notifications/unread-count  — { count: N } (Redis-cached)
+PATCH /api/notifications/:id/read     — mark one notification read
+PATCH /api/notifications/read-all     — mark all notifications read
+DELETE /api/notifications/:id         — delete one notification
+```
+
+### Web bell UI
+
+- Bell icon in the Navbar with a red badge showing the unread count.
+- Clicking the bell opens a dropdown panel listing the most recent notifications; unread rows have a
+  distinct background tint and accent border using theme tokens.
+- Clicking a notification row opens a detail modal (portal-rendered to `document.body`) instead of
+  navigating away, preserving the current page context.
+- A "View all" link opens the full notification list page.
+- Polling interval: 60 seconds via `setInterval`; cancelled on unmount.
+- All colours use existing CSS variables — no hardcoded values.
+
+### Mobile bell UI
+
+- Bell icon in the app header with a red dot badge mirroring web behaviour.
+- Tapping the bell opens a bottom sheet listing notifications; tapping a row opens a detail modal.
+- Polling is AppState-aware: paused when the app is backgrounded, resumed on foreground.
+- Theme tokens from the generated palette are used throughout.
+
+### Wiring new notification types
+
+Every place that fires a transactional email now also calls
+`fireNotification(userId, type, variables)` immediately after. The two calls are independent — a
+notification failure never suppresses the email and vice versa.
+
+To add a new notification type:
+
+1. Add the type string to the `type` enum in `notification.model.js`.
+2. Add `titleKey` and `bodyKey` i18n entries in all 4 locale files under `notifications.<type>.*`.
+3. Call `fireNotification(userId, type, variables)` at the relevant service/controller callsite.
+
+---
+
+## Admin user management
+
+The admin panel includes a dedicated **Users** tab (`AdminUsersPanel` in
+`frontend/src/pages/AdminPage.jsx`) for managing platform users.
+
+**Backend endpoints (`/api/admin/users/*`):**
+
+```
+GET    /api/admin/users              — paginated list; filterable by role, status, and free-text search
+POST   /api/admin/users/:id/suspend  — suspend a user account (body: { reason })
+POST   /api/admin/users/:id/unsuspend — lift a suspension
+DELETE /api/admin/users/:id          — permanently delete and anonymise (reuses deleteUserAccount service)
+```
+
+**Behaviour:**
+
+- Suspended users are rejected at login with a clear error message; all active sessions are
+  immediately invalidated via Redis token revocation.
+- Admin-initiated deletion reuses the shared `deleteUserAccount` service, cascading PII
+  anonymisation, seller data scrubbing, and `UserDeletionAudit` creation — identical to self-service
+  deletion.
+- Admins cannot suspend, unsuspend, or delete themselves or other admin accounts; these requests
+  return 403.
+
+**Schema additions (User model):**
+
+```
+suspendedAt      Date    — timestamp of most recent suspension
+suspendedReason  String  — operator-supplied reason text
+suspendedBy      ObjectId — admin userId who initiated the suspension
+lastLoginAt      Date    — updated on each successful login (used for activity display)
+```
+
+**Frontend (`AdminUsersPanel`):**
+
+- Filter bar: role selector, status selector (active / suspended / deleted), free-text search.
+- Paginated table with action buttons: Suspend, Unsuspend, Delete.
+- Each destructive action opens a confirmation modal; suspension prompts for a reason string.
+
+---
+
+## Admin audit-log dashboard
+
+Gated by `FEATURE_ADMIN_AUDIT_DASHBOARD=true`. Adds a read-only **Audit Log** tab to the admin panel
+that surfaces five audit collections:
+
+| Audit type            | Source collection          | What it shows                                                   |
+| --------------------- | -------------------------- | --------------------------------------------------------------- |
+| Seller lifecycle      | `SellerLifecycleAudit`     | KYC decisions, closures, status transitions with actor + reason |
+| Seller profile access | `SellerProfileAccessAudit` | Admin views of tier-1 seller PII (govId, birthDate, banking)    |
+| COD refund access     | `CodRefundAccessAudit`     | Admin decryption of sensitive COD refund bank details           |
+| User deletion         | `UserDeletionAudit`        | Self-service and admin-initiated soft/hard-delete events        |
+| Document access       | `DocumentAccessAudit`      | KYC document view and download events                           |
+
+**Backend endpoints (`/api/admin/audit/*`):**
+
+```
+GET /api/admin/audit/seller-lifecycle    — date range + pagination + whitelisted filters
+GET /api/admin/audit/seller-profile      — date range + pagination
+GET /api/admin/audit/cod-refund          — date range + pagination
+GET /api/admin/audit/user-deletion       — date range + pagination
+GET /api/admin/audit/document-access     — date range + pagination
+```
+
+All endpoints are read-only (`GET`), admin-only, and reject any query parameters not on the
+whitelist to prevent unintended data exposure.
+
+**Frontend table:**
+
+- Columns adapt per audit type (e.g., seller lifecycle shows `sellerId`, `action`, `actor`,
+  `reason`; document access shows `documentId`, `tier`, `actorId`).
+- Human-readable identifiers (seller business name, user name + email) are batch-resolved server-
+  side and returned alongside the raw IDs.
+- Date-range picker (from / to) and pagination controls.
+- CSV export downloads the currently filtered result set.
 
 ---
 
@@ -6136,6 +6392,18 @@ DISPUTE_SLA_ESCALATION_CRON             # cron expression for the SLA escalation
                                           # Dev: "* * * * *" to trigger every minute for testing
 ```
 
+**In-app notifications and audit log**
+
+```
+FEATURE_IN_APP_NOTIFICATIONS             # set to "true" to enable /api/notifications/* routes,
+                                          # the bell UI (web + mobile), and 60-second polling.
+                                          # (default: unset / disabled)
+
+FEATURE_ADMIN_AUDIT_DASHBOARD            # set to "true" to enable /api/admin/audit/* endpoints
+                                          # and the Audit Log tab in the admin panel.
+                                          # (default: unset / disabled)
+```
+
 **Cron job boot-kickoff and ops alerting**
 
 ```
@@ -6447,6 +6715,10 @@ MAX_UPLOAD_MB=25
 FEATURE_DISPUTES_V1=true
 DISPUTE_SLA_ESCALATION_ENABLED=true
 DISPUTE_SLA_ESCALATION_CRON=* * * * *
+
+# In-app notifications and audit log
+FEATURE_IN_APP_NOTIFICATIONS=true
+FEATURE_ADMIN_AUDIT_DASHBOARD=true
 
 # Local HTTPS cert usage flags (optional)
 USE_LOCAL_HTTPS=true
@@ -6906,6 +7178,8 @@ Extra reference material that complements this README:
   `MONITORING_METRICS_TOKEN` rotation strategy and future multi-scraper support plan.
 - [`docs/security/webhook-rotation.md`](docs/security/webhook-rotation.md) — rotation runbooks for
   Stripe, Chimoney, and OAuth bridge secrets.
+- [`docs/notifications.md`](docs/notifications.md) — in-app notification centre reference: model,
+  REST API, bell UI behaviour, and guide for wiring new notification types.
 - [`docs/settlements-runbook.md`](docs/settlements-runbook.md) — settlement and payout operations
   runbook including distributed lock keys, `RUN_ON_BOOT` vars, and manual fallback procedures.
 - [`docs/DAISYUI-THEME.md`](docs/DAISYUI-THEME.md) — shared DaisyUI theming internals for web and
