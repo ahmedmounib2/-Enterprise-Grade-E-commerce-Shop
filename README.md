@@ -61,13 +61,6 @@
       - [Admin review workflow (store profile + policy updates)](#admin-review-workflow-store-profile--policy-updates)
       - [Storefront policy rendering (public store page + checkout)](#storefront-policy-rendering-public-store-page--checkout)
       - [Pause store (Hide All) behavior](#pause-store-hide-all-behavior)
-    - [Seller store closure lifecycle](#seller-store-closure-lifecycle)
-      - [Phase 1 — Eligibility check \& closure request](#phase-1--eligibility-check--closure-request)
-      - [Phase 2 — Immediate deactivation (soft close)](#phase-2--immediate-deactivation-soft-close)
-      - [Phase 3 — Waiting period \& permanent deletion (finalizer job)](#phase-3--waiting-period--permanent-deletion-finalizer-job)
-      - [Admin override](#admin-override)
-      - [Closure email notifications](#closure-email-notifications)
-      - [i18n](#i18n)
     - [Seller product creation \& admin moderation (end-to-end)](#seller-product-creation--admin-moderation-end-to-end)
       - [Flow overview (from seller draft to storefront)](#flow-overview-from-seller-draft-to-storefront)
       - [Product creation + moderation pipeline flowchart](#product-creation--moderation-pipeline-flowchart)
@@ -162,7 +155,6 @@
     - [Cron jobs added for COD payout resiliency](#cron-jobs-added-for-cod-payout-resiliency)
       - [1) COD payout reconciliation cron](#1-cod-payout-reconciliation-cron)
       - [2) COD refund details purge cron](#2-cod-refund-details-purge-cron)
-      - [3) Dispute SLA escalation cron](#3-dispute-sla-escalation-cron)
     - [Carrier shipping webhook](#carrier-shipping-webhook)
     - [Key rotation \& webhook replay procedures](#key-rotation--webhook-replay-procedures)
       - [Rotate Stripe webhook secret safely](#rotate-stripe-webhook-secret-safely)
@@ -919,6 +911,21 @@ approved content. Sellers see these fields **locked** while review is pending.
 These updates save immediately and do **not** require admin approval, unless a store review is
 already pending, in which case the same fields are temporarily locked to avoid conflicting edits.
 
+**Logo/banner image storage (Cloudinary URLs, never inline base64):**
+
+Store logo and banner images are uploaded to Cloudinary and the Store document stores only the
+resulting **URL** — never a base64 data URI. The dashboard uploads the chosen file via
+`POST /api/stores/:id/image` (multipart; `kind=logo|banner`), which reuses the product-image
+pipeline (`uploadMiddleware` → `cloudinary.uploader.upload`, capped at 512px logos / 1600px
+banners) and returns `{ url }`; the seller then saves that URL through the normal store-update
+call. `updateStorePolicies` **rejects** a `data:` URI for `logoUrl`/`bannerUrl` with a 400.
+
+Why: inlining base64 made a single Store document multiple megabytes (one banner was ~4.7 MB), so
+every read that needs branding — the seller dashboard overview and the public storefront — had to
+transfer the whole document over Atlas, taking tens of seconds. Storing URLs keeps the document a
+few KB. Convert any pre-existing base64 images with the one-time migration:
+`npm run migrate:store-images` (dry-run) / `npm run migrate:store-images:apply`.
+
 #### What happens when a seller updates policies or branding
 
 When a seller hits **Save** on the store settings page:
@@ -993,6 +1000,9 @@ Specifically:
 - During checkout, `fetchStorePolicySnapshot` resolves the **approved** policy source. It prefers
   `reviewSnapshot` when `reviewStatus !== 'approved'`, matching the storefront's display behavior.
   This ensures a pending policy edit cannot leak into the order snapshot at checkout.
+- For performance it `.select()`s **only** the policy fields (not branding/logo/banner), so the
+  checkout query stays a few hundred bytes regardless of Store-document size. The store/fee/commission
+  lookups run in parallel and outside the order transaction in both the COD and Stripe flows.
 - These values are persisted on the **Order** as immutable fields (e.g.,
   `orderShippingPolicy`/`orderReturnPolicy` or `order_shipping_policy`/`order_return_policy`
   depending on API shape).
@@ -2161,6 +2171,276 @@ Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
 
 ---
 
+## Per-store shipping & admin delivery regions
+
+Checkout shipping is computed per store and per destination by
+`backend/src/services/shipping/shippingRate.service.js` (`resolveStoreShipping`). It is destination-
+aware: nothing is charged until the customer enters a country (see `feat(checkout): calculate
+shipping after the customer enters a destination`).
+
+### Per-store rate configuration (`store.shipping`)
+
+Each store document carries a `shipping` sub-document the seller edits in **Store settings**:
+
+```
+mode                  'flat' | 'tiered' | 'carrier'   (default 'flat')
+currency              ISO currency for the store's rates (default 'USD')
+flatRate              flat per-order shipping cost (null = use marketplace default)
+freeShippingThreshold subtotal at/above which shipping is free (null = off)
+handlingFee           added to every computed rate (default 0)
+regions[]             tiered tiers: { countries[], rate, freeOver }   (mode 'tiered')
+excludedCountries[]   legacy ISO-2 country opt-outs (still honoured)
+excludedRegions[]     admin-region codes the seller opts out of: "EG" or "EG-ALX" / "US-CA"
+carrier{}             Phase-3 carrier-calculated config (provider/origin/fallbackRate)
+```
+
+Resolution order in `resolveStoreShipping`:
+
+1. **Platform deliverability** — `resolvePlatformDeliverability` checks the destination against the
+   admin operating regions (below). A blocked destination returns an exclusion marker
+   `{ excluded, reason: 'not_operating', field, value }` (no price).
+2. **Seller opt-out** — if the seller excluded the resolved country/subdivision (`excludedRegions`
+   or legacy `excludedCountries`), returns `{ excluded, reason: 'seller_excluded', field, value }`.
+   The block carries the exact field (`country` | `state` | `city`) and the value the customer typed.
+3. **Rate** — `tiered` mode picks the first matching `regions[]` tier (`selectRegionForDestination`),
+   else the store `flatRate`, else the marketplace default `SHIPPING_COST` (env, fallback **35**).
+4. **Free shipping** — if `subtotal >= freeShippingThreshold` (or the tier's `freeOver`), the rate is
+   a true `0` (bypasses the handling fee and the admin clamp).
+5. **Handling fee + admin clamp** — `handlingFee` is added, then the result is clamped to
+   `SHIPPING_MIN_RATE` / `SHIPPING_MAX_RATE` when those env bounds are set.
+
+The marketplace default (`SHIPPING_COST`, `SHIPPING_DEFAULT_CURRENCY`) is surfaced to sellers via
+`getShippingDefaults` so the Store-settings UI shows the fallback that applies when a field is blank,
+and is displayed on the storefront/checkout.
+
+### Admin-managed delivery regions (operating countries + subdivisions)
+
+`DeliveryRegion` (`backend/src/models/deliveryRegion.model.js`) is the admin-managed list of where
+the platform operates. One document per country:
+
+- `countryCode` — ISO-3166 alpha-2, or the sentinel `*` for the **Rest of World** catch-all (when
+  that document is enabled, any country not explicitly listed ships at country level).
+- `subdivisions[]` — `{ code, name, aliases[], enabled }`. Disabling a subdivision excludes it (e.g.
+  operate in EG but exclude Alexandria, or US but exclude Alaska/Hawaii).
+- `deletedSubdivisions[]` — **tombstones** for subdivisions the admin removed. They still block
+  delivery to that name, so deleting a major governorate doesn't silently re-open it as if it were
+  an unknown small city. Re-adding the subdivision clears its tombstone.
+
+State/city matching uses the **shared address normalizer** (see the tax section): a destination state
+is a whitelist — it must resolve to an enabled subdivision (by code, name, or alias) or the order is
+blocked. When the state field is empty, the **city** field is matched as a fallback (so typing a
+governorate name in the city box still resolves). Matching is suffix-, article- and Arabic-insensitive
+(`Alexandria Governorate`, `Al Iskandariyah`, and `الإسكندرية` all resolve to the same subdivision).
+
+Sellers inherit the admin set: the seller region selector only offers admin-enabled regions, and
+`excludedRegions` holds the codes a seller opts out of.
+
+### Endpoints & seed
+
+```
+GET  /api/shipping/estimate?storeId=&subtotal=&country=&state=&city=
+       -> { shippingCost, currency, freeThreshold? }  OR
+          { excluded:true, reason, field, value, currency }   (informational; checkout re-computes)
+GET  /api/public/delivery-regions          enabled regions for the seller selector / dropdowns
+GET  /api/admin/delivery-regions           admin list (admin only)
+POST /api/admin/delivery-regions           create
+PUT  /api/admin/delivery-regions/:id        update (enable/disable subdivisions, edit aliases)
+DELETE /api/admin/delivery-regions/:id      delete (tombstones its subdivisions)
+```
+
+Seed the initial operating set (idempotent — preserves admin enabled flags, only adds missing
+subdivisions, refreshes names/aliases) with **`npm run seed:delivery-regions`** (from `backend/`).
+It seeds EG governorates (with Arabic aliases), US states, and the Rest-of-World catch-all. The admin
+UI is the **Delivery Regions** tab (`AdminDeliveryRegionsPanel`).
+
+---
+
+## Category-based tax engine (internal rules + Avalara)
+
+Tax is computed per order line by category and destination jurisdiction
+(`backend/src/services/tax/`). The full admin guide is in
+[`docs/tax-book.md`](docs/tax-book.md); this is the architecture summary.
+
+### Internal `TaxRule` engine
+
+A `TaxRule` (`backend/src/models/taxRule.model.js`) is `{ jurisdiction:{ country, state }, categoryKey,
+rate, taxExempt, avalaraTaxCode, effectiveStartDate, effectiveEndDate, enabled }`. `country` is ISO-2
+or `*` (global default); `state` is a subdivision code or `null` (country-level).
+
+- **Category key per line** — `resolveLineTaxCategory(product)` derives the key: an explicit,
+  non-`standard` product `taxCategory` wins; otherwise the product's `subCategorySlug`, then
+  `categorySlug`, then `standard`. So an admin rule keyed `dress` applies to dress products even when
+  the seller never set `taxCategory` (which defaults to `standard`).
+- **Precedence (`findTaxRule`)** — a single combined score `categoryExact*10 + jurisdiction` where
+  jurisdiction is `state 3 > country 2 > global '*' 1`. An exact category match always beats a
+  `standard` fallback within the same jurisdiction, and `standard` is the fallback when no
+  category-specific rule exists. Category keys are normalised before comparison (gender-prefix strip
+  `Men's`/`Women's`/`Kids'`, plural/hyphen folding) so a rule `"Men's Tshirts"` matches a product key
+  `"t-shirt"`. The destination country is resolved to its ISO code (so a typed `"Egypt"` matches `EG`),
+  and the state is matched through the shared normalizer against the subdivision catalog (so
+  `"Alexandria Governorate"`, `"Al Iskandariyah"`, `"الإسكندرية"` all match a rule state `ALEXANDRIA`);
+  an empty state falls back to the city.
+- **No match** → the engine uses the env `TAX_RATE` (default `0.14`).
+
+`resolveOrderTax` returns `{ taxAmount, perLine:[{ productId, taxCategory, taxableBase, rate,
+taxAmount, exempt }], jurisdiction:{ country, state }, provider }`.
+
+### TaxProvider interface, Avalara, and the fallback chain
+
+`getTaxProvider()` is selected by `TAX_PROVIDER` (`internal` | `avalara`). Every provider's `quote()`
+returns the same shape, so checkout/order/refund code is provider-neutral.
+
+- **internal** — the `TaxRule` engine above (default).
+- **avalara** — `services/tax/providers/avalara.provider.js` posts a non-committing `SalesOrder` to
+  AvaTax `POST /transactions/create` with each line's Avalara tax code, the destination address, and
+  `companyCode` (`AVALARA_COMPANY_CODE`, default `DEFAULT`). The base URL is chosen from
+  `AVALARA_ENVIRONMENT` (`sandbox` → `sandbox-rest.avatax.com`, `production` → `rest.avatax.com`).
+
+**Fallback chain: Avalara → internal `TaxRule`s → env `TAX_RATE`.** On *any* Avalara failure (no
+creds, 4xx/5xx, network/timeout, trial expired) the avalara provider catches and returns the internal
+result, which itself falls back to `TAX_RATE` — so the tax provider can never break checkout.
+
+**Environment auto-correction** — these credentials must match the tier they belong to. If a request
+401s against the configured environment, the provider transparently retries the *other* environment
+once; if the credentials authenticate there it uses that result and logs `Set
+AVALARA_ENVIRONMENT=<env>`. The health probe does the same.
+
+**Tax-code mapping** — `services/tax/providers/taxCodeMap.js` maps a platform category to an AvaTax
+code (`standard`/`digital`/`exempt` → `P0000000`, `food` → `PF050032`, apparel → `PC040100`, footwear
+→ `PC040108`, unknown → `P0000000`). An admin can override per rule via `TaxRule.avalaraTaxCode`.
+
+**Health** — `getTaxProviderHealth` (60s TTL cache) pings `GET /utilities/ping`; "healthy" requires a
+2xx **and** `authenticated:true`. The **Tax Rules** admin panel shows a green/red provider badge.
+
+### Order tax audit
+
+Every order persists `order.tax = { provider, jurisdiction:{ country, state }, breakdown:[…perLine],
+meta }`. `meta` holds the provider response metadata (for Avalara: `taxSummary`, `jurisdictions`,
+transaction code, timestamp; `null` for internal — it's a `Mixed` field so a provider swap needs no
+schema change).
+
+### Endpoints & UI
+
+```
+POST /api/tax/estimate          { items:[{ productId, quantity, variantAttributes }],
+                                  destination:{ country, state, city, street, postalCode } }
+                                -> { taxAmount, perLine, jurisdiction, provider }   (informational)
+GET  /api/public/tax-categories -> { data, groups:{ special[], product[] } }  (seller product form +
+                                   admin rule dropdown; product categories come from the category tree)
+GET  /api/admin/tax-rules        admin CRUD (admin only)
+POST|PUT|DELETE /api/admin/tax-rules[/:id]
+GET  /api/admin/tax/health      -> { provider, healthy, environment?, status?, reason? }
+```
+
+The cart/checkout shows tax **per product** (rate + amount under each line, plus a "Tax Total") when
+products are taxed at different rates, and a single summary line when all rates match. The tax line is
+deferred until a destination is entered (it shows a placeholder before that). Products carry a
+`taxCategory` key (default `standard`) editable on the seller product form.
+
+---
+
+## Address autocomplete & draggable-pin checkout map
+
+### Google Places autocomplete via a backend proxy
+
+The checkout street field autocompletes through the **backend proxy** (not the browser SDK) on both
+web (`AddressAutocomplete.jsx`) and mobile (`AddressAutocomplete.js`):
+
+```
+GET /api/shipping/places/autocomplete?input=   -> [{ id, text }]
+GET /api/shipping/places/details?placeId=      -> { address:{ street, city, state, postalCode, country }, formattedAddress }
+```
+
+The proxy calls the **Places API (New)** REST endpoints with the server key (`GOOGLE_PLACES_API_KEY`,
+falling back to `GOOGLE_MAPS_API_KEY`), so the browser avoids CORS / HTTP-referrer-key restrictions
+and the server key is never exposed. Errors are surfaced verbatim (e.g. `REQUEST_DENIED`,
+referrer-restriction messages) for diagnosis, and the field degrades to plain manual entry when the
+proxy returns nothing.
+
+### Draggable-pin map (web)
+
+`frontend/src/components/AddressMap.jsx` shows a Google Map with a draggable pin below the street
+field. It loads Maps JS via `frontend/src/lib/googleMaps.js` using `VITE_GOOGLE_MAPS_API_KEY`:
+
+- With `loading=async`, nothing under `google.maps` exists until imported, so the loader
+  `importLibrary`s **maps**, **geocoding**, and **marker** and only resolves once `google.maps.Map` &
+  `Geocoder` exist (this fixed `google.maps.Map is not a constructor`).
+- A **10 s timeout** and a `gm_authFailure` handler (referrer/auth) resolve to `null` so the UI never
+  hangs; a `RefererNotAllowedMapError` is logged with the fix (allow-list the dev origin).
+- The pin geocodes the entered address; dragging it reverse-geocodes the new position and updates the
+  address fields, which re-runs the shipping/tax estimates. It uses `AdvancedMarkerElement` when a
+  Cloud `VITE_GOOGLE_MAPS_MAP_ID` is set, otherwise the classic draggable `Marker`.
+- The container is responsive (`h-80 sm:h-96`). If the map can't load it shows
+  **"Map unavailable — enter your address manually."** and the fields stay editable.
+
+### Draggable-pin map (mobile, WebView)
+
+`mobile/src/components/AddressMapWebView.js` renders the same map inside a `react-native-webview`
+(Expo-Go compatible, no native maps module). An **app-restricted** EXPO key fails inside a WebView
+(Google treats the page as a foreign/null origin), so the mobile map **fetches the server key at
+runtime** from `GET /api/shipping/maps/config` (`{ mapsApiKey, configured }` — the same unrestricted
+server key). The page is loaded with a real `baseUrl` origin so the key may instead be HTTP-referrer
+restricted. `gestureHandling: 'cooperative'` lets a one-finger drag scroll the checkout `ScrollView`
+while two fingers pan the map and the marker stays draggable; the map is 280 px tall. `gm_authFailure`
+/ JS / script / 10 s-timeout errors post back to React Native and trigger the same fallback message.
+`EXPO_PUBLIC_GOOGLE_MAPS_API_KEY` has been **removed** — the mobile app no longer holds a Maps key
+(documented in `mobile/env.md`).
+
+---
+
+## New environment variables (shipping, tax, address & resilience)
+
+All optional unless noted. Backend values live in `backend/.env`; `VITE_*` build into the frontend,
+`EXPO_PUBLIC_*` into the mobile bundle.
+
+```
+# ── Shipping ─────────────────────────────────────────────────────────────────
+SHIPPING_COST                     Marketplace default per-order rate when a store sets no flatRate.
+                                  Default 35. (Frontend mirror: VITE_SHIPPING_COST.)
+SHIPPING_DEFAULT_CURRENCY         Currency shown for marketplace default. Default USD.
+SHIPPING_MIN_RATE                 Optional admin floor; computed rate is clamped up to this.
+SHIPPING_MAX_RATE                 Optional admin ceiling; computed rate is clamped down to this.
+
+# ── Tax ──────────────────────────────────────────────────────────────────────
+TAX_RATE                          Final fallback rate when no TaxRule/provider applies. Default 0.14.
+                                  (Frontend mirror: VITE_TAX_RATE.)
+TAX_PROVIDER                      'internal' (default) or 'avalara'.
+AVALARA_ACCOUNT_ID                Avalara account id. Required when TAX_PROVIDER=avalara.
+AVALARA_LICENSE_KEY               Avalara license key. Required when TAX_PROVIDER=avalara. Secret.
+AVALARA_ENVIRONMENT               'sandbox' or 'production' — must match the credentials' tier
+                                  (auto-retries the other env on a 401). Default 'sandbox'.
+AVALARA_COMPANY_CODE              AvaTax company code. Default 'DEFAULT' (the generic value 404s on
+                                  most accounts — set the account's real code).
+AVALARA_TIMEOUT_MS                Avalara request timeout before falling back to internal. Default 8000.
+
+# ── Address / maps ───────────────────────────────────────────────────────────
+GOOGLE_PLACES_API_KEY             Server key for the Places proxy + the mobile map config endpoint.
+                                  Falls back to GOOGLE_MAPS_API_KEY. Must NOT be HTTP-referrer
+                                  restricted (server calls have no referrer); unrestricted or IP-bound.
+GOOGLE_MAPS_API_KEY               Fallback server key for the above.
+VITE_GOOGLE_MAPS_API_KEY          Web key for the Maps JS loader (AddressMap). HTTP-referrer restrict
+                                  to your web origins; needs Maps JavaScript API + Geocoding API.
+VITE_GOOGLE_MAPS_MAP_ID           Optional Cloud Map ID to enable AdvancedMarkerElement on web.
+EXPO_PUBLIC_GOOGLE_MAPS_API_KEY   REMOVED — the mobile map now fetches the server key from
+                                  /api/shipping/maps/config; do not set this.
+
+# ── COD / cache / Mongo resilience ───────────────────────────────────────────
+REDIS_OP_TIMEOUT_MS               Per-op bound for cache reads/writes (stock, cart) so a slow Redis
+                                  fails fast instead of hanging the request.
+COD_REDIS_OP_TIMEOUT_MS           COD-flow override for the above (falls back to REDIS_OP_TIMEOUT_MS).
+CACHE_REDIS_COMMAND_TIMEOUT_MS    ioredis (TCP cache driver) command timeout; offline queue disabled.
+SESSION_REDIS_COMMAND_TIMEOUT_MS  Session Redis client command timeout (offline queue disabled).
+UPSTASH_MAX_RETRIES               Caps Upstash REST retries so one outage costs at most one timeout.
+MONGO_SERVER_SELECTION_TIMEOUT_MS Optional Mongo server-selection timeout (driver default otherwise).
+MONGO_CONNECT_TIMEOUT_MS          Optional Mongo connect timeout (driver default otherwise).
+```
+
+> Note: custom MongoDB `socketTimeoutMS` / pool options were deliberately **removed** (they caused a
+> recurring `MongoNetworkTimeoutError` crash); the driver defaults are used unless the two
+> `MONGO_*_TIMEOUT_MS` vars above are explicitly set.
+
+---
+
 ## Payment & order flow (detailed)
 
 This section explains the exact runtime flow implemented by the backend payment controller.
@@ -2289,6 +2569,41 @@ The webhook handler validates Stripe signatures and supports multiple events:
   order id and totals to the client.
 - `codCheckoutSuccess` accepts `orderId`, verifies user ownership, clears cart and safety keys,
   sends confirmation email (if not sent), and returns order summary to the client.
+
+**Cache-failure resilience**
+
+COD order creation is hardened so a Redis problem can never lose or silently block an order:
+
+- Stock-reservation writes to Redis are tolerant: a timeout, rate-limit, or disconnect is logged as
+  a warning rather than thrown, so the order still commits and returns `201`. A COD order placed
+  during a complete cache outage succeeds normally.
+- Cache operations are bounded by `REDIS_OP_TIMEOUT_MS` and Upstash retries are capped by
+  `UPSTASH_MAX_RETRIES`; once one reservation write fails, the remaining items skip Redis so a
+  single outage costs at most one timeout for the whole order.
+- The session Redis client uses a command timeout and disables the offline queue
+  (`SESSION_REDIS_COMMAND_TIMEOUT_MS`), so a stalled session store can never block the response
+  flush — previously this could leave a committed order with no HTTP response.
+- If no reservation keys exist at restore time (e.g. they were never written during an outage),
+  stock is restored directly from the order document, guarded by the order's `restockApplied` flag.
+  The `reconcile:cod-reservations` script audits (and optionally backfills) affected orders.
+- Frontend: if the request hits the axios timeout, checkout shows a calm "your order is taking
+  longer than expected — please check your orders page" message instead of a failure toast, and the
+  cart is **not** cleared, so the customer never loses items for an order that may have been placed.
+- The COD route, the Stripe `create-checkout-session` route, and `GET /api/orders/user` are wrapped
+  in the `skipSessionPersist` middleware (`middleware/sessionSkip.middleware.js`). With
+  `express-session` `rolling: true`, `connect-redis` defers `res.end` until the per-request session
+  touch/save returns; a slow session Redis could therefore hang the response of an
+  already-committed order. These JWT-authenticated routes don't mutate the session, so skipping the
+  rolling save/touch is safe — the sliding expiry just refreshes on the next mutating request.
+- Per-flow override: COD reservation cache ops honour `COD_REDIS_OP_TIMEOUT_MS` (falls back to
+  `REDIS_OP_TIMEOUT_MS`). The TCP/ioredis cache driver is hardened with
+  `CACHE_REDIS_COMMAND_TIMEOUT_MS` + a disabled offline queue so a stalled TCP Redis fails fast
+  instead of buffering commands.
+- MongoDB driver defaults were restored (custom `serverSelectionTimeoutMS` / `socketTimeoutMS` /
+  pool options were removed) after they were traced as the root cause of a recurring
+  `MongoNetworkTimeoutError` crash; an `uncaughtException` guard now survives a transient Mongo pool
+  timeout instead of exiting the process. Connection timeouts remain tunable via
+  `MONGO_SERVER_SELECTION_TIMEOUT_MS` / `MONGO_CONNECT_TIMEOUT_MS` when explicitly set.
 
 ### COD eligibility policy, seller financial summary, and recovery path
 
@@ -5041,8 +5356,14 @@ an unnecessary logout.
 ### Order status transition enforcement
 
 The backend enforces a strict `ALLOWED_TRANSITIONS` map that defines which status moves are legal
-for each order state. Attempts to jump directly from `order_placed` to `delivered` (or any other
-invalid hop) are rejected with a 400 error before any database write occurs.
+for each order state:
+
+- Sellers must advance orders one step at a time along the fulfilment chain
+  `placed → processing → dispatched → delivered`; statuses cannot be skipped.
+- **Cancellation** is allowed from any non-terminal status. Terminal states (`delivered`,
+  `cancelled`, `refunded`) accept no further transitions.
+- Attempts to jump directly from `order_placed` to `delivered` (or any other invalid hop) are
+  rejected with a `400` carrying a human-readable message, before any database write occurs.
 
 **Frontend behaviour:**
 
@@ -5768,6 +6089,16 @@ User model
 Multi-key rotation is supported via `FIELD_ENCRYPTION_KEYS` (comma-separated list of historical
 keys). New writes always use `FIELD_ENCRYPTION_KEY`; decryption attempts each key in the rotation
 list until one succeeds. After a rotation window, remove the old key from `FIELD_ENCRYPTION_KEYS`.
+
+**Decryption resilience & operations:**
+
+- `decryptField` returns `null` instead of throwing when a value cannot be decrypted with any
+  configured key (e.g. mid-rotation or after a key mismatch), so a bad key degrades gracefully
+  instead of crashing the request with a 500.
+- On startup the server logs the fingerprints of all configured keys (primary + rotation) in every
+  environment, so operators can confirm which keys are loaded without exposing key material.
+- The `npm run reencrypt:pii` script (run from `backend/`) re-encrypts stored PII with the current
+  primary key; it is a dry-run by default and persists changes only with `--apply`.
 
 ### Role & Permission Matrix
 
@@ -6805,6 +7136,11 @@ raw Redis usage in controllers/services.
   - `UPSTASH_REDIS_REST_TOKEN`
 - TCP:
   - `REDIS_URL` (or `UPSTASH_REDIS_URL`) as `rediss://default:<password>@<host>:6379`
+- Resilience:
+  - `REDIS_OP_TIMEOUT_MS` (default `1500`) — per-operation timeout so a stalled cache endpoint
+    cannot block a request.
+  - `UPSTASH_MAX_RETRIES` (default `1`) — caps Upstash REST client retries to fail fast instead of
+    piling up backoff delays.
 
 **Sessions (TCP-only)**
 
@@ -6812,6 +7148,9 @@ raw Redis usage in controllers/services.
 - `SESSION_REDIS_PREFIX` (recommended)
   - `session:dev:` for dev
   - `session:prod:` for prod
+- `SESSION_REDIS_COMMAND_TIMEOUT_MS` (default `1000`) — per-command timeout for the session client.
+  Combined with a disabled offline queue, this ensures a stalled session store fails fast and never
+  defers the response flush.
 
 ### Redis configuration examples
 
@@ -7182,6 +7521,9 @@ Extra reference material that complements this README:
   REST API, bell UI behaviour, and guide for wiring new notification types.
 - [`docs/settlements-runbook.md`](docs/settlements-runbook.md) — settlement and payout operations
   runbook including distributed lock keys, `RUN_ON_BOOT` vars, and manual fallback procedures.
+- [`docs/tax-book.md`](docs/tax-book.md) — admin tax guide: internal `TaxRule`s and precedence,
+  product tax categories, the Avalara integration (credentials, auto-fallback, cross-env retry, tax
+  codes), provider health, the fallback chain, and what's persisted on each order.
 - [`docs/DAISYUI-THEME.md`](docs/DAISYUI-THEME.md) — shared DaisyUI theming internals for web and
   mobile.
 - [`docs/THEME.md`](docs/THEME.md) — native token architecture for both platforms.

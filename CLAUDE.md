@@ -255,6 +255,7 @@ All user-visible text must use translation keys (no inline literals).
 - Run the narrowest relevant checks first (targeted lint/tests), then broader checks if needed.
 - Report exactly what was run and the result.
 - If checks cannot run, state why and provide precise local run instructions.
+- After all tests pass, always output a one-line summary: "X passed, Y failed, Z skipped."
 
 ## 8. Environment Variable Change Policy
 
@@ -279,6 +280,10 @@ Provide these sections:
 - **Next steps** (if any)
 - **i18n impact** (when applicable)
 - **Environment Changes** (when applicable)
+
+**After every completed batch, you MUST output the "What changed / Why / Validation / Risks / Next
+steps / i18n impact / Environment Changes" summary. Never skip this step, even if the batch was
+simple or the changes were already described inline.**
 
 **List and inventory formatting rule:**
 

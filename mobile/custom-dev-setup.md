@@ -27,6 +27,22 @@
   - [Clean builds \& cache resets](#clean-builds--cache-resets)
   - [Examples of “native-affecting” changes in app.config.js](#examples-of-native-affecting-changes-in-appconfigjs)
   - [Troubleshooting](#troubleshooting)
+  - [Troubleshooting](#troubleshooting-1)
+    - [Android Device Missing in WSL](#android-device-missing-in-wsl)
+      - [Symptoms](#symptoms)
+    - [Fast Diagnosis](#fast-diagnosis)
+    - [Step 1 — Verify WSL Can See the Phone](#step-1--verify-wsl-can-see-the-phone)
+    - [Step 2 — Reattach Device from Windows](#step-2--reattach-device-from-windows)
+    - [Step 3 — Verify USB Attachment Inside WSL](#step-3--verify-usb-attachment-inside-wsl)
+    - [Step 4 — Restart ADB](#step-4--restart-adb)
+    - [Step 5 — Reset USB Debugging Authorization](#step-5--reset-usb-debugging-authorization)
+    - [Known Recovery Sequence](#known-recovery-sequence)
+    - [Expo Tunnel Failures](#expo-tunnel-failures)
+      - [Symptoms](#symptoms-1)
+    - [Notes](#notes)
+    - [Verify Metro Is Healthy](#verify-metro-is-healthy)
+    - [Verify Backend Tunnel](#verify-backend-tunnel)
+    - [Distinguishing Tunnel vs ADB Problems](#distinguishing-tunnel-vs-adb-problems)
   - [Automation script](#automation-script)
     - [Extra: Building the **Internal Release** APK (optional)](#extra-building-the-internal-release-apk-optional)
   - [Fix the 99% hang \& reinstall the dev client](#fix-the-99-hang--reinstall-the-dev-client)
@@ -496,6 +512,286 @@ npx expo run:android --variant internalDebug
   when the backend is configured for HTTPS.
 
 ---
+
+## Troubleshooting
+
+### Android Device Missing in WSL
+
+#### Symptoms
+
+```bash
+adb devices -l
+```
+
+Returns:
+
+```text
+List of devices attached
+```
+
+with no devices listed.
+
+Common symptoms:
+
+- `npx expo start --dev-client` launches Metro but cannot open the app.
+- Pressing `a` in Expo takes a long time or does nothing.
+- Android Studio does not detect the phone from WSL.
+- `adb reverse` commands fail.
+- Expo development build never opens on the device.
+
+---
+
+### Fast Diagnosis
+
+Run:
+
+```bash
+lsusb && adb devices -l
+```
+
+Interpretation:
+
+| Result                                  | Meaning                 |
+| --------------------------------------- | ----------------------- |
+| Samsung visible + device visible in adb | Everything is working   |
+| Samsung visible + adb empty             | ADB issue               |
+| Samsung not visible                     | USB/IP attachment issue |
+
+---
+
+### Step 1 — Verify WSL Can See the Phone
+
+```bash
+lsusb
+```
+
+Expected:
+
+```text
+04e8:6860 Samsung Electronics
+```
+
+If Samsung is not listed:
+
+```text
+WSL lost the USB attachment.
+```
+
+Continue to Step 2.
+
+---
+
+### Step 2 — Reattach Device from Windows
+
+Open PowerShell as Administrator:
+
+```powershell
+wsl --shutdown
+
+usbipd list
+
+usbipd attach --wsl --busid 1-4
+```
+
+Replace:
+
+```text
+1-4
+```
+
+with the current Samsung BUSID shown by:
+
+```powershell
+usbipd list
+```
+
+Expected output:
+
+```text
+usbipd: info: Using WSL distribution 'Ubuntu-22.04'
+usbipd: info: Device attached
+```
+
+---
+
+### Step 3 — Verify USB Attachment Inside WSL
+
+```bash
+lsusb
+```
+
+Expected:
+
+```text
+Bus XXX Device XXX: ID 04e8:6860 Samsung Electronics
+```
+
+If Samsung appears, continue.
+
+---
+
+### Step 4 — Restart ADB
+
+```bash
+adb kill-server
+adb start-server
+adb devices -l
+```
+
+Expected:
+
+```text
+R58T60ETLJZ device
+```
+
+or another connected device serial.
+
+---
+
+### Step 5 — Reset USB Debugging Authorization
+
+If the device still does not appear:
+
+On the phone:
+
+```text
+Developer Options
+  → Revoke USB debugging authorizations
+```
+
+Then:
+
+```text
+Disable USB debugging
+Enable USB debugging
+```
+
+Unplug and reconnect the cable.
+
+Accept the RSA authorization prompt.
+
+---
+
+### Known Recovery Sequence
+
+This sequence resolved the issue on 2026-06-07:
+
+1. Phone disappeared from WSL.
+2. `adb devices -l` returned no devices.
+3. `lsusb` did not show Samsung.
+4. Ran:
+
+```powershell
+wsl --shutdown
+usbipd attach --wsl --busid 1-4
+```
+
+1. Verified:
+
+```bash
+lsusb
+```
+
+showed:
+
+```text
+Samsung Electronics
+```
+
+1. Restarted ADB:
+
+```bash
+adb kill-server
+adb start-server
+adb devices -l
+```
+
+1. Device appeared again:
+
+```text
+R58T60ETLJZ device
+```
+
+Root cause: WSL lost the USB/IP attachment even though Windows still detected the phone.
+
+### Expo Tunnel Failures
+
+#### Symptoms
+
+```text
+CommandError: failed to start tunnel
+
+remote gone away
+```
+
+---
+
+### Notes
+
+This issue is usually unrelated to ADB.
+
+Possible causes:
+
+- Expo tunnel service issue
+- ngrok issue
+- Expo/ngrok integration issue
+- Temporary network issue
+
+---
+
+### Verify Metro Is Healthy
+
+Run:
+
+```bash
+npx expo start --dev-client --clear
+```
+
+If Metro starts and displays:
+
+```text
+Metro waiting on exp+...
+```
+
+then Metro is healthy.
+
+---
+
+### Verify Backend Tunnel
+
+Manual backend tunnel:
+
+```bash
+ngrok http https://localhost:5001
+```
+
+Verify:
+
+```bash
+curl https://your-ngrok-url.ngrok-free.app
+```
+
+returns a valid response.
+
+---
+
+### Distinguishing Tunnel vs ADB Problems
+
+| Symptom                              | Likely Cause            |
+| ------------------------------------ | ----------------------- |
+| Tunnel fails with "remote gone away" | Expo/ngrok issue        |
+| `adb devices -l` empty               | ADB / USB issue         |
+| Samsung missing from `lsusb`         | USB/IP issue            |
+| Metro starts successfully            | Expo bundler is healthy |
+
+Always check:
+
+```bash
+lsusb
+adb devices -l
+```
+
+before spending time debugging Expo.
 
 ## Automation script
 
