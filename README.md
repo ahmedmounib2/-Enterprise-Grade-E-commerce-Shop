@@ -136,6 +136,7 @@
     - [Per-store rate configuration (`store.shipping`)](#per-store-rate-configuration-storeshipping)
     - [Admin-managed delivery regions (operating countries + subdivisions)](#admin-managed-delivery-regions-operating-countries--subdivisions)
     - [Endpoints \& seed](#endpoints--seed)
+    - [Ship-from address requirement](#ship-from-address-requirement)
   - [Category-based tax engine (internal rules + Avalara)](#category-based-tax-engine-internal-rules--avalara)
     - [Internal `TaxRule` engine](#internal-taxrule-engine)
     - [TaxProvider interface, Avalara, and the fallback chain](#taxprovider-interface-avalara-and-the-fallback-chain)
@@ -145,6 +146,7 @@
     - [Google Places autocomplete via a backend proxy](#google-places-autocomplete-via-a-backend-proxy)
     - [Draggable-pin map (web)](#draggable-pin-map-web)
     - [Draggable-pin map (mobile, WebView)](#draggable-pin-map-mobile-webview)
+    - [Ship-from address autocomplete (seller settings)](#ship-from-address-autocomplete-seller-settings)
   - [New environment variables (shipping, tax, address \& resilience)](#new-environment-variables-shipping-tax-address--resilience)
   - [Payment \& order flow (detailed)](#payment--order-flow-detailed)
     - [Checkout (Stripe) flow — `createCheckoutSession`](#checkout-stripe-flow--createcheckoutsession)
@@ -295,6 +297,7 @@
     - [REST API](#rest-api)
     - [Web bell UI](#web-bell-ui)
     - [Mobile bell UI](#mobile-bell-ui)
+    - [`order_shipped` notification](#order_shipped-notification)
     - [Wiring new notification types](#wiring-new-notification-types)
   - [Admin user management](#admin-user-management)
   - [Admin audit-log dashboard](#admin-audit-log-dashboard)
@@ -2214,7 +2217,8 @@ handlingFee           added to every computed rate (default 0)
 regions[]             tiered tiers: { countries[], rate, freeOver }   (mode 'tiered')
 excludedCountries[]   legacy ISO-2 country opt-outs (still honoured)
 excludedRegions[]     admin-region codes the seller opts out of: "EG" or "EG-ALX" / "US-CA"
-carrier{}             Phase-3 carrier-calculated config (provider/origin/fallbackRate)
+carrier{}             Carrier-calculated config: provider, ship-from origin (5 fields), fallbackRate,
+                      defaultParcel. Ship-from origin is required before a store can go active (see below).
 ```
 
 Resolution order in `resolveStoreShipping`:
@@ -2278,6 +2282,19 @@ Seed the initial operating set (idempotent — preserves admin enabled flags, on
 subdivisions, refreshes names/aliases) with **`npm run seed:delivery-regions`** (from `backend/`).
 It seeds EG governorates (with Arabic aliases), US states, and the Rest-of-World catch-all. The
 admin UI is the **Delivery Regions** tab (`AdminDeliveryRegionsPanel`).
+
+### Ship-from address requirement
+
+Every store must have a complete ship-from origin (street, city, state, postal code, country —
+stored in `store.shipping.carrier.origin*`) before it can be set to `active`. The activation
+endpoint (`PUT /api/stores/:id/status`) returns `400 ship_from_required` when any field is blank,
+unless the caller is an admin (admin can activate on behalf of a seller during onboarding). Stores
+that were already active before this requirement was introduced receive `shipFromComplete: false` in
+the store response and show a dismissible amber warning banner in the seller dashboard. The origin
+address is entered in the **Ship-from address** section of Store Settings (always visible regardless
+of shipping mode) using the same `AddressAutocomplete` + draggable-pin `AddressMap` components used
+at checkout. The origin is also consumed by the tax engine when Avalara is active — see
+[`docs/tax-book.md §9`](docs/tax-book.md#9-ship-from-address-and-avalara-nexus).
 
 ---
 
@@ -2351,6 +2368,10 @@ timestamp; `null` for internal — it's a `Mixed` field so a provider swap needs
 
 ```
 POST /api/tax/estimate          { items:[{ productId, quantity, variantAttributes }],
+                                  storeId,                               (optional but recommended —
+                                    used to load the store's ship-from origin so Avalara receives the
+                                    correct nexus address; falls back to the storeId stored on the
+                                    product document)
                                   destination:{ country, state, city, street, postalCode } }
                                 -> { taxAmount, perLine, jurisdiction, provider }   (informational)
 GET  /api/public/tax-categories -> { data, groups:{ special[], product[] } }  (seller product form +
@@ -2414,6 +2435,16 @@ while two fingers pan the map and the marker stays draggable; the map is 280 px 
 fallback message. `EXPO_PUBLIC_GOOGLE_MAPS_API_KEY` has been **removed** — the mobile app no longer
 holds a Maps key (documented in `mobile/env.md`).
 
+### Ship-from address autocomplete (seller settings)
+
+`frontend/src/components/seller/SellerStoreSettings.jsx` reuses the same `AddressAutocomplete` and
+`AddressMap` components for the seller's ship-from origin address. The street field autocompletes
+via the same backend Places proxy; selecting a suggestion populates all five origin fields at once
+(`originStreet/City/State/PostalCode/Country`). The draggable-pin map renders below the address grid
+— dragging the pin reverse-geocodes and fills the same five fields. This section is always visible
+in Store Settings regardless of the active shipping mode (flat/tiered/carrier). The values are saved
+as part of the normal settings form and are read by the tax engine at checkout.
+
 ---
 
 ## New environment variables (shipping, tax, address & resilience)
@@ -2428,6 +2459,24 @@ SHIPPING_COST                     Marketplace default per-order rate when a stor
 SHIPPING_DEFAULT_CURRENCY         Currency shown for marketplace default. Default USD.
 SHIPPING_MIN_RATE                 Optional admin floor; computed rate is clamped up to this.
 SHIPPING_MAX_RATE                 Optional admin ceiling; computed rate is clamped down to this.
+
+# ── Carrier / Shippo ────────────────────────────────────────────────
+SHIPPING_PROVIDER                 Active carrier adapter: 'disabled' (dev default), 'manual',
+                                  'aramex', or 'shippo'.
+SHIPPO_API_KEY                    Shippo API key. Required when SHIPPING_PROVIDER=shippo. Secret.
+SHIPPO_ENVIRONMENT                'sandbox' or 'production'. Default 'sandbox'.
+FEATURE_SHIPPO_RATES              true → carrier-mode stores get live Shippo rates at checkout;
+                                  false (default) → falls back to store.shipping.carrier.fallbackRate.
+FEATURE_SHIPPO_TRACKING           true → GET /orders/:id/shipments/:shipId/tracking performs a live
+                                  carrier sync; false (default) → returns persisted events only.
+# Optional Shippo tuning:
+# SHIPPO_API_BASE_URL=https://api.goshippo.com
+# SHIPPO_TIMEOUT_MS=15000
+# SHIPPO_MAX_RETRIES=3
+# SHIPPO_RETRY_BASE_DELAY_MS=300
+# SHIPPO_LABEL_FILE_TYPE=PDF
+# SHIPPO_MAX_RATE_ATTEMPTS=6      # label purchase tries up to N carriers (skips unactivated ones)
+# SHIPPO_TEST_TRACKING_NUMBER=SHIPPO_TRANSIT  # sandbox sample number for tracking demos
 
 # ── Tax ──────────────────────────────────────────────────────────────────────
 TAX_RATE                          Final fallback rate when no TaxRule/provider applies. Default 0.14.
@@ -5481,21 +5530,43 @@ The shipping layer follows the same adapter-map pattern as COD payouts
 - `providers/manual.adapter.js` — accepts caller-supplied tracking number; no external API call.
 - `providers/aramex.adapter.js` — Aramex Shipping API integration (sandbox: create shipment, track
   shipment, status mapping).
+- `providers/shippo.adapter.js` — Shippo integration (Phase 3): live multi-carrier rates
+  (`getRates`), label purchase (create), and tracking (`track`). Single platform-wide account via
+  `SHIPPO_API_KEY`; the platform pays Shippo and the Shipping-Liability ledger handles accounting.
 - `providers/disabled.adapter.js` — returns a safe `{ ok: false }` no-op without throwing; default
   for local development.
 
 Adapters share a normalized result shape, idempotency keys, and retry-with-backoff. Set
-`SHIPPING_PROVIDER=disabled` for local development, `manual` for operator-entered tracking, or
-`aramex` for full carrier API integration.
+`SHIPPING_PROVIDER=disabled` for local development, `manual` for operator-entered tracking, `aramex`
+for the Aramex carrier API, or `shippo` for Shippo label/tracking.
+
+**Carrier-calculated rates (`shipping.mode='carrier'`).** A seller can opt a store into live carrier
+rates. At checkout, `resolveStoreShippingRate` (async wrapper around the pure
+`resolveStoreShipping`) calls Shippo `getRates` for the origin → destination → parcel and charges
+the cheapest rate (+ handling, clamped). The parcel weight is summed from product `weight` (grams),
+falling back to the store's `shipping.carrier.defaultParcel`, then a global default (0.5 kg / 10 cm
+cube). Gated by `FEATURE_SHIPPO_RATES`; when off (or on any Shippo error/timeout) it falls back to
+`shipping.carrier.fallbackRate`, so checkout never blocks on the carrier. Flat/tiered modes stay
+fully synchronous.
+
+**Customer tracking.** `GET /orders/:orderId/shipments/:shipmentId/tracking` (owner-only) performs a
+throttled live carrier sync (gated by `FEATURE_SHIPPO_TRACKING`) and persists the latest events; the
+order-details "Track My Shipment" action (web + mobile) drives it.
 
 ### Seller shipment management
 
-- `POST /seller/orders/:id/shipments` — create a shipment. Sellers can enter a tracking number +
-  carrier manually, or trigger label generation via the carrier API using the "Generate Label"
-  button in the `ShipmentForm` component (`frontend/src/components/SellerOrdersPanel.jsx`).
+- `POST /seller/orders/:id/shipments` — create a shipment. Sellers choose one of two paths:
+  - **Manual entry** — enter a tracking number + carrier directly; no external API call.
+  - **Generate Label** (`source:'api'`) — the backend calls Shippo to purchase a label using the
+    carrier rate that was stored on the order at checkout. If that rate has expired Shippo re-quotes
+    automatically before purchase. The label URL (`labelUrl`) is signed and stripped from the
+    customer-facing shipment response.
 - `GET /seller/orders/:id/shipments` — list all shipments on an order.
 - Zustand store actions: `fetchShipments`, `createShipmentManual`, `createShipmentApi` (with
   optimistic update and rollback on error).
+- The `ShipmentForm` component (`frontend/src/components/SellerOrdersPanel.jsx`) exposes both paths
+  in a toggle; the Generate Label button is only shown when `FEATURE_SHIPPO_RATES=true` and the
+  store's shipping mode is `carrier`.
 
 ### Customer order tracking timeline
 
@@ -5884,7 +5955,7 @@ Fields
                  dispute_escalated, order_cancelled, new_order, new_dispute)
   titleKey    — i18n key resolved client-side (e.g. "notifications.order_shipped.title")
   bodyKey     — i18n key resolved client-side
-  variables   — interpolation map (orderId, amount, productName, etc.)
+  variables   — interpolation map (orderId, amount, productName, carrier, trackingUrl, etc.)
   read        — boolean; false by default
   createdAt   — timestamp
 ```
@@ -5924,6 +5995,21 @@ DELETE /api/notifications/:id         — delete one notification
 - Tapping the bell opens a bottom sheet listing notifications; tapping a row opens a detail modal.
 - Polling is AppState-aware: paused when the app is backgrounded, resumed on foreground.
 - Theme tokens from the generated palette are used throughout.
+
+### `order_shipped` notification
+
+The `order_shipped` notification is fired by the order-financials hook
+(`backend/src/services/orders/orderFinancials.hook.js`) when a shipment's status transitions to
+`in_transit` or later. The `variables` map includes `carrier`, `trackingUrl`, and `orderId`. The
+body key is chosen based on whether a tracking URL is available:
+
+- `notifications.types.order_shipped.body` — shown when `trackingUrl` is present; the client renders
+  it as a clickable link to the carrier tracking page.
+- `notifications.types.order_shipped.bodyNoTracking` — shown when no tracking URL is available
+  (manual shipments without a public URL).
+
+The notification `link` field is set to `trackingUrl` when present, otherwise to `/orders/<orderId>`
+so tapping the notification still navigates to the order detail page.
 
 ### Wiring new notification types
 
@@ -6547,10 +6633,12 @@ SELLER_CLOSURE_FINALIZER_ENABLED   # set to "false" to disable automatic finaliz
 
 ```
 SHIPPING_PROVIDER                  # Active carrier adapter: 'disabled' | 'manual' | 'aramex'
+                                   #                         | 'shippo'
                                    # 'disabled' (default) returns { ok: false } without throwing
                                    # — safe for local dev. 'manual' accepts caller-supplied
                                    # tracking numbers. 'aramex' calls the Aramex Shipping API.
-                                   # REQUIRED IN PRODUCTION (set to 'manual' or 'aramex')
+                                   # 'shippo' calls the Shippo API (labels + tracking).
+                                   # REQUIRED IN PRODUCTION (set to 'manual', 'aramex' or 'shippo')
 
 # Aramex credentials — required when SHIPPING_PROVIDER=aramex
 ARAMEX_USERNAME                    # Aramex account username
@@ -6564,6 +6652,31 @@ ARAMEX_BASE_URL                    # Aramex API base URL
                                    # Production: https://ws.aramex.net
 ARAMEX_WEBHOOK_SECRET              # HMAC secret for validating incoming Aramex webhook callbacks
                                    # REQUIRED IN PRODUCTION when SHIPPING_PROVIDER=aramex
+
+# Shippo (Phase 3: carrier-calculated rates + tracking). Single platform-wide account.
+SHIPPO_API_KEY                     # Shippo API token. Test tokens start with shippo_test_;
+                                   # use a live token in production. REQUIRED for carrier mode
+                                   # and live tracking; absent => adapters return shippo_config_missing
+                                   # and carrier mode falls back to carrier.fallbackRate.
+SHIPPO_ENVIRONMENT                 # 'sandbox' (dev) | 'live' (prod) — informational marker
+SHIPPO_API_BASE_URL                # optional, default https://api.goshippo.com
+SHIPPO_TIMEOUT_MS                  # optional, default 15000
+SHIPPO_MAX_RETRIES                 # optional, default 3
+SHIPPO_RETRY_BASE_DELAY_MS         # optional, default 300
+SHIPPO_LABEL_FILE_TYPE             # optional, default PDF
+SHIPPO_MAX_RATE_ATTEMPTS           # optional, default 6 — label purchase tries up to N carriers,
+                                   # skipping ones whose account isn't activated
+SHIPPO_TEST_TRACKING_NUMBER        # optional, default SHIPPO_TRANSIT — sandbox-only sample number
+SHIPPO_FROM_EMAIL                  # optional — sender email used on labels when the store has none
+SHIPPO_FROM_PHONE                  # optional — sender phone used on labels when the store has none
+                                   # (a non-empty sender email/phone is required by some carriers,
+                                   # e.g. USPS, to purchase a label)
+
+# Phase 3 feature flags (default off; enable per environment after validation)
+FEATURE_SHIPPO_RATES               # 'true' => carrier-mode stores get live Shippo rates at checkout;
+                                   # off => fall back to carrier.fallbackRate
+FEATURE_SHIPPO_TRACKING            # 'true' => customer tracking endpoint does a live carrier sync;
+                                   # off => serves cached shipment events only
 ```
 
 **Payment provider + COD refund/payout policy**
