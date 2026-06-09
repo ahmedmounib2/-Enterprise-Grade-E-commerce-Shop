@@ -15,6 +15,7 @@ see the **Category-based tax engine** section of the root `README.md`.
     - [Configuration](#configuration)
     - [Auto-fallback](#auto-fallback)
     - [Cross-environment retry (env mismatch self-correction)](#cross-environment-retry-env-mismatch-self-correction)
+    - [Rate-limit resilience](#rate-limit-resilience)
   - [5. Avalara tax codes](#5-avalara-tax-codes)
   - [6. TaxProvider health](#6-taxprovider-health)
   - [7. Order tax audit](#7-order-tax-audit)
@@ -44,6 +45,10 @@ Avalara  ──(any failure)──▶  internal TaxRules  ──(no rule matches
 - `TAX_PROVIDER=avalara` → Avalara, and on **any** Avalara failure (missing creds, 4xx/5xx,
   network/timeout, trial expired) it falls back to the internal `TaxRule`s, which themselves fall
   back to `TAX_RATE` (default `0.14`).
+- **Cross-border zero-rating (internal engine only):** when the store's ship-from country differs
+  from the destination country, the internal engine returns `$0` tax — cross-border sales are
+  zero-rated in the internal fallback. Avalara handles cross-border jurisdiction natively when it is
+  active.
 
 The cart and checkout show tax informationally via `POST /api/tax/estimate`; the **authoritative**
 tax is recomputed server-side at order creation (Stripe and COD flows) and persisted on the order.
@@ -166,6 +171,19 @@ transaction **401s** against the configured environment, it retries the request 
 `Set AVALARA_ENVIRONMENT=<env>` hint — so checkout still gets a real quote, but you should fix the
 env var to avoid a wasted first request per quote. The health probe (§6) does the same and reports
 `reason: environment_mismatch` with the environment the credentials actually belong to.
+
+### Rate-limit resilience
+
+Three layers protect the Avalara integration from excessive API calls:
+
+| Layer                | Where                               | What it does                                                                                                                                           |
+| -------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 2 s debounce         | frontend (`POST /api/tax/estimate`) | Waits 2 s after the last address keystroke before firing the estimate request; prevents a burst of calls during fast address entry.                    |
+| 5-char street guard  | frontend                            | Skips the estimate call when the street field has fewer than 5 characters, preventing noise requests on partial input.                                 |
+| 60 s in-memory cache | `avalara.provider.js`               | Caches each Avalara quote keyed by the full `address + items` fingerprint for 60 s; repeated estimates for the same cart do not consume Avalara quota. |
+
+The debounce and guard apply to the **estimate** endpoint only; order-creation and refund calls are
+not debounced (they happen once on submit and must complete synchronously).
 
 ---
 
@@ -316,8 +334,10 @@ Both `POST /api/tax/estimate` and the Stripe/COD checkout resolve the store orig
 1. Load the store by `storeId` (derived from the products in the cart, with the `storeId` field in
    the request body as a reliable fallback for products created before that field was indexed).
 2. Read `store.shipping.carrier.origin*` and pass it as `shipFrom` to `getTaxProvider().quote()`.
-3. The estimate frontend now sends `storeId` and a full `destination` (including `street` and
-   `postalCode`) so Avalara gets the precise jurisdiction rather than just country/state.
+3. The estimate frontend (web and mobile) sends `storeId` and a full `destination` (including
+   `street` and `postalCode`) so Avalara gets the precise jurisdiction rather than just
+   country/state. The mobile app previously sent only country/state — it now sends the complete
+   destination object including street and postal code, and the correct `storeId`.
 
 ### `buildTransaction` fallback for missing street
 

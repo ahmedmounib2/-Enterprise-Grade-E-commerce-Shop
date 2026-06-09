@@ -147,6 +147,7 @@
     - [Draggable-pin map (web)](#draggable-pin-map-web)
     - [Draggable-pin map (mobile, WebView)](#draggable-pin-map-mobile-webview)
     - [Ship-from address autocomplete (seller settings)](#ship-from-address-autocomplete-seller-settings)
+    - [Profile address management](#profile-address-management)
   - [New environment variables (shipping, tax, address \& resilience)](#new-environment-variables-shipping-tax-address--resilience)
   - [Payment \& order flow (detailed)](#payment--order-flow-detailed)
     - [Checkout (Stripe) flow — `createCheckoutSession`](#checkout-stripe-flow--createcheckoutsession)
@@ -2344,6 +2345,16 @@ creds, 4xx/5xx, network/timeout, trial expired) the avalara provider catches and
 internal result, which itself falls back to `TAX_RATE` — so the tax provider can never break
 checkout.
 
+**Cross-border zero-rating (internal engine).** When the store's ship-from country does not match
+the destination country, the internal engine returns `$0` tax — cross-border sales are zero-rated in
+the internal fallback. Avalara handles cross-border jurisdiction natively when active.
+
+**Avalara rate-limit resilience.** The `POST /api/tax/estimate` endpoint is protected by a 2 s
+debounce on the frontend (fires after the last address keystroke), a 5-character street guard (skips
+the call when the street field is too short), and a 60 s in-memory cache on the Avalara provider
+keyed by the full address + items fingerprint — so repeated estimates for the same cart do not count
+against the Avalara rate limit.
+
 **Environment auto-correction** — these credentials must match the tier they belong to. If a request
 401s against the configured environment, the provider transparently retries the _other_ environment
 once; if the credentials authenticate there it uses that result and logs
@@ -2444,6 +2455,23 @@ via the same backend Places proxy; selecting a suggestion populates all five ori
 — dragging the pin reverse-geocodes and fills the same five fields. This section is always visible
 in Store Settings regardless of the active shipping mode (flat/tiered/carrier). The values are saved
 as part of the normal settings form and are read by the tax engine at checkout.
+
+### Profile address management
+
+Shipping and billing addresses entered at checkout are **auto-saved to the user profile** after a
+successful order placement (fire-and-forget; never blocks or delays the checkout flow). On the next
+checkout visit the saved address pre-fills the form.
+
+The web **Profile page** (`frontend/src/pages/ProfilePage.jsx`) replaces the plain text inputs for
+shipping and billing addresses with the same `AddressAutocomplete` + `AddressMap` components used at
+checkout. When a profile address is saved, the checkout `sessionStorage` key is cleared so the fresh
+address pre-fills on the next visit rather than showing stale session data. Profile addresses are
+stored encrypted in the database; a missing `.lean()` call was causing encrypted fields to return as
+raw objects — profile address endpoints now call `findOne()` (not `.lean()`) so decryption runs
+correctly.
+
+The **mobile** Profile screen (`mobile/src/screens/ProfileScreen.js`) uses the same
+`AddressAutocomplete` component (via the backend proxy) for address editing.
 
 ---
 
@@ -5517,7 +5545,14 @@ Fields
 ```
 
 Creating the first shipment on an order transitions the order from `processing` → `dispatched` and
-stamps `Order.shippedAt`.
+stamps `Order.shippedAt`. If the order is already `dispatched` when the first shipment is added
+(e.g. set by an admin), the status is unchanged but `onOrderStatusChanged` still fires so the
+customer receives the shipped email and notification.
+
+**Dispatch gate:** The seller cannot manually transition an order to `dispatched` until at least one
+shipment carries a non-empty `trackingNumber`. The `updateSellerOrderStatus` endpoint returns
+`400 tracking_required` when this condition is not met. The dispatched `<option>` in the seller
+order-status dropdown is also disabled in the UI until the condition is met.
 
 ### Carrier service abstraction
 
@@ -5543,11 +5578,20 @@ for the Aramex carrier API, or `shippo` for Shippo label/tracking.
 **Carrier-calculated rates (`shipping.mode='carrier'`).** A seller can opt a store into live carrier
 rates. At checkout, `resolveStoreShippingRate` (async wrapper around the pure
 `resolveStoreShipping`) calls Shippo `getRates` for the origin → destination → parcel and charges
-the cheapest rate (+ handling, clamped). The parcel weight is summed from product `weight` (grams),
-falling back to the store's `shipping.carrier.defaultParcel`, then a global default (0.5 kg / 10 cm
-cube). Gated by `FEATURE_SHIPPO_RATES`; when off (or on any Shippo error/timeout) it falls back to
-`shipping.carrier.fallbackRate`, so checkout never blocks on the carrier. Flat/tiered modes stay
-fully synchronous.
+the cheapest rate (+ handling, clamped). The parcel weight and dimensions are summed from
+per-product `weight`, `dimensionLength`, `dimensionWidth`, and `dimensionHeight` fields, falling
+back to the store's `shipping.carrier.defaultParcel`, then a global default (0.5 kg / 10 cm cube).
+The shipping/ tax estimate endpoint uses the same product weight and dimensions so the quoted rate
+during browsing matches what is charged at checkout. Gated by `FEATURE_SHIPPO_RATES`; when off (or
+on any Shippo error/timeout) it falls back to `shipping.carrier.fallbackRate`, so checkout never
+blocks on the carrier. Flat/tiered modes stay fully synchronous.
+
+The rate picker shows the cheapest available rate **pre-selected** on load. The checkout uses the
+`servicelevelToken` (not the carrier name string) to match the customer-chosen rate when purchasing
+the Shippo label — this guarantees the correct service level is purchased even when two carriers
+share a similar service name. When Shippo returns no rates the UI surfaces the reason from Shippo
+(e.g. `rate_not_available`, `outside_service_area`) alongside freight-carrier guidance for sellers
+whose parcels exceed standard carrier size or weight limits.
 
 **Customer tracking.** `GET /orders/:orderId/shipments/:shipmentId/tracking` (owner-only) performs a
 throttled live carrier sync (gated by `FEATURE_SHIPPO_TRACKING`) and persists the latest events; the
@@ -5567,6 +5611,11 @@ order-details "Track My Shipment" action (web + mobile) drives it.
 - The `ShipmentForm` component (`frontend/src/components/SellerOrdersPanel.jsx`) exposes both paths
   in a toggle; the Generate Label button is only shown when `FEATURE_SHIPPO_RATES=true` and the
   store's shipping mode is `carrier`.
+  - **Manual entry** supports a custom carrier name: selecting "Other" in the carrier dropdown
+    reveals a free-text input so sellers can specify a carrier not on the preset list.
+  - An optional **Tracking URL** field lets the seller paste the carrier's public tracking page URL;
+    when provided it is stored on the shipment, used as the notification `link`, and included in the
+    shipped email as a clickable link.
 
 ### Customer order tracking timeline
 
@@ -5998,10 +6047,11 @@ DELETE /api/notifications/:id         — delete one notification
 
 ### `order_shipped` notification
 
-The `order_shipped` notification is fired by the order-financials hook
-(`backend/src/services/orders/orderFinancials.hook.js`) when a shipment's status transitions to
-`in_transit` or later. The `variables` map includes `carrier`, `trackingUrl`, and `orderId`. The
-body key is chosen based on whether a tracking URL is available:
+The `order_shipped` notification is fired by the `onOrderStatusChanged` hook
+(`backend/src/services/orders/orderFinancials.hook.js`) when an order transitions to `dispatched` —
+either via the manual status dropdown or when the **first shipment** (label or manual tracking) is
+created on the order. The `variables` map includes `carrier`, `trackingUrl`, and `orderId`. The body
+key is chosen based on whether a tracking URL is available:
 
 - `notifications.types.order_shipped.body` — shown when `trackingUrl` is present; the client renders
   it as a clickable link to the carrier tracking page.
@@ -6010,6 +6060,11 @@ body key is chosen based on whether a tracking URL is available:
 
 The notification `link` field is set to `trackingUrl` when present, otherwise to `/orders/<orderId>`
 so tapping the notification still navigates to the order detail page.
+
+The companion **shipped email** (`sendOrderShippedEmail`) uses a **three-way template** keyed by
+tracking state: no tracking → `htmlNoTracking` / `plainNoTracking`; tracking + URL → `html` /
+`plain`; tracking without URL → `htmlTrackingNoUrl` / `plainTrackingNoUrl`. This prevents a broken
+`<a href="">` link when a manual shipment has a tracking number but no public tracking URL.
 
 ### Wiring new notification types
 
