@@ -11,8 +11,8 @@ and environment flag see the [main README](../README.md#in-app-notification-cent
 FEATURE_IN_APP_NOTIFICATIONS=true
 ```
 
-When unset or `false`, all `/api/notifications/*` routes return 404 and the bell UI is hidden on
-web and mobile.
+When unset or `false`, all `/api/notifications/*` routes return 404 and the bell UI is hidden on web
+and mobile.
 
 ---
 
@@ -96,8 +96,8 @@ Navbar
 
 - Badge shows unread count; hidden when count is 0.
 - Dropdown renders at most 10 recent notifications (configurable).
-- Unread rows have a distinct background tint and left accent border using DaisyUI theme tokens —
-  no hardcoded colours.
+- Unread rows have a distinct background tint and left accent border using DaisyUI theme tokens — no
+  hardcoded colours.
 - Clicking a row marks it read and opens the detail modal; the dropdown stays open.
 - The modal is portal-rendered to `document.body` to avoid z-index conflicts.
 - Polling: `setInterval` at 60 000 ms; cleared on component unmount.
@@ -147,14 +147,74 @@ service layer.
 
 ---
 
-## 7. Wiring new notification types
+## 7. Dispatched (`order_shipped`) notification
+
+The `order_shipped` notification is fired by `onOrderStatusChanged`
+(`backend/src/services/orders/orderFinancials.hook.js`) whenever an order transitions to
+`dispatched`. This happens in two paths:
+
+- **Label-generated shipment:** seller purchases a Shippo carrier label via
+  `POST /seller/orders/:id/shipments` (`source: 'api'`). The first label creation auto-transitions
+  the order from `processing` → `dispatched`.
+- **Manual tracking entry:** seller fills in a tracking number (and optionally a tracking URL and
+  custom carrier name) in the ShipmentForm. Same `onOrderStatusChanged` hook fires.
+
+### Variables map
+
+| Variable      | Source                                                            | Notes                                             |
+| ------------- | ----------------------------------------------------------------- | ------------------------------------------------- |
+| `orderId`     | `order._id`                                                       | Always present                                    |
+| `carrier`     | `shipment.carrier` (e.g. `"usps"`, `"dhl"`, `"My Local Courier"`) | Custom carrier name when "Other" selected in form |
+| `trackingUrl` | `shipment.trackingUrl` — public carrier tracking page URL         | May be absent for manual shipments with no URL    |
+
+### Body-key selection
+
+The notification body key depends on whether a tracking URL is present:
+
+- `notifications.types.order_shipped.body` — when `trackingUrl` is set; the client renders the URL
+  as a clickable link.
+- `notifications.types.order_shipped.bodyNoTracking` — when no tracking URL is available (manual
+  shipments that have a tracking number but no public tracking page URL).
+
+The `link` field on the notification document is set to `trackingUrl` when present, otherwise to
+`/orders/<orderId>` so tapping the notification still opens the correct order detail page.
+
+### Companion shipped email
+
+`sendOrderShippedEmail` uses a **three-way template** keyed by tracking state:
+
+| State                     | Template keys used                         |
+| ------------------------- | ------------------------------------------ |
+| No tracking number at all | `htmlNoTracking` / `plainNoTracking`       |
+| Tracking number + URL     | `html` / `plain`                           |
+| Tracking number, no URL   | `htmlTrackingNoUrl` / `plainTrackingNoUrl` |
+
+The three-way selection prevents a broken `<a href="">` link in cases where a seller has a tracking
+number (e.g. from a local carrier) but no publicly accessible tracking URL.
+
+### Custom carrier name
+
+When a seller selects **"Other"** in the carrier dropdown on the ShipmentForm, a free-text input is
+revealed and its value is stored as `shipment.carrier`. This custom string is passed directly in the
+notification `variables.carrier` so the customer sees the actual carrier name (e.g. "Aramex Local
+Office", "Hand delivery") rather than a generic placeholder.
+
+### Manual tracking URL
+
+An optional **Tracking URL** field lets the seller paste the carrier's tracking page URL. When
+provided it is stored on the `Shipment` document, set as the notification `link`, and embedded as a
+clickable hyperlink in the shipped email. When absent the system gracefully falls back to the
+`bodyNoTracking` key and the order page link — no broken links are ever rendered.
+
+---
+
+## 8. Wiring new notification types
 
 Follow these four steps to add a notification type end-to-end:
 
 **Step 1 — Model**
 
-Add the new type string to the `type` enum in
-`backend/src/models/notification.model.js`.
+Add the new type string to the `type` enum in `backend/src/models/notification.model.js`.
 
 **Step 2 — i18n**
 
@@ -174,11 +234,10 @@ Keys must be present in all four files before merge (locale key parity is requir
 At the relevant callsite (controller or service) add:
 
 ```js
-await fireNotification(userId, 'your_new_type', { key: value });
+await fireNotification(userId, "your_new_type", { key: value });
 ```
 
-Import `fireNotification` from
-`backend/src/services/notification/notification.service.js`.
+Import `fireNotification` from `backend/src/services/notification/notification.service.js`.
 
 The call is fire-and-forget: wrap in a try/catch if needed, but do not let a notification failure
 propagate to the caller.
@@ -190,7 +249,7 @@ the `onNotificationPress` handler in the web `NotificationRow` and mobile `Botto
 
 ---
 
-## 8. Redis keys used
+## 9. Redis keys used
 
 ```
 notification:unread:<userId>    — cached unread count (TTL ~60 s)

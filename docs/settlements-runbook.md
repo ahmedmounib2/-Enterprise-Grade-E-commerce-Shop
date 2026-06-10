@@ -10,29 +10,33 @@ and manual fallback procedures.
 The settlement engine aggregates immutable seller ledger entries. Every entry carries an integer
 `amountCents`, currency, and source references (order/refund).
 
-| Type                       | Trigger                                                                                         | Merchant-scoped sign                                 | Platform-scoped sign                       | Idempotency-key pattern                                                                                                                               |
-| -------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sale`                     | Order marked delivered (`recordDeliveryLedger`)                                                 | Positive (seller revenue)                            | —                                          | `delivered:sale:{orderId}:{sellerId}`                                                                                                                 |
-| `commission`               | Same delivery event as `sale`                                                                   | Negative (platform fee deducted)                     | —                                          | `delivered:commission:{orderId}:{sellerId}`                                                                                                           |
-| `platform_fee`             | Same delivery event as `sale`/`commission`                                                      | —                                                    | Positive (mirrors commission credit)       | `delivered:platform_fee:{orderId}:{sellerId}:platform`                                                                                                |
-| `tax`                      | Same delivery event; two rows posted                                                            | Negative (seller tax share)                          | Positive (platform collects)               | `delivered:tax:{orderId}:{sellerId}:seller` / `:platform`                                                                                             |
-| `shipping_fee`             | Same delivery event; two rows posted                                                            | Negative (seller shipping share)                     | Positive (platform collects)               | `delivered:shipping_fee:{orderId}:{sellerId}:seller` / `:shipping`                                                                                    |
-| `refund`                   | `refund.updated` or `charge.refunded` webhook (`recordRefundLedger`)                            | Negative (revenue reversed)                          | —                                          | `refunded:refund:{orderId}:{sellerId}:{refundKeyPart}`                                                                                                |
-| `commission_reversal`      | Same refund event as `refund`                                                                   | Positive (commission returned to seller)             | Negative (platform gives back fee)         | `refunded:commission:{orderId}:{sellerId}:{refundKeyPart}`                                                                                            |
-| `tax_refund`               | Same refund event; two rows posted                                                              | Positive (tax refunded to seller)                    | Negative (platform returns tax)            | `refunded:tax_refund:{orderId}:{sellerId}:seller:{refundKeyPart}` / `:platform:{refundKeyPart}`                                                       |
-| `shipping_refund`          | Same refund event; two rows posted                                                              | Positive (shipping refunded to seller)               | Negative (platform returns shipping)       | `refunded:shipping_refund:{orderId}:{sellerId}:seller:{refundKeyPart}` / `:shipping:{refundKeyPart}`                                                  |
-| `processor_fee`            | Stripe balance transaction resolved (`recordPaymentProcessorFeeLiabilities`)                    | —                                                    | Negative (processor cost to platform)      | `processor_fee:{orderId}`                                                                                                                             |
-| `processing_fee`           | Same event as `processor_fee`; per-seller row                                                   | Negative (seller's share of processor cost)          | —                                          | `processing_fee:{orderId}:{sellerId}`                                                                                                                 |
-| `processor_fee_recovery`   | Corrective entry when actual processor fee differs from estimate (`recordProcessorFeeRecovery`) | Positive or negative (delta vs estimate, per seller) | Positive or negative (platform-side delta) | `processor_fee_recovery:{orderId}:delta:{deltaKey}` / `:{sellerId}`                                                                                   |
-| `cod_refund_disbursement`  | COD refund paid out to customer via provider (Chimoney webhook / reconciliation)                | —                                                    | Negative (platform disburses)              | `refunded:cod_refund_disbursement:{orderId}:{sellerId}:{refundKeyPart}:platform`                                                                      |
-| `cod_refund_reimbursement` | Same COD refund event                                                                           | Negative (seller reimburses platform)                | —                                          | `refunded:cod_refund_reimbursement:{orderId}:{sellerId}:{refundKeyPart}:seller`                                                                       |
-| `adjustment`               | Manual operator correction                                                                      | Variable                                             | Variable                                   | Caller-supplied; no standard shape                                                                                                                    |
-| `payout_reversal`          | Admin reversal endpoint (`POST /api/admin/settlements/payouts/:id/reverse`)                     | Negative (offsets original payout credit)            | —                                          | `payout_reversal:{payoutId}:{reversalId}`                                                                                                             |
-| `payout_execution`         | Successful retry execution of a `retryable` payout                                              | Positive (re-credited after reversal)                | —                                          | `settlement:{batchId}:{sellerId}:{currency}:retry:{retrySeq}:{timestamp}`                                                                             |
-| `manual_payout`            | Manual payout via `manualSettlementPayout.service.js`                                           | Positive (payout credit)                             | —                                          | `manual_payout:{payoutId}:{transactionId}`                                                                                                            |
-| `reserve`                  | Reserve withholding job at settlement cycle                                                     | Negative (amount withheld from net payout)           | —                                          | Caller-supplied or derived from `reserve_release:{sellerId}:{currency}:{amount}:{reason}:{actor}:{reserveMonth}`                                      |
-| `reserve_release`          | Reserve release job after hold period expires                                                   | Positive (withheld amount returned)                  | —                                          | Derived from components: `reserve_release:{sellerId}:{currency}:{amount}:{reason}:{actor}:{reserveMonth}:{marker}`                                    |
-| `reserve_used`             | Reserve applied against outstanding debt (refund path or release job debt path)                 | Positive (cancels outstanding reserve debit)         | —                                          | `refunded:reserve_used:{orderId}:{sellerId}:{refundKeyPart}` (refund) or `reserve_release_job:reserve_used:debt:{sellerId}:{currency}:{reserveMonth}` |
+| Type                       | Trigger                                                                                                                                   | Merchant-scoped sign                                                                             | Platform-scoped sign                                                | Idempotency-key pattern                                                                                                                               |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sale`                     | Order marked delivered (`recordDeliveryLedger`)                                                                                           | Positive (seller revenue)                                                                        | —                                                                   | `delivered:sale:{orderId}:{sellerId}`                                                                                                                 |
+| `commission`               | Same delivery event as `sale`                                                                                                             | Negative (platform fee deducted)                                                                 | —                                                                   | `delivered:commission:{orderId}:{sellerId}`                                                                                                           |
+| `platform_fee`             | Same delivery event as `sale`/`commission`                                                                                                | —                                                                                                | Positive (mirrors commission credit)                                | `delivered:platform_fee:{orderId}:{sellerId}:platform`                                                                                                |
+| `tax`                      | Same delivery event; two rows posted                                                                                                      | Negative (seller tax share)                                                                      | Positive (platform collects)                                        | `delivered:tax:{orderId}:{sellerId}:seller` / `:platform`                                                                                             |
+| `shipping_fee`             | Same delivery event; two rows posted                                                                                                      | Negative (seller shipping share)                                                                 | Positive (platform collects)                                        | `delivered:shipping_fee:{orderId}:{sellerId}:seller` / `:shipping`                                                                                    |
+| `refund`                   | `refund.updated` or `charge.refunded` webhook (`recordRefundLedger`)                                                                      | Negative (revenue reversed)                                                                      | —                                                                   | `refunded:refund:{orderId}:{sellerId}:{refundKeyPart}`                                                                                                |
+| `commission_reversal`      | Same refund event as `refund`                                                                                                             | Positive (commission returned to seller)                                                         | Negative (platform gives back fee)                                  | `refunded:commission:{orderId}:{sellerId}:{refundKeyPart}`                                                                                            |
+| `tax_refund`               | Same refund event; two rows posted                                                                                                        | Positive (tax refunded to seller)                                                                | Negative (platform returns tax)                                     | `refunded:tax_refund:{orderId}:{sellerId}:seller:{refundKeyPart}` / `:platform:{refundKeyPart}`                                                       |
+| `tax_remittance`           | Admin records a tax payment to a tax authority (`POST /api/admin/platform-financials/tax-remittances`); gated by `FEATURE_TAX_REMITTANCE` | —                                                                                                | Negative (platform pays tax authority; debits `PLATFORM_SELLER_ID`) | `tax_remittance:{taxRemittanceId}`                                                                                                                    |
+| `shipping_refund`          | Same refund event; two rows posted                                                                                                        | Positive (shipping refunded to seller)                                                           | Negative (platform returns shipping)                                | `refunded:shipping_refund:{orderId}:{sellerId}:seller:{refundKeyPart}` / `:shipping:{refundKeyPart}`                                                  |
+| `shipping_label_cost`      | Carrier label purchased (`POST /seller/orders/:id/shipments` with `source:'api'`); gated by `FEATURE_SHIPPING_LABEL_LEDGER`               | —                                                                                                | Negative (carrier label cost; debits `SHIPPING_SELLER_ID`)          | `shipping_label_cost:{shipmentId}`                                                                                                                    |
+| `shipping_revenue`         | Same delivery event; flat/tiered shipping (`order.shippingMode !== 'carrier'`) when `FEATURE_SELLER_SHIPPING_PAYOUT=true`                 | Positive (seller keeps shipping as revenue)                                                      | —                                                                   | `delivered:shipping_revenue:{orderId}:{sellerId}`                                                                                                     |
+| `shipping_revenue_refund`  | Same refund event; reverses `shipping_revenue`                                                                                            | Negative (seller revenue reversed on refund)                                                     | —                                                                   | `refunded:shipping_revenue_refund:{orderId}:{sellerId}:{refundKeyPart}`                                                                               |
+| `processor_fee`            | Stripe balance transaction resolved (`recordPaymentProcessorFeeLiabilities`)                                                              | —                                                                                                | Negative (processor cost to platform)                               | `processor_fee:{orderId}`                                                                                                                             |
+| `processing_fee`           | Same event as `processor_fee`; per-seller row                                                                                             | Negative (seller's share of processor cost)                                                      | —                                                                   | `processing_fee:{orderId}:{sellerId}`                                                                                                                 |
+| `processor_fee_recovery`   | Corrective entry when actual processor fee differs from estimate (`recordProcessorFeeRecovery`)                                           | Positive or negative (delta vs estimate, per seller)                                             | Positive or negative (platform-side delta)                          | `processor_fee_recovery:{orderId}:delta:{deltaKey}` / `:{sellerId}`                                                                                   |
+| `cod_refund_disbursement`  | COD refund paid out to customer via provider (Chimoney webhook / reconciliation)                                                          | —                                                                                                | Negative (platform disburses)                                       | `refunded:cod_refund_disbursement:{orderId}:{sellerId}:{refundKeyPart}:platform`                                                                      |
+| `cod_refund_reimbursement` | Same COD refund event — amount = `refundAmountCents + taxRefundAmountCents + shippingRefundAmountCents`                                   | Negative (seller reimburses platform for the full customer refund: merchandise + tax + shipping) | —                                                                   | `refunded:cod_refund_reimbursement:{orderId}:{sellerId}:{refundKeyPart}:seller`                                                                       |
+| `adjustment`               | Manual operator correction                                                                                                                | Variable                                                                                         | Variable                                                            | Caller-supplied; no standard shape                                                                                                                    |
+| `payout_reversal`          | Admin reversal endpoint (`POST /api/admin/settlements/payouts/:id/reverse`)                                                               | Negative (offsets original payout credit)                                                        | —                                                                   | `payout_reversal:{payoutId}:{reversalId}`                                                                                                             |
+| `payout_execution`         | Successful retry execution of a `retryable` payout                                                                                        | Positive (re-credited after reversal)                                                            | —                                                                   | `settlement:{batchId}:{sellerId}:{currency}:retry:{retrySeq}:{timestamp}`                                                                             |
+| `manual_payout`            | Manual payout via `manualSettlementPayout.service.js`                                                                                     | Positive (payout credit)                                                                         | —                                                                   | `manual_payout:{payoutId}:{transactionId}`                                                                                                            |
+| `reserve`                  | Reserve withholding job at settlement cycle                                                                                               | Negative (amount withheld from net payout)                                                       | —                                                                   | Caller-supplied or derived from `reserve_release:{sellerId}:{currency}:{amount}:{reason}:{actor}:{reserveMonth}`                                      |
+| `reserve_release`          | Reserve release job after hold period expires                                                                                             | Positive (withheld amount returned)                                                              | —                                                                   | Derived from components: `reserve_release:{sellerId}:{currency}:{amount}:{reason}:{actor}:{reserveMonth}:{marker}`                                    |
+| `reserve_used`             | Reserve applied against outstanding debt (refund path or release job debt path)                                                           | Positive (cancels outstanding reserve debit)                                                     | —                                                                   | `refunded:reserve_used:{orderId}:{sellerId}:{refundKeyPart}` (refund) or `reserve_release_job:reserve_used:debt:{sellerId}:{currency}:{reserveMonth}` |
 
 Every entry carries an integer `amountCents`, currency, and source references (order/refund).
 Entries start with `payoutStatus=pending` and move through these phases:
@@ -246,6 +250,7 @@ simultaneously. Each job uses a distinct lock key:
 | Payout retry              | `lock:settlement_payout_retry`   | 120                   | `PAYOUT_RETRY_RUN_ON_BOOT`                                    |
 | COD payout reconciliation | `lock:cod_payout_reconciliation` | 120                   | `COD_PAYOUT_RECONCILIATION_RUN_ON_BOOT`                       |
 | Subscription renewal      | `lock:subscription_renewal`      | 120                   | `SUBSCRIPTION_RENEWAL_RUN_ON_BOOT`                            |
+| Liability reconciliation  | `liability:reconciliation:lock`  | 1800                  | `LIABILITY_RECONCILIATION_RUN_ON_BOOT`                        |
 
 **RUN_ON_BOOT semantics:** each `*_RUN_ON_BOOT` variable defaults to `false`. When `false`, the job
 only runs on its configured cron schedule — safe for multi-replica deployments where process startup
@@ -353,6 +358,21 @@ debt is resolved:
   `onOrderStatusChanged` call in a single session for the same reason.
 - A seller with `payoutHold: true` is excluded from payout execution and from the reserve release
   job until the hold is lifted (see Section 8 — Reserve withholding & release).
+
+**`cod_refund_reimbursement` accounting.** When a COD order is refunded, the platform disburses the
+full refund (merchandise + tax + shipping) to the customer via Chimoney. `cod_refund_reimbursement`
+claws back the **full** amount —
+`refundAmountCents + taxRefundAmountCents + shippingRefundAmountCents` (merchandise + tax +
+shipping) — from the seller's merchant-side balance. In the same COD refund event the seller is also
+credited `tax_refund` (+`taxRefundAmountCents`) and `shipping_refund`
+(+`shippingRefundAmountCents`); these exactly offset the tax/shipping portion of
+`cod_refund_reimbursement`, so the seller's **net** merchant-side movement for the refund is
+`-refundAmountCents` (merchandise only) — the operator-side `cod_refund_disbursement` debit is sized
+the same way, so the refund is fully accounted for on both sides with no residual liability. To
+verify, query all ledger rows for the order/refund and confirm
+`|cod_refund_reimbursement.amountCents|` equals
+`refundAmountCents + taxRefundAmountCents + shippingRefundAmountCents` from the corresponding
+`RefundRecord`/`refundPlan`.
 
 ### COD refund error-rate alerting and dashboarding
 
@@ -644,15 +664,15 @@ month releases are now correctly included when their hold period has elapsed.
 
 ## 9) Payout and refund notifications
 
-When `FEATURE_IN_APP_NOTIFICATIONS=true`, settlement and refund operations fire in-app
-notifications **in addition to** the transactional emails described in the main README.
+When `FEATURE_IN_APP_NOTIFICATIONS=true`, settlement and refund operations fire in-app notifications
+**in addition to** the transactional emails described in the main README.
 
-| Event                          | Email function               | Notification type    | Recipient  |
-| ------------------------------ | ---------------------------- | -------------------- | ---------- |
-| Settlement payout marked `paid`  | `sendPayoutCompletedEmail`   | `payout_completed`   | Seller     |
-| Settlement payout marked `failed`| `sendPayoutFailedEmail`      | `payout_failed`      | Seller     |
-| Refund approved                | `sendRefundApprovedCustomerEmail` / `...SellerEmail` | `refund_approved` | Customer + Seller |
-| Refund rejected                | `sendRefundRejectedCustomerEmail` / `...SellerEmail` | `refund_rejected` | Customer + Seller |
+| Event                             | Email function                                       | Notification type  | Recipient         |
+| --------------------------------- | ---------------------------------------------------- | ------------------ | ----------------- |
+| Settlement payout marked `paid`   | `sendPayoutCompletedEmail`                           | `payout_completed` | Seller            |
+| Settlement payout marked `failed` | `sendPayoutFailedEmail`                              | `payout_failed`    | Seller            |
+| Refund approved                   | `sendRefundApprovedCustomerEmail` / `...SellerEmail` | `refund_approved`  | Customer + Seller |
+| Refund rejected                   | `sendRefundRejectedCustomerEmail` / `...SellerEmail` | `refund_rejected`  | Customer + Seller |
 
 Both the email and the notification are fire-and-forget: a failure in one never suppresses the
 other. Notification delivery is handled by `fireNotification()` in
@@ -674,3 +694,124 @@ When the actual payment processor fee differs from the estimate posted at order 
 Both directions are handled in the same ledger write. The corrective entries ensure the net booked
 cost always equals the true processor charge regardless of whether the actual fee came in above or
 below the original estimate.
+
+---
+
+## 11) Shipping liability reconciliation
+
+The platform holds collected shipping fees in the Shipping Liability pool (`SHIPPING_SELLER_ID`).
+This pool should net to zero (or a small positive float) when carrier label costs are properly
+recorded. Verify the pool balance with:
+
+> **`FEATURE_SELLER_SHIPPING_PAYOUT` (default off):** when enabled, only **carrier**-mode shipping
+> flows into this liability pool. **Flat/tiered** (self-fulfilled) shipping is instead posted as
+> payout-eligible seller revenue (`shipping_revenue` / `shipping_revenue_refund`) and never touches
+> `SHIPPING_SELLER_ID`. The flag is **forward-only** — it changes how deliveries are posted while it
+> is on; historical flat/tiered rows already in the pool are left untouched (no backfill).
+
+> **Per-region classification.** `order.shippingMode` is the _effective_ mode for that order's
+> destination (`resolveEffectiveShippingMode`): a seller can set `shipping.regions[].mode` to
+> `carrier` for some regions and `flat`/`tiered` for others (or leave a region to inherit the
+> store-level mode). The carrier-vs-flat/tiered split above is therefore evaluated **per order, by
+> destination** — not per store. A single seller can have some deliveries post to the Shipping
+> Liability pool (carrier-region orders) and others post as `shipping_revenue` (flat/tiered-region
+> orders, when `FEATURE_SELLER_SHIPPING_PAYOUT=true`) within the same period.
+
+```
+# 1. Query the shipping liability seller's ledger entries for a period
+GET /api/admin/platform-financials/ledger
+  ?sellerId=<SHIPPING_SELLER_ID>&type=shipping_fee,shipping_refund,shipping_label_cost
+  &from=<YYYY-MM-01>&to=<YYYY-MM-01 next month>
+```
+
+**Expected signs:**
+
+| Type                  | Sign     | Meaning                              |
+| --------------------- | -------- | ------------------------------------ |
+| `shipping_fee`        | Positive | Collected from customers on delivery |
+| `shipping_refund`     | Negative | Returned to customers on refund      |
+| `shipping_label_cost` | Negative | Paid to Shippo for carrier labels    |
+
+**Net formula:** `shipping_fee + shipping_refund + shipping_label_cost` (sum of signed values).
+
+> **Carrier-only.** With `FEATURE_SELLER_SHIPPING_PAYOUT` on, flat/tiered shipping is **not** in
+> this net — it is posted as `shipping_revenue` / `shipping_revenue_refund` (seller revenue) and
+> surfaced separately on the snapshot as `sellerRetainedShippingCents`
+> (`shippingRevenueCents + shippingRevenueRefundCents`). It is reported for visibility only and
+> never affects the carrier-liability `status`. Both `marketplaceMetrics.shippingLiabilityCents`
+> (this carrier net) and `marketplaceMetrics.sellerRetainedShippingCents` are exposed by
+> `/api/admin/platform-financials` — never blend the two.
+
+A **positive net** means the platform collected more in shipping fees than it paid in labels —
+reasonable if the store's shipping prices exceed carrier cost. A **negative net** means outflows
+exceeded collections (e.g. labels were purchased for free/discounted shipping orders). The monthly
+`ReconciliationSnapshot` sets `status: 'review'` and logs a warning in this case.
+
+**Procedure when net is negative:**
+
+1. Query `ReconciliationSnapshot.findOne({ period, currency, status: 'review' })`.
+2. Identify whether the shortfall is from missing `shipping_label_cost` entries (e.g.
+   `FEATURE_SHIPPING_LABEL_LEDGER` was off when shipments were created), excess refunds, or
+   underpriced shipping.
+3. For missing historical entries, perform a backfill by calling `recordShippingLabelExpense` for
+   each affected shipment with `labelCostCents > 0` and `labelCostSource === 'api'`.
+4. Re-run reconciliation (`LIABILITY_RECONCILIATION_PERIOD=<period>`) after the backfill.
+
+---
+
+## 12) Tax remittance procedure
+
+When the platform pays collected tax to a tax authority, record the remittance via the admin panel
+or API before the next reconciliation run.
+
+**Admin panel:** Navigate to Admin → Marketplace Financials → Tax Remittances → Create. Fill in the
+period, amount, currency, and optionally the jurisdiction and filing notes. On success the document
+is filed and the ledger entry is posted automatically.
+
+**API:**
+
+```
+POST /api/admin/platform-financials/tax-remittances
+Authorization: admin/staff session cookie
+
+{
+  "period":       "2026-05",
+  "amountCents":  42500,
+  "currency":     "USD",
+  "jurisdiction": "US-Federal",
+  "notes":        "Q1 2026 quarterly payment — EIN 12-3456789"
+}
+```
+
+The response returns the `TaxRemittance` document with `status: 'filed'` and the `ledgerEntryId` of
+the posted `tax_remittance` debit.
+
+> **`FEATURE_TAX_LIABILITY_SELLER` (default off):** when enabled,
+> `resolveTaxLiabilityLedgerSellerId()` posts the operator-side mirror of every `tax`, `tax_refund`,
+> and `tax_remittance` entry — including this remittance debit — against the dedicated Tax-Liability
+> seller (`TAX_SELLER_ID`, slug `tax-liability`) instead of `PLATFORM_SELLER_ID`. The flag is
+> **forward-only** — it changes where new entries post while it is on; historical
+> `tax`/`tax_refund`/`tax_remittance` rows already against `PLATFORM_SELLER_ID` are left untouched
+> (no backfill). See `docs/tax-book.md` for the full cutover and reconciliation impact.
+
+**Verify:** After recording, query the tax liability pool to confirm the debit landed. Use
+`TAX_SELLER_ID` if `FEATURE_TAX_LIABILITY_SELLER=true`, otherwise `PLATFORM_SELLER_ID`:
+
+```
+GET /api/admin/platform-financials/ledger
+  ?sellerId=<TAX_SELLER_ID or PLATFORM_SELLER_ID>&type=tax,tax_refund,tax_remittance
+  &from=<period start>&to=<period end>
+```
+
+The `taxNetLiabilityCents` in the next `ReconciliationSnapshot` for that period should decrease by
+`amountCents`.
+
+**Rollback:** If a remittance was entered with an incorrect amount, record a corrective entry in the
+opposite direction using the `adjustment` endpoint (`POST /api/admin/ledger/adjustments`) against
+the same seller the remittance was posted to (`TAX_SELLER_ID` if
+`FEATURE_TAX_LIABILITY_SELLER=true`, otherwise `PLATFORM_SELLER_ID`), then create a new remittance
+with the correct amount. Do not delete the original `TaxRemittance` document — it is the audit
+trail.
+
+**Feature gate:** Both the admin UI panel and the API endpoints return `404` when
+`FEATURE_TAX_REMITTANCE=false`. Enable in `backend/.env` before using.

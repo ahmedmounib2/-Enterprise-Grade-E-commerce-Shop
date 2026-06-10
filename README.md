@@ -134,6 +134,7 @@
   - [Key features (summary)](#key-features-summary)
   - [Per-store shipping \& admin delivery regions](#per-store-shipping--admin-delivery-regions)
     - [Per-store rate configuration (`store.shipping`)](#per-store-rate-configuration-storeshipping)
+    - [Seller shipping UI](#seller-shipping-ui)
     - [Admin-managed delivery regions (operating countries + subdivisions)](#admin-managed-delivery-regions-operating-countries--subdivisions)
     - [Endpoints \& seed](#endpoints--seed)
     - [Ship-from address requirement](#ship-from-address-requirement)
@@ -180,6 +181,7 @@
       - [1) COD payout reconciliation cron](#1-cod-payout-reconciliation-cron)
       - [2) COD refund details purge cron](#2-cod-refund-details-purge-cron)
       - [3) Dispute SLA escalation cron](#3-dispute-sla-escalation-cron)
+      - [4) Liability reconciliation cron](#4-liability-reconciliation-cron)
     - [Carrier shipping webhook](#carrier-shipping-webhook)
     - [Key rotation \& webhook replay procedures](#key-rotation--webhook-replay-procedures)
       - [Rotate Stripe webhook secret safely](#rotate-stripe-webhook-secret-safely)
@@ -197,10 +199,13 @@
       - [Seller ledger exports (CSV + PDF) and filter](#seller-ledger-exports-csv--pdf-and-filter)
         - [Export data shape](#export-data-shape)
         - [Amount formatting fix](#amount-formatting-fix)
+      - [Double-entry ledger and accounting](#double-entry-ledger-and-accounting)
     - [Admin marketplace financials API (`/api/admin/platform-financials/*`)](#admin-marketplace-financials-api-apiadminplatform-financials)
       - [`GET /api/admin/platform-financials/summary`](#get-apiadminplatform-financialssummary)
       - [`GET /api/admin/platform-financials/ledger`](#get-apiadminplatform-financialsledger)
       - [`GET /api/admin/platform-financials/liabilities`](#get-apiadminplatform-financialsliabilities)
+      - [`GET /api/admin/platform-financials/tax-remittances`](#get-apiadminplatform-financialstax-remittances)
+      - [`POST /api/admin/platform-financials/tax-remittances`](#post-apiadminplatform-financialstax-remittances)
     - [Seller financial summary behavior updates](#seller-financial-summary-behavior-updates)
     - [Frontend financial documentation updates](#frontend-financial-documentation-updates)
       - [Seller dashboard financials scoping](#seller-dashboard-financials-scoping)
@@ -2215,7 +2220,10 @@ currency              ISO currency for the store's rates (default 'USD')
 flatRate              flat per-order shipping cost (null = use marketplace default)
 freeShippingThreshold subtotal at/above which shipping is free (null = off)
 handlingFee           added to every computed rate (default 0)
-regions[]             tiered tiers: { countries[], rate, freeOver }   (mode 'tiered')
+regions[]             per-region tiers: { countries[], mode?, rate, freeOver }. Optional per-region
+                      `mode` ('flat'|'tiered'|'carrier') overrides the store-level mode for that
+                      region (unset = inherit). Lets one store be carrier (card-only) for some
+                      regions and flat/tiered (COD-allowed) for others.
 excludedCountries[]   legacy ISO-2 country opt-outs (still honoured)
 excludedRegions[]     admin-region codes the seller opts out of: "EG" or "EG-ALX" / "US-CA"
 carrier{}             Carrier-calculated config: provider, ship-from origin (5 fields), fallbackRate,
@@ -2231,17 +2239,50 @@ Resolution order in `resolveStoreShipping`:
    or legacy `excludedCountries`), returns `{ excluded, reason: 'seller_excluded', field, value }`.
    The block carries the exact field (`country` | `state` | `city`) and the value the customer
    typed.
-3. **Rate** — `tiered` mode picks the first matching `regions[]` tier
-   (`selectRegionForDestination`), else the store `flatRate`, else the marketplace default
-   `SHIPPING_COST` (env, fallback **35**).
-4. **Free shipping** — if `subtotal >= freeShippingThreshold` (or the tier's `freeOver`), the rate
-   is a true `0` (bypasses the handling fee and the admin clamp).
-5. **Handling fee + admin clamp** — `handlingFee` is added, then the result is clamped to
+3. **Effective mode** — `resolveEffectiveShippingMode(shipping, destination)` matches the
+   destination to a region (`selectRegionForDestination`) and returns
+   `region.mode ?? shipping.mode`. This is the mode used for rating, the `requiresPostalCode`
+   carrier gate, the order snapshot (`order.shippingMode`), and the COD gate below.
+4. **Rate** — a matched region's `rate` is used when the store is `tiered` (legacy) **or** the
+   region sets its own `mode` (so a flat-default store with stray, mode-less regions is unaffected);
+   else the store `flatRate`, else the marketplace default `SHIPPING_COST` (env, fallback **35**).
+   When the effective mode is `carrier`, `resolveStoreShippingRate` performs the live Shippo lookup.
+5. **Free shipping** — if `subtotal >= freeShippingThreshold` (or the matched region's `freeOver`),
+   the rate is a true `0` (bypasses the handling fee and the admin clamp).
+6. **Handling fee + admin clamp** — `handlingFee` is added, then the result is clamped to
    `SHIPPING_MIN_RATE` / `SHIPPING_MAX_RATE` when those env bounds are set.
+
+**Region-aware COD:** Cash on Delivery is card-only for any destination whose effective mode is
+`carrier` (the platform pays the carrier label, so there's no cash for the seller to collect). The
+checkout estimate returns the effective `mode`; the web/mobile UIs disable the COD option (with a
+note) for carrier destinations, and `createCODOrder` rejects such orders with
+`cod_not_available_carrier`. This server-side rejection is gated by `FEATURE_REGION_SHIPPING_MODE`
+(the schema/resolver/UI are additive and always on).
 
 The marketplace default (`SHIPPING_COST`, `SHIPPING_DEFAULT_CURRENCY`) is surfaced to sellers via
 `getShippingDefaults` so the Store-settings UI shows the fallback that applies when a field is
 blank, and is displayed on the storefront/checkout.
+
+### Seller shipping UI
+
+`SellerStoreSettings.jsx` presents a single, unified **Store Settings → Shipping** page — it is not
+split per mode:
+
+- **Store defaults (top)** — the Ship-from address (always visible, independent of mode), the
+  store-level mode toggle (Flat rate / Regional tiers / Carrier rates), the store flat rate, and the
+  free-shipping threshold. These values are the fallback used when no region matches a destination,
+  or a matched region has no `mode` of its own.
+- **Regional rates (middle)** — the regions editor is always shown, regardless of the store-level
+  mode. Each row has its countries (ISO codes), a **Mode** dropdown (`Use store default` / Flat rate
+  / Regional tiers / Carrier rates), a rate, and an optional free-shipping threshold. Selecting "Use
+  store default" omits that region's `mode` from the save payload, so it inherits the store-level
+  mode. Regions are always sent on save (array-level edit), independent of the store mode.
+- **Carrier rates (Shippo)** — store-level carrier configuration (fallback rate + default parcel
+  dimensions). Shown when the store mode is `carrier` **or** any region's mode is `carrier`, since
+  one carrier configuration applies to every carrier-mode destination, store-wide or per-region. The
+  ship-from origin lives in the Ship-from address section above, not here.
+- **Exclusions (bottom)** — "Regions I don't ship to", the seller's opt-outs from the admin's
+  deliverable regions.
 
 ### Admin-managed delivery regions (operating countries + subdivisions)
 
@@ -2270,7 +2311,8 @@ Sellers inherit the admin set: the seller region selector only offers admin-enab
 
 ```
 GET  /api/shipping/estimate?storeId=&subtotal=&country=&state=&city=
-       -> { shippingCost, currency, freeThreshold? }  OR
+       -> { shippingCost, currency, freeThreshold?, mode }  OR
+          { shippingCost:null, requiresPostalCode:true, currency, mode }  OR
           { excluded:true, reason, field, value, currency }   (informational; checkout re-computes)
 GET  /api/public/delivery-regions          enabled regions for the seller selector / dropdowns
 GET  /api/admin/delivery-regions           admin list (admin only)
@@ -2505,6 +2547,58 @@ FEATURE_SHIPPO_TRACKING           true → GET /orders/:id/shipments/:shipId/tra
 # SHIPPO_LABEL_FILE_TYPE=PDF
 # SHIPPO_MAX_RATE_ATTEMPTS=6      # label purchase tries up to N carriers (skips unactivated ones)
 # SHIPPO_TEST_TRACKING_NUMBER=SHIPPO_TRANSIT  # sandbox sample number for tracking demos
+
+# ── Accounting / Liability reconciliation ────────────────────────────────────
+FEATURE_SHIPPING_LABEL_LEDGER     true → post a `shipping_label_cost` ledger debit against the
+                                  Shipping Liability seller when a Shippo carrier label is
+                                  purchased. Off by default until backfill of historical shipments
+                                  is decided. Requires SHIPPING_PROVIDER=shippo.
+FEATURE_TAX_REMITTANCE            true → enable the TaxRemittance model and the admin
+                                  tax-remittance API (`GET/POST
+                                  /api/admin/platform-financials/tax-remittances`). Off by default.
+FEATURE_LIABILITY_RECONCILIATION  true → start the monthly liability reconciliation cron job that
+                                  snapshots shipping/tax collected vs. disbursed per currency and
+                                  flags negative residuals. Off by default.
+FEATURE_SELLER_SHIPPING_PAYOUT    true → flat/tiered (self-fulfilled) shipping is posted as a
+                                  payout-eligible `shipping_revenue` credit to the seller
+                                  (`shipping_revenue_refund` on refund) instead of the
+                                  `shipping_fee`/Shipping Liability mirror pair. Carrier-mode
+                                  shipping is unaffected — it stays a pass-through liability offset
+                                  by the carrier label cost. Off by default; forward-only (applies
+                                  to deliveries posted while on).
+FEATURE_TAX_LIABILITY_SELLER      true → operator-side tax mirror rows (`tax`, `tax_refund`,
+                                  `tax_remittance`) post against the dedicated Tax-Liability seller
+                                  (TAX_SELLER_ID) instead of PLATFORM_SELLER_ID, separating the
+                                  marketplace-wide tax clearing account from the platform store's
+                                  own books. Off by default; forward-only (only entries posted
+                                  while on use TAX_SELLER_ID). See docs/tax-book.md.
+TAX_SELLER_ID                    MongoDB ObjectId of the Tax-Liability synthetic seller (slug
+                                  `tax-liability`). Derived at boot by ensureAdminStore (like
+                                  SHIPPING_SELLER_ID) — leave blank; do not hand-set. Only used as a
+                                  posting target when FEATURE_TAX_LIABILITY_SELLER=true.
+FEATURE_REGION_SHIPPING_MODE      true → checkout rejects Cash on Delivery when the customer's
+                                  destination resolves to a carrier-mode region (a region whose
+                                  effective `shipping.regions[].mode` is `carrier`), returning
+                                  `cod_not_available_carrier`. The per-region `mode` schema,
+                                  `resolveEffectiveShippingMode` resolver, and seller UI are
+                                  additive and always-on regardless of this flag — only the COD
+                                  rejection is gated. Off by default; flip per environment.
+# Optional reconciliation job tuning:
+
+Production
+
+# LIABILITY_RECONCILIATION_CRON=30 3 1 * *   # keep the default — monthly accounting close, no benefit to running more often
+# LIABILITY_RECONCILIATION_TIMEZONE=UTC      # keep UTC — matches SETTLEMENT_SCHEDULER_TZ and period-boundary convention
+# LIABILITY_RECONCILIATION_RUN_ON_BOOT=false # multi-replica safe; only the cron fires
+# LIABILITY_RECONCILIATION_PERIOD          # leave unset — defaults to previousMonthPeriod(), so each monthly run automatically reconciles "last month"
+
+Development / local testing
+
+# LIABILITY_RECONCILIATION_CRON=*/2 * * * *  # frequent cadence so you can see a snapshot get created/updated quickly
+# LIABILITY_RECONCILIATION_TIMEZONE=UTC      # keep UTC for deterministic period math while testing
+# LIABILITY_RECONCILIATION_RUN_ON_BOOT=true  # trigger an immediate run on server start for fast feedback (single-instance dev)
+# LIABILITY_RECONCILIATION_PERIOD=2026-05    # pin to whatever month you've seeded ledger entries for; previousMonthPeriod() won't match seeded test data otherwise — remove this once you're done testing so it doesn't get left set
+
 
 # ── Tax ──────────────────────────────────────────────────────────────────────
 TAX_RATE                          Final fallback rate when no TaxRule/provider applies. Default 0.14.
@@ -3360,6 +3454,35 @@ CHIMONEY_PAYOUT_STATUS_PATH=/payouts/{payoutId}
   3. Verify a system message is appended and the escalation email is queued.
   4. Confirm re-runs do not send a second email (check `slaEscalationEmailedAt` is set).
 
+#### 4) Liability reconciliation cron
+
+- **File:** `backend/src/jobs/liabilityReconciliation.job.js`
+- **Scheduler env vars**
+  - `FEATURE_LIABILITY_RECONCILIATION` — set to `"true"` to enable (default `"false"`)
+  - `LIABILITY_RECONCILIATION_CRON` — cron expression (default: `"30 3 1 * *"` — 03:30 UTC on the
+    1st of each month)
+  - `LIABILITY_RECONCILIATION_TIMEZONE` — default `"UTC"`
+  - `LIABILITY_RECONCILIATION_RUN_ON_BOOT` — set `"true"` only on single-instance deploys
+  - `LIABILITY_RECONCILIATION_PERIOD` — override the reconciliation period (e.g. `"2026-05"`);
+    defaults to the previous calendar month
+- **Purpose**
+  - Aggregates `shipping_fee`, `shipping_refund`, `shipping_label_cost`, `shipping_revenue`,
+    `shipping_revenue_refund`, `tax`, `tax_refund`, and `tax_remittance` entries for the closed
+    month.
+  - Produces one `ReconciliationSnapshot` per `{period, currency}` (upserted on re-run), including
+    `shippingRevenueCents`, `shippingRevenueRefundCents`, and `sellerRetainedShippingCents`
+    (`shippingRevenueCents + shippingRevenueRefundCents`) — reported for visibility only and never
+    folded into `shippingNetLiabilityCents` or the negative-residual `status` check.
+  - Sets `status: 'review'` and logs a warning when any liability net is negative (outflows exceeded
+    collections), indicating a shortfall that requires operator investigation.
+- **How to test**
+  1. Set `FEATURE_LIABILITY_RECONCILIATION=true` and `LIABILITY_RECONCILIATION_RUN_ON_BOOT=true`.
+  2. Restart the backend (or wait for the cron trigger).
+  3. Query `ReconciliationSnapshot` for the previous month — verify `shippingNetLiabilityCents` and
+     `taxNetLiabilityCents` match your ledger aggregates.
+  4. Force a negative residual (e.g. set `LIABILITY_RECONCILIATION_PERIOD` to a month where
+     `shipping_label_cost` exceeds `shipping_fee`) and confirm `status: 'review'` is set.
+
 ### Carrier shipping webhook
 
 `POST /api/webhooks/shipping/:provider` is the generic carrier webhook hub. Each supported carrier
@@ -3587,9 +3710,12 @@ Validation errors (API):
   ```
 
 - Liability-account env vars used by ledger mapping:
-  - `PLATFORM_SELLER_ID`: seller id of the platform liability ledger account (tax flows).
-  - `SHIPPING_SELLER_ID`: seller id of the shipping liability ledger account (shipping flows).
-    **Operational notes**
+  - `PLATFORM_SELLER_ID`: seller id of the platform liability ledger account (tax flows when
+    `FEATURE_TAX_LIABILITY_SELLER` is off).
+  - `SHIPPING_SELLER_ID`: seller id of the shipping liability ledger account (carrier-mode shipping
+    flows).
+  - `TAX_SELLER_ID`: seller id of the Tax-Liability ledger account (tax flows when
+    `FEATURE_TAX_LIABILITY_SELLER=true`). **Operational notes**
 
 - Notification cooldown behavior:
   - On first blocked attempt per seller, backend stores a cooldown key and sends email.
@@ -3856,6 +3982,147 @@ To avoid confusion, human-readable monetary values are now formatted from cents 
 
 Raw cents columns are still included in CSV for accounting/system integrations.
 
+#### Double-entry ledger and accounting
+
+The platform uses a **signed double-entry ledger** where `amountCents > 0` is a credit (inflow) and
+`amountCents < 0` is a debit (outflow). Every financial event produces at least two rows — a
+merchant-scoped row and a platform/operator-scoped mirror — so both sides of each transaction are
+always on record.
+
+**Entry type reference**
+
+| Type                       | Settlement class | Who it touches                           | Sign convention (merchant side)                                                 |
+| -------------------------- | ---------------- | ---------------------------------------- | ------------------------------------------------------------------------------- |
+| `sale`                     | payout-eligible  | Seller                                   | Positive (revenue)                                                              |
+| `refund`                   | payout-eligible  | Seller                                   | Negative (revenue reversal)                                                     |
+| `commission`               | payout-eligible  | Seller                                   | Negative (platform fee deducted)                                                |
+| `commission_reversal`      | payout-eligible  | Seller                                   | Positive (commission returned)                                                  |
+| `processing_fee`           | payout-eligible  | Seller                                   | Negative (Stripe fee share)                                                     |
+| `processor_fee`            | payout-eligible  | Platform                                 | Negative (full Stripe cost)                                                     |
+| `processor_fee_recovery`   | payout-eligible  | Seller + Platform                        | Delta vs estimate (positive or negative)                                        |
+| `platform_fee`             | payout-eligible  | Platform                                 | Positive (mirrors commission credit)                                            |
+| `cod_refund_disbursement`  | payout-eligible  | Platform                                 | Negative (platform disburses refund)                                            |
+| `cod_refund_reimbursement` | payout-eligible  | Seller                                   | Negative (seller reimburses platform for merchandise + tax + shipping refunded) |
+| `tax`                      | pass-through     | Seller debit / Platform credit           | Negative on seller side                                                         |
+| `tax_refund`               | pass-through     | Seller credit / Platform debit           | Positive on seller side                                                         |
+| `tax_remittance`           | pass-through     | Platform                                 | Negative (platform pays tax authority)                                          |
+| `shipping_fee`             | pass-through     | Seller debit / Shipping Liability credit | Negative on seller side                                                         |
+| `shipping_refund`          | pass-through     | Seller credit / Shipping Liability debit | Positive on seller side                                                         |
+| `shipping_label_cost`      | pass-through     | Shipping Liability                       | Negative (carrier label cost)                                                   |
+| `shipping_revenue`         | payout-eligible  | Seller                                   | Positive (flat/tiered shipping kept as seller revenue)                          |
+| `shipping_revenue_refund`  | payout-eligible  | Seller                                   | Negative (flat/tiered shipping revenue reversed on refund)                      |
+| `reserve`                  | reserve          | Seller                                   | Negative (withheld at settlement)                                               |
+| `reserve_release`          | reserve          | Seller                                   | Positive (hold expires)                                                         |
+| `reserve_used`             | reserve          | Seller                                   | Positive (reserve applied to debt)                                              |
+
+**Merchant / operator mirroring pattern**
+
+Each delivery event calls `buildMerchantLedgerDimensions` and `buildOperatorLedgerDimensions` to
+produce both scopes. The `accountingScope` field (`merchant` or `platform`) and `entrySide` field
+(`merchant` or `operator`) distinguish the two rows. Seller dashboards default to merchant-scoped
+rows; `includeOperatorRows=true` is available for admin audit queries.
+
+**Shipping Liability synthetic seller**
+
+`ensureAdminStore.js` creates a synthetic seller with slug `shipping-liability` on first startup and
+exports its `_id` as `process.env.SHIPPING_SELLER_ID`. This account acts as the platform's shipping
+liability pool:
+
+- **Credits** (`shipping_fee`, positive): collected from customers on every delivered order.
+- **Debits** (`shipping_refund`, negative): returned on shipping refunds.
+- **Debits** (`shipping_label_cost`, negative): carrier label costs debited when a Shippo label is
+  purchased (gated by `FEATURE_SHIPPING_LABEL_LEDGER`). This closes the accounting loop — carrier
+  spend is now tracked against the shipping fees collected.
+
+**Shipping mode and seller-retained shipping revenue**
+
+Each order snapshots the **effective, region-specific** shipping mode at checkout time as
+`order.shippingMode` (`'flat' | 'tiered' | 'carrier'`, defaulting to `'flat'` for orders placed
+before this field existed). `resolveEffectiveShippingMode(shipping, destination)` resolves a
+per-region `shipping.regions[].mode` override for the customer's destination, falling back to the
+store-level `shipping.mode` when the matched region has none — so two orders from the same store can
+carry different `shippingMode` values depending on the destination. On delivery,
+`resolveShippingMode(order)` reads this per-order snapshot to decide how the collected shipping
+amount is posted:
+
+- **`carrier`** (or `FEATURE_SELLER_SHIPPING_PAYOUT=false`): unchanged pass-through behavior — the
+  seller is debited `shipping_fee` and the Shipping Liability pool (`SHIPPING_SELLER_ID`) is
+  credited the same amount, later offset by `shipping_label_cost` when a label is purchased.
+- **`flat` / `tiered`** (with `FEATURE_SELLER_SHIPPING_PAYOUT=true`): the seller fulfils shipping
+  themselves, so the collected amount is their revenue. A single payout-eligible `shipping_revenue`
+  credit is posted to the seller — there is no Shipping Liability mirror, since there is no platform
+  payable to offset. On refund, `shipping_revenue_refund` (negative) reverses it symmetrically.
+
+Both entry types carry `metadata: { shippingMode }` for audit/debugging. The flag is **off by
+default** and **forward-only** — it changes how new deliveries are posted while it is on; existing
+`shipping_fee`/`shipping_refund` rows from before the cutover are left untouched (no backfill).
+`marketplaceMetrics.sellerRetainedShippingCents` (`shipping_revenue + shipping_revenue_refund`) and
+the seller financial summary's `sellerRetainedShippingCents` report this figure separately from the
+carrier `shippingLiabilityCents` — the two are never blended.
+
+**Tax Liability synthetic seller**
+
+`ensureAdminStore.js` also creates a synthetic seller with slug `tax-liability` on first startup and
+exports its `_id` as `process.env.TAX_SELLER_ID`. When `FEATURE_TAX_LIABILITY_SELLER=true`,
+`resolveTaxLiabilityLedgerSellerId()` routes the operator-side mirror of every `tax`, `tax_refund`,
+and `tax_remittance` entry to this account instead of `PLATFORM_SELLER_ID` — separating the
+marketplace-wide tax clearing account from the platform store's own books, mirroring how
+`SHIPPING_SELLER_ID` isolates the carrier pass-through pool. The flag is **off by default** and
+**forward-only**: historical tax rows already posted against `PLATFORM_SELLER_ID` are left
+untouched; only entries posted while the flag is on use `TAX_SELLER_ID`. See `docs/tax-book.md` for
+the cutover and reconciliation impact.
+
+When `FEATURE_TAX_LIABILITY_SELLER=false` (default), `PLATFORM_SELLER_ID` holds the tax liability
+pool.
+
+**Shippo label cost tracking**
+
+When a seller purchases a carrier label via `POST /seller/orders/:id/shipments` (source: `api`), the
+Shippo adapter extracts the label cost from the transaction response and stores it as
+`labelCostCents` / `labelCostCurrency` / `labelCostSource` on the `Shipment` document. The
+`recordShippingLabelExpense` function then posts a `shipping_label_cost` debit:
+
+- Idempotency key: `shipping_label_cost:<shipmentId>` — safe to retry.
+- Skipped automatically when `labelCostSource === 'sandbox'` (Shippo sandbox labels are $0 and must
+  not pollute the production ledger).
+- Skipped when `labelCostCents <= 0`.
+- Enable with `FEATURE_SHIPPING_LABEL_LEDGER=true` (default `false`).
+
+**Tax remittance tracking**
+
+When the platform pays collected tax to a tax authority, admins record it via
+`POST /api/admin/platform-financials/tax-remittances`. The service creates a `TaxRemittance`
+document and calls `recordTaxRemittance`, which posts a `tax_remittance` debit against
+`resolveTaxLiabilityLedgerSellerId(PLATFORM_SELLER_ID)` — the Tax-Liability seller (`TAX_SELLER_ID`)
+when `FEATURE_TAX_LIABILITY_SELLER=true`, otherwise `PLATFORM_SELLER_ID`. The document starts as
+`'draft'`, the ledger entry is posted, and then it is promoted to `'filed'`. If the ledger call
+fails the document stays as `'draft'` for operator review rather than disappearing. Enable with
+`FEATURE_TAX_REMITTANCE=true` (default `false`).
+
+**Seller financials**
+
+`sellerFinancialSummary.service.js` aggregates the seller's ledger entries using the same signed-sum
+convention as the platform side: merchandise refunds (`type: 'refund'`, negative) are summed with
+sales (`merchandiseSubtotalCents = sale + refund`), and tax/shipping refunds are _subtracted_ from
+their collected totals (`passThroughTaxCollectedCents = |tax| - |tax_refund|`, and similarly for
+shipping). The "Customer paid total" card therefore decreases correctly after a refund, aligning the
+seller dashboard with the admin platform liability view. Seller-retained shipping revenue
+(`shipping_revenue` / `shipping_revenue_refund`, `sellerRetainedShippingCents`) is reported as its
+own field, separate from the carrier shipping liability (`passThroughShippingCollectedCents`) — see
+"Shipping mode and seller-retained shipping revenue" above.
+
+**COD refund accounting**
+
+When a COD order is refunded, the platform disburses the full refund (merchandise + tax + shipping)
+to the customer via Chimoney. `cod_refund_reimbursement` claws back
+`refundAmountCents + taxRefundAmountCents + shippingRefundAmountCents` — the full reimbursed amount
+— from the seller's merchant-side balance. In the same event the seller is credited `tax_refund`
+(+`taxRefundAmountCents`) and `shipping_refund` (+`shippingRefundAmountCents`), which exactly offset
+the tax/shipping portion of the reimbursement debit, leaving the seller's net merchant-side movement
+at `-refundAmountCents` — the merchandise portion only. This matches the operator-side
+`cod_refund_disbursement` debit (also `-refundAmountCents`), so the order's refund is fully
+accounted for on both sides with no residual liability.
+
 **Batch statuses (`SettlementBatch.status`)**
 
 - `calculated`: reserved for pre-scheduled calculation states.
@@ -4068,6 +4335,11 @@ Authorization for all routes below: `protectRoute` + `restrictTo('admin', 'staff
 - `data.totals`: total entries/net/credit/debit/outstanding amounts
 - `data.marketplaceMetrics`: GMV, platform fee revenue, processor fee cost/recovery, liabilities,
   payouts breakdown, reserve metrics, subscription fee receivables
+  - `shippingLiabilityCents`: carrier-mode-only net
+    (`shipping_fee + shipping_refund + shipping_label_cost`) — the Shipping Liability pool balance.
+  - `sellerRetainedShippingCents`: flat/tiered shipping kept as seller revenue
+    (`shipping_revenue + shipping_revenue_refund`), reported separately and never blended into
+    `shippingLiabilityCents`.
 - `data.byType[]`, `data.byPayoutStatus[]`
 - `meta.generatedAt`
 - `filters` echo envelope
@@ -4086,7 +4358,7 @@ Same filters as summary.
 #### `GET /api/admin/platform-financials/liabilities`
 
 Same filters as summary/ledger; liability rows are constrained to liability types
-(`tax/tax_refund/shipping_fee/shipping_refund/reserve/reserve_used/cod_refund_*`).
+(`tax/tax_refund/tax_remittance/shipping_fee/shipping_refund/shipping_label_cost/reserve/reserve_used/cod_refund_*`).
 
 **Response shape**
 
@@ -4098,6 +4370,34 @@ Same filters as summary/ledger; liability rows are constrained to liability type
   - grouped by `type + payoutStatus`
   - `type, payoutStatus, totalAmountCents, entryCount, lastCreatedAt`
 - `meta` + `filters`
+
+#### `GET /api/admin/platform-financials/tax-remittances`
+
+Returns a paginated list of tax remittances recorded by the platform. Returns `404` when
+`FEATURE_TAX_REMITTANCE=false`.
+
+**Optional query params:** `page`, `limit`, `currency`
+
+**Response shape:** `{ data: { items: [...], total, page, pages }, meta }`
+
+#### `POST /api/admin/platform-financials/tax-remittances`
+
+Records a tax payment made to a tax authority. Creates a `TaxRemittance` document and posts a
+`tax_remittance` debit ledger entry against the platform tax-liability pool. Returns `404` when
+`FEATURE_TAX_REMITTANCE=false`. Returns `422` on validation error (invalid period format or
+non-positive amount).
+
+**Request body:**
+
+| Field          | Type   | Required | Notes                                                |
+| -------------- | ------ | -------- | ---------------------------------------------------- |
+| `period`       | String | Yes      | `YYYY-MM` — the tax period being remitted            |
+| `amountCents`  | Number | Yes      | Positive integer (cents)                             |
+| `currency`     | String | Yes      | ISO 4217 code (e.g. `USD`)                           |
+| `jurisdiction` | String | No       | Identifies the taxing authority; default `'default'` |
+| `notes`        | String | No       | Free-text filing notes                               |
+
+**Response:** the created `TaxRemittance` document with `status: 'filed'` and `ledgerEntryId`.
 
 ### Seller financial summary behavior updates
 
@@ -4125,12 +4425,21 @@ Endpoint: `GET /api/seller/financials/summary`
 - `merchantShippingCents`: shipping component in merchant settlement mix.
 - `merchantCommissionCents`: commission effect (typically negative) in merchant settlement mix.
 - `merchantNetCents`: net before processor fees (`gross + tax + shipping + commission`).
-- `customerPaidTotalCents`: total paid by customer (`merchandise + pass-through tax + shipping`).
-- `merchandiseSubtotalCents`: merchandise subtotal before pass-through tax/shipping.
-- `passThroughTaxCollectedCents`: tax pass-through total added using absolute values of tax rows
-  (for example `abs(tax) + abs(tax_refund)`).
-- `passThroughShippingCollectedCents`: shipping pass-through total added using absolute values of
-  shipping rows (for example `abs(shipping_fee) + abs(shipping_refund)`).
+- `customerPaidTotalCents`: net total paid by customer after refunds
+  (`merchandiseSubtotalCents + passThroughTaxCollectedCents + passThroughShippingCollectedCents + sellerRetainedShippingCents`).
+  Customer-paid shipping is mode-independent — it includes carrier pass-through shipping and
+  seller-retained (flat/tiered) shipping, whichever applies to the order.
+- `merchandiseSubtotalCents`: merchandise net — `sale` entries (positive) plus `refund` entries
+  (negative), so partial/full refunds reduce this value.
+- `passThroughTaxCollectedCents`: tax pass-through net (`abs(tax) − abs(tax_refund)`). Tax refunds
+  are subtracted so the total decreases after a refund, matching the platform-side signed-sum
+  convention.
+- `passThroughShippingCollectedCents`: carrier-mode shipping pass-through net
+  (`abs(shipping_fee) − abs(shipping_refund)`). Shipping refunds are subtracted so the total
+  decreases after a refund.
+- `sellerRetainedShippingCents`: flat/tiered (self-fulfilled) shipping kept as seller revenue
+  (`shipping_revenue + shipping_revenue_refund`, signed sum). Zero unless
+  `FEATURE_SELLER_SHIPPING_PAYOUT=true` and the order's `shippingMode` is `flat`/`tiered`.
 - `settlementPayableBeforeReserveCents`: net seller-settlement amount before reserve withholding
   (this is the reserve-calculation base, not pass-through customer collections).
 - `reserveWithheldCents`: reserve amount currently withheld.
@@ -4187,6 +4496,10 @@ readable business totals.
   - Deductions total = sum of `deductionTotalsCents` values (`commission`, `processing_fee`,
     `cod_refund_reimbursement`, plus any additional deduction keys returned by API).
   - Sign convention: positive amounts increase seller receivable; negative amounts reduce it.
+- When `sellerRetainedShippingCents` is non-zero (`FEATURE_SELLER_SHIPPING_PAYOUT=true` and the
+  seller's orders use `flat`/`tiered` shipping), `SellerFinancialsPanel` renders an additional
+  "Shipping revenue (you keep)" card (`seller.financials.summary.sellerRetainedShipping`) showing
+  this amount alongside the existing summary cards.
 
 #### Operator rows in seller ledger
 
@@ -4258,6 +4571,8 @@ Seller Dashboard > Financials
   - `GET /summary`
   - `GET /ledger`
   - `GET /liabilities`
+  - `GET /tax-remittances`
+  - `POST /tax-remittances`
 
 **3) Frontend adjustments included**
 
@@ -5536,6 +5851,9 @@ Fields
                      out_for_delivery → delivered → returned → exception → cancelled
   carrierStatusRaw — raw carrier status string for debugging
   source           — "manual" (seller-entered) or "api" (carrier-generated)
+  labelCostCents   — carrier label cost in cents (api-source labels only; absent for manual shipments)
+  labelCostCurrency — ISO 4217 currency code for labelCostCents
+  labelCostSource  — "api" (live Shippo label) or "sandbox" (Shippo sandbox; $0, excluded from ledger)
   shippedAt        — timestamp of first shipment (also stamped on Order.shippedAt)
   deliveredAt      — confirmed delivery timestamp
   lastSyncedAt     — last carrier webhook sync
@@ -5543,6 +5861,16 @@ Fields
   events[]         — append-only timeline of carrier status events
   createdBy        — user who created the shipment record
 ```
+
+**`order.shippingMode`** (`'flat' | 'tiered' | 'carrier' | null`) is a separate field on the `Order`
+document (not `Shipment`) — a snapshot of the **effective**, region-specific shipping mode for the
+order's destination at checkout time (`resolveEffectiveShippingMode`: a per-region
+`shipping.regions[].mode` override, falling back to the store-level `shipping.mode`).
+`recordDeliveryLedger`/`recordRefundLedger` read it via `resolveShippingMode(order)` to decide
+whether collected shipping is posted as a carrier pass-through liability (`shipping_fee`) or, when
+`FEATURE_SELLER_SHIPPING_PAYOUT=true` and the mode is `flat`/`tiered`, payout-eligible seller
+revenue (`shipping_revenue`). Orders placed before this field existed have `shippingMode: null` and
+fall back to `'flat'`.
 
 Creating the first shipment on an order transitions the order from `processing` → `dispatched` and
 stamps `Order.shippedAt`. If the order is already `dispatched` when the first shipment is added
@@ -5567,7 +5895,14 @@ The shipping layer follows the same adapter-map pattern as COD payouts
   shipment, status mapping).
 - `providers/shippo.adapter.js` — Shippo integration (Phase 3): live multi-carrier rates
   (`getRates`), label purchase (create), and tracking (`track`). Single platform-wide account via
-  `SHIPPO_API_KEY`; the platform pays Shippo and the Shipping-Liability ledger handles accounting.
+  `SHIPPO_API_KEY`. When a label is purchased the adapter extracts the carrier cost from the Shippo
+  transaction response and surfaces `labelCostCents`, `labelCostCurrency`, and `labelCostSource`
+  (`'api'` for live labels, `'sandbox'` for Shippo test-mode labels). The controller persists these
+  fields on the `Shipment` document and then calls `recordShippingLabelExpense`, which posts a
+  `shipping_label_cost` debit against the Shipping Liability seller — closing the accounting loop
+  between shipping fees collected from customers and actual carrier spend. Sandbox labels are tagged
+  and skipped so test data never enters the production ledger. Gated by
+  `FEATURE_SHIPPING_LABEL_LEDGER`.
 - `providers/disabled.adapter.js` — returns a safe `{ ok: false }` no-op without throwing; default
   for local development.
 
@@ -6732,6 +7067,46 @@ FEATURE_SHIPPO_RATES               # 'true' => carrier-mode stores get live Ship
                                    # off => fall back to carrier.fallbackRate
 FEATURE_SHIPPO_TRACKING            # 'true' => customer tracking endpoint does a live carrier sync;
                                    # off => serves cached shipment events only
+
+# Accounting / Liability reconciliation (all default off)
+FEATURE_SHIPPING_LABEL_LEDGER      # 'true' => post a shipping_label_cost ledger debit against the
+                                   # Shipping Liability seller when a Shippo label is purchased.
+                                   # Off by default until backfill of historical shipments is decided.
+FEATURE_TAX_REMITTANCE             # 'true' => enable TaxRemittance model + admin
+                                   # GET/POST /api/admin/platform-financials/tax-remittances.
+FEATURE_LIABILITY_RECONCILIATION   # 'true' => start the monthly liability reconciliation cron job.
+FEATURE_SELLER_SHIPPING_PAYOUT     # 'true' => flat/tiered shipping posts a payout-eligible
+                                   # shipping_revenue credit to the seller (shipping_revenue_refund
+                                   # on refund) instead of the shipping_fee/Shipping Liability pair.
+                                   # Carrier-mode shipping is unaffected. Forward-only.
+FEATURE_TAX_LIABILITY_SELLER       # 'true' => operator-side tax/tax_refund/tax_remittance mirrors
+                                   # post against TAX_SELLER_ID instead of PLATFORM_SELLER_ID.
+                                   # Forward-only; see docs/tax-book.md.
+TAX_SELLER_ID                      # MongoDB ObjectId of the Tax-Liability synthetic seller (slug
+                                   # tax-liability), derived at boot by ensureAdminStore — leave
+                                   # blank; do not hand-set. Used when
+                                   # FEATURE_TAX_LIABILITY_SELLER=true.
+FEATURE_REGION_SHIPPING_MODE       # 'true' => checkout rejects COD (cod_not_available_carrier)
+                                   # when the destination's effective shipping.regions[].mode is
+                                   # 'carrier'. The per-region mode schema/resolver/seller UI are
+                                   # additive and always-on; only the COD rejection is gated.
+
+# Reconciliation job tuning (only read when FEATURE_LIABILITY_RECONCILIATION=true)
+
+Production
+
+LIABILITY_RECONCILIATION_CRON      # cron expression; default '30 3 1 * *' (03:30 UTC 1st of month)
+LIABILITY_RECONCILIATION_TIMEZONE  # default 'UTC'
+LIABILITY_RECONCILIATION_RUN_ON_BOOT # default 'false'; set true only on single-instance deploys
+LIABILITY_RECONCILIATION_PERIOD    # override period, e.g. '2026-05'; defaults to previous month
+
+Development / local testing
+
+LIABILITY_RECONCILIATION_CRON=*/2 * * * *  # frequent cadence so you can see a snapshot get created/updated quickly
+LIABILITY_RECONCILIATION_TIMEZONE=UTC      # keep UTC for deterministic period math while testing
+LIABILITY_RECONCILIATION_RUN_ON_BOOT=true  # trigger an immediate run on server start for fast feedback (single-instance dev)
+LIABILITY_RECONCILIATION_PERIOD=2026-05    # pin to whatever month you've seeded ledger entries for; previousMonthPeriod() won't match seeded test data otherwise — remove this once you're done testing so it doesn't get left set
+
 ```
 
 **Payment provider + COD refund/payout policy**
@@ -6971,6 +7346,8 @@ COD_PAYOUT_RECONCILIATION_RUN_ON_BOOT   # run COD payout reconciliation on serve
 SUBSCRIPTION_RENEWAL_RUN_ON_BOOT         # run subscription renewal on server start
 SELLER_CLOSURE_FINALIZER_RUN_ON_BOOT     # run seller closure finalizer once on server start
                                           # (default false; set true only on single-instance deploys)
+LIABILITY_RECONCILIATION_RUN_ON_BOOT     # run liability reconciliation job on server start
+                                          # (default false; requires FEATURE_LIABILITY_RECONCILIATION=true)
 
 # Ops alerting
 OPS_SLACK_WEBHOOK                        # optional Slack incoming webhook URL for job-health alerts
@@ -7276,6 +7653,17 @@ DISPUTE_SLA_ESCALATION_CRON=* * * * *
 # In-app notifications and audit log
 FEATURE_IN_APP_NOTIFICATIONS=true
 FEATURE_ADMIN_AUDIT_DASHBOARD=true
+
+# Accounting / Liability reconciliation (all off by default; enable after validating in dev)
+FEATURE_SHIPPING_LABEL_LEDGER=false
+FEATURE_TAX_REMITTANCE=false
+FEATURE_LIABILITY_RECONCILIATION=false
+
+LIABILITY_RECONCILIATION_CRON=*/2 * * * *  # frequent cadence so you can see a snapshot get created/updated quickly
+LIABILITY_RECONCILIATION_TIMEZONE=UTC      # keep UTC for deterministic period math while testing
+LIABILITY_RECONCILIATION_RUN_ON_BOOT=true  # trigger an immediate run on server start for fast feedback (single-instance dev)
+LIABILITY_RECONCILIATION_PERIOD=2026-05    # pin to whatever month you've seeded ledger entries for; previousMonthPeriod() won't match seeded test data otherwise — remove this once you're done testing so it doesn't get left set
+
 
 # Local HTTPS cert usage flags (optional)
 USE_LOCAL_HTTPS=true

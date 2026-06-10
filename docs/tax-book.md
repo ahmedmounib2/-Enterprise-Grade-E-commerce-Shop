@@ -4,29 +4,17 @@ How tax is calculated, configured, and audited in `ahmedmonib-eshop-demo.com`. T
 `backend/src/services/tax/`; this guide is the operational reference. For the architecture summary
 see the **Category-based tax engine** section of the root `README.md`.
 
-- [Tax Book — admin \& maintainer guide](#tax-book--admin--maintainer-guide)
-  - [1. Overview \& the fallback chain](#1-overview--the-fallback-chain)
-  - [2. Internal TaxRules](#2-internal-taxrules)
-    - [Precedence (how the winning rule is chosen)](#precedence-how-the-winning-rule-is-chosen)
-    - [Matching is tolerant (so real-world addresses resolve)](#matching-is-tolerant-so-real-world-addresses-resolve)
-  - [3. Product tax categories](#3-product-tax-categories)
-  - [4. Avalara integration](#4-avalara-integration)
-    - [Getting credentials](#getting-credentials)
-    - [Configuration](#configuration)
-    - [Auto-fallback](#auto-fallback)
-    - [Cross-environment retry (env mismatch self-correction)](#cross-environment-retry-env-mismatch-self-correction)
-    - [Rate-limit resilience](#rate-limit-resilience)
-  - [5. Avalara tax codes](#5-avalara-tax-codes)
-  - [6. TaxProvider health](#6-taxprovider-health)
-  - [7. Order tax audit](#7-order-tax-audit)
-  - [8. Quick admin recipes](#8-quick-admin-recipes)
-  - [9. Ship-from address and Avalara nexus](#9-ship-from-address-and-avalara-nexus)
-    - [Why ship-from matters](#why-ship-from-matters)
-    - [How sellers configure it](#how-sellers-configure-it)
-    - [Activation guard](#activation-guard)
-    - [Avalara early-exit guard](#avalara-early-exit-guard)
-    - [How tax estimate and checkout both use ship-from](#how-tax-estimate-and-checkout-both-use-ship-from)
-    - [`buildTransaction` fallback for missing street](#buildtransaction-fallback-for-missing-street)
+- [1. Overview & the fallback chain](#1-overview--the-fallback-chain)
+- [2. Internal TaxRules](#2-internal-taxrules)
+- [3. Product tax categories](#3-product-tax-categories)
+- [4. Avalara integration](#4-avalara-integration)
+- [5. Avalara tax codes](#5-avalara-tax-codes)
+- [6. TaxProvider health](#6-taxprovider-health)
+- [7. Order tax audit](#7-order-tax-audit)
+- [8. Quick admin recipes](#8-quick-admin-recipes)
+- [9. Ship-from address and Avalara nexus](#9-ship-from-address-and-avalara-nexus)
+- [10. Tax remittance tracking](#10-tax-remittance-tracking)
+- [11. Shipping accounting by mode](#11-shipping-accounting-by-mode)
 
 ---
 
@@ -345,3 +333,161 @@ When the destination address has no street (e.g. the customer has only entered c
 `buildTransaction` helper passes an **empty string** — not `'N/A'` — as `line1` in the ShipTo block.
 An empty string lets Avalara apply city/state-level jurisdiction rules; the literal `'N/A'` was
 previously causing `InvalidAddress` rejections that silently fell back to `TAX_RATE`.
+
+---
+
+## 10. Tax remittance tracking
+
+### Overview
+
+The platform collects `tax` ledger entries (positive, operator-side mirror) on every delivered order
+and negative `tax_refund` entries on refunds. These operator mirrors are credited to
+`PLATFORM_SELLER_ID` by default, or to the dedicated tax-liability seller (`TAX_SELLER_ID`) when
+`FEATURE_TAX_LIABILITY_SELLER` is enabled — see _Tax-liability seller_ below. Without recording
+outflows to tax authorities, the platform tax-liability pool grows without bound and the admin
+dashboard shows "outstanding tax liability" that never resolves. Tax remittance tracking closes this
+loop.
+
+### Feature flag
+
+```env
+FEATURE_TAX_REMITTANCE=true
+```
+
+When unset or `false`, the `TaxRemittance` model is still available but the admin endpoints return
+`404` and the UI panel is hidden.
+
+### Tax-liability seller
+
+Operator-side tax mirror rows (`tax`, `tax_refund`, `tax_remittance`) historically posted against
+`PLATFORM_SELLER_ID` — the same synthetic seller that backs the platform's own first-party
+storefront. This conflates the marketplace-wide tax clearing account with the platform store's own
+commercial books. It is insulated in every store-facing query (those filter by
+`accountingScope: 'merchant'` and order ownership, while the mirrors are
+`accountingScope: 'platform'`), so it never leaks into platform-store reporting — but it is muddy in
+the operator audit view.
+
+`FEATURE_TAX_LIABILITY_SELLER` (default off) routes those operator mirrors to a dedicated **Tax
+Liability** synthetic seller instead, mirroring how `SHIPPING_SELLER_ID` isolates the carrier
+pass-through pool:
+
+```env
+FEATURE_TAX_LIABILITY_SELLER=true
+```
+
+- The seller (slug `tax-liability`, env `TAX_SELLER_ID`) is always created at boot by
+  `ensureAdminStore.js` — idempotent, like `shipping-liability`. The flag only controls whether tax
+  mirrors are posted against it.
+- **Forward-only cutover:** only entries posted while the flag is on use `TAX_SELLER_ID`; historical
+  rows stay on `PLATFORM_SELLER_ID`. Tax types are pass-through, non-payout-eligible, and
+  `TAX_SELLER_ID` is excluded from settlement scope (`getExcludedLiabilitySellerIds`), so historical
+  rows on `PLATFORM_SELLER_ID` cause no live harm.
+- Merchant-facing tax rows (`accountingScope: 'merchant'`) are unaffected — they stay on the real
+  merchant seller.
+- Reconciliation is unaffected: it aggregates tax purely by `type`, with no `sellerId` filter.
+
+### Data model (`TaxRemittance`)
+
+`backend/src/models/taxRemittance.model.js`
+
+| Field           | Type     | Notes                                                      |
+| --------------- | -------- | ---------------------------------------------------------- |
+| `period`        | String   | `YYYY-MM` — the tax period being remitted                  |
+| `jurisdiction`  | String   | Identifies the taxing authority (default `'default'`)      |
+| `amountCents`   | Number   | Amount paid, in cents (positive, min 1)                    |
+| `currency`      | String   | ISO 4217 (e.g. `USD`)                                      |
+| `status`        | String   | `'draft'` → `'filed'` (→ `'paid'` if manually set)         |
+| `ledgerEntryId` | ObjectId | The `LedgerEntry._id` of the posted `tax_remittance` debit |
+| `filedAt`       | Date     | Timestamp when the record was promoted from draft          |
+| `notes`         | String   | Free-text filing notes (e.g. confirmation number)          |
+| `createdBy`     | ObjectId | Admin who recorded the remittance                          |
+
+Unique index on `{period, jurisdiction, currency}` is intentionally absent — multiple remittances
+per period are allowed (e.g. quarterly instalments).
+
+### Admin workflow
+
+1. **Record a remittance** — Admin → Marketplace Financials → Tax Remittances → Create, or:
+
+   ```
+   POST /api/admin/platform-financials/tax-remittances
+   { "period": "2026-05", "amountCents": 42500, "currency": "USD",
+     "jurisdiction": "US-Federal", "notes": "Q1 2026 payment" }
+   ```
+
+2. **Review the list:**
+
+   ```
+   GET /api/admin/platform-financials/tax-remittances?currency=USD&page=1
+   ```
+
+3. **Verify the ledger:** query the liabilities endpoint filtering by `type=tax_remittance` to
+   confirm the debit landed against the correct period.
+
+### Draft → filed lifecycle
+
+`createTaxRemittance` in `taxRemittance.service.js` uses an optimistic two-phase write:
+
+1. Create `TaxRemittance` with `status: 'draft'`.
+2. Call `recordTaxRemittance` (posts `tax_remittance` debit to ledger).
+3. Promote document to `status: 'filed'`, set `ledgerEntryId` and `filedAt`.
+
+If step 2 throws, the document remains in `'draft'` — visible to admins for investigation — rather
+than disappearing silently. A `draft` record with no `ledgerEntryId` signals a failed ledger write.
+
+### Reconciliation
+
+The monthly liability reconciliation job (`liabilityReconciliation.job.js`) includes
+`tax_remittance` entries in its per-currency snapshot:
+
+```
+taxNetLiabilityCents = tax + tax_refund + tax_remittance   (all signed)
+```
+
+A positive `taxNetLiabilityCents` means the platform still holds collected tax that has not yet been
+remitted. A negative value means outflows exceeded collections — flag for review.
+
+### Fallback chain interaction
+
+Tax remittance is a pure accounting/liability operation and does not affect the tax calculation
+fallback chain (Avalara → internal TaxRules → `TAX_RATE`). Changing how much tax you collect does
+not change how you record payments to authorities, and vice versa.
+
+---
+
+## 11. Shipping accounting by mode
+
+Tax is computed from the order's product lines and the destination address (Section 1's fallback
+chain) — it has **no dependency** on `order.shippingMode` (`'flat' | 'tiered' | 'carrier' | null`).
+Whichever mode an order uses, the `tax`/`tax_refund` ledger entries are posted exactly as described
+in Section 10, and the [Tax-liability seller](#10-tax-remittance-tracking) routing
+(`FEATURE_TAX_LIABILITY_SELLER`) applies identically. What changes between modes is only how the
+**shipping charge itself** is accounted for; see the root `README.md`'s "Shipping mode and
+seller-retained shipping revenue" section for the full ledger detail. This section summarizes the
+tax-relevant differences.
+
+### Carrier mode (`order.shippingMode === 'carrier'`)
+
+The customer's shipping payment is a pass-through liability: `shipping_fee` credits the **Shipping
+Liability** synthetic seller (`SHIPPING_SELLER_ID`), and `shipping_label_cost` debits it when a
+label is purchased (gated by `FEATURE_SHIPPING_LABEL_LEDGER`). Tax on the order's product lines is
+computed and posted independently of this pool — the carrier shipping liability never appears in tax
+reconciliation, and `tax`/`tax_refund` totals are unaffected by label purchases or carrier rate
+changes.
+
+### Flat/tiered mode (`order.shippingMode !== 'carrier'`, with `FEATURE_SELLER_SHIPPING_PAYOUT=true`)
+
+The shipping charge is seller revenue: `shipping_revenue` (and `shipping_revenue_refund` on refunds)
+post directly to the seller, payout-eligible. Tax is still computed on the product lines exactly as
+in carrier mode — enabling `FEATURE_SELLER_SHIPPING_PAYOUT` does not change what is taxed or how
+much tax is collected, only who ultimately keeps the shipping charge. The `tax`/`tax_refund`
+operator mirrors continue to post to `PLATFORM_SELLER_ID` or `TAX_SELLER_ID` per Section 10,
+regardless of `shippingMode`.
+
+### Net effect
+
+Tax accounting is **mode-independent**: the `RECONCILED_TYPES` aggregation in
+`liabilityReconciliation.service.js` derives `taxNetLiabilityCents` from `tax`/`tax_refund`/
+`tax_remittance` only, with no `shippingMode` filter, while `shippingNetLiabilityCents` (carrier
+pool) and `sellerRetainedShippingCents` (flat/tiered revenue) are reported as separate, unrelated
+figures in the same `ReconciliationSnapshot`.
