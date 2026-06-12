@@ -919,7 +919,23 @@ split into seller UI behavior, backend review gating, and storefront policy rend
 #### Seller settings: editable fields & review gates
 
 Seller settings live in the seller dashboard’s **Store profile** page and are backed by the store
-profile API. The editable fields are grouped into **reviewed** vs **instant** updates:
+profile API. The page (`SellerStoreSettings.jsx`) is organized into **five collapsible sections**,
+built on a shared `CollapsibleSection` component:
+
+- **Store profile** — name, description, logo/banner, support contact, SEO tagline.
+- **Store categories** — up to 5 profile categories with optional descriptions.
+- **Store policies** — shipping and return/refund policy text.
+- **Shipping** — ship-from address, default rate, regional tiers, carrier configuration, and
+  excluded regions (see [Seller shipping UI](#seller-shipping-ui) below).
+- **Store settings** — pause/resume the store and the share-link/QR code.
+
+Each section is collapsed by default and shows a one-line summary (e.g. the store name, the number
+of selected categories, whether policies are complete, the region-tier count, or whether the store
+is paused). Expanding a section reveals its fields and its own **Save** button — saving persists
+only that section's payload (`PUT /api/stores/:id/policies` merges partial updates onto the existing
+document), so editing one section never clears another. The **Store settings** section has no Save
+button: its pause/resume action and share-link/QR download apply immediately. The editable fields
+are grouped into **reviewed** vs **instant** updates:
 
 **Fields that require admin review (store review pipeline):**
 
@@ -2265,24 +2281,46 @@ blank, and is displayed on the storefront/checkout.
 
 ### Seller shipping UI
 
-`SellerStoreSettings.jsx` presents a single, unified **Store Settings → Shipping** page — it is not
-split per mode:
+The **Shipping** collapsible section of Store Settings (`SellerStoreSettings.jsx`) presents a
+single, unified view — there are no per-mode tabs. Top to bottom:
 
-- **Store defaults (top)** — the Ship-from address (always visible, independent of mode), the
-  store-level mode toggle (Flat rate / Regional tiers / Carrier rates), the store flat rate, and the
-  free-shipping threshold. These values are the fallback used when no region matches a destination,
-  or a matched region has no `mode` of its own.
-- **Regional rates (middle)** — the regions editor is always shown, regardless of the store-level
-  mode. Each row has its countries (ISO codes), a **Mode** dropdown (`Use store default` / Flat rate
-  / Regional tiers / Carrier rates), a rate, and an optional free-shipping threshold. Selecting "Use
-  store default" omits that region's `mode` from the save payload, so it inherits the store-level
-  mode. Regions are always sent on save (array-level edit), independent of the store mode.
-- **Carrier rates (Shippo)** — store-level carrier configuration (fallback rate + default parcel
-  dimensions). Shown when the store mode is `carrier` **or** any region's mode is `carrier`, since
-  one carrier configuration applies to every carrier-mode destination, store-wide or per-region. The
-  ship-from origin lives in the Ship-from address section above, not here.
-- **Exclusions (bottom)** — "Regions I don't ship to", the seller's opt-outs from the admin's
-  deliverable regions.
+- **Ship-from address** — always visible, independent of mode. Street autocompletes via
+  `AddressAutocomplete` (backend Places proxy); city/state/postal/country fields plus a
+  draggable-pin `AddressMap` fill in the rest. Required before the store can go `active` (see
+  [Ship-from address requirement](#ship-from-address-requirement)).
+- **Default shipping rate** — the store's flat rate and free-shipping threshold. The flat rate
+  "applies when no regional tier matches, or when a tier uses 'Use store default'"; the free-over
+  threshold makes orders at or above that subtotal ship free (leave empty to disable). The
+  store-level `shipping.mode` itself has no toggle in this UI — it is preserved from existing data,
+  and a tier's "Use store default" inherits it.
+- **Regional rates** — always shown, with an **Add region** button. Each tier has:
+  - **Ships to** — one or more regions picked from the admin's deliverable-region list
+    (`GET /api/public/delivery-regions`), shown as removable chips with real country/subdivision
+    names (e.g. "Egypt", "Egypt — Cairo"), not raw ISO codes. An empty list makes the tier the
+    rest-of-world catch-all.
+  - **Mode** — `Use store default` / Flat rate / Regional tiers / Carrier rates. Selecting "Use
+    store default" omits the tier's `mode` from the save payload, so it inherits the store-level
+    mode.
+  - **Rate** and **Free over** — shown for flat/tiered tiers. Hidden for any tier whose _effective_
+    mode is **Carrier rates** (its own mode is `carrier`, or it inherits a `carrier` store default),
+    since Shippo computes the live rate for those destinations and a manual rate would be ignored.
+    Carrier tiers are also card-only — Cash on Delivery is unavailable for them (see
+    [Region-aware COD](#per-store-rate-configuration-storeshipping)).
+  - **Remove** button.
+
+  On load, stored backend tokens (country codes/names and subdivision names) are mapped back to
+  picker option codes; on save, picker codes are expanded to backend tokens — a country becomes
+  `[countryCode]`, a subdivision becomes `[countryCode, subdivisionName]` so
+  `selectRegionForDestination` (which matches subdivisions by name) resolves the tier at checkout.
+  Legacy free-text tokens that don't match a current admin region round-trip unchanged as raw chips.
+  Regions are always sent on save (array-level edit).
+
+- **Carrier rates (Shippo)** — a collapsible sub-panel containing the fallback rate and default
+  parcel dimensions (weight in grams, dimensions in cm, used when a product has no weight/dimensions
+  of its own). It auto-expands when the store-default mode or any tier's mode is "Carrier rates"
+  (still manually collapsible otherwise). The ship-from origin lives in the section above, not here.
+- **Regions I don't ship to** — the seller's opt-outs, picked from the same admin deliverable-region
+  list as the regional-rate tiers.
 
 ### Admin-managed delivery regions (operating countries + subdivisions)
 
@@ -4015,6 +4053,17 @@ always on record.
 | `reserve_release`          | reserve          | Seller                                   | Positive (hold expires)                                                         |
 | `reserve_used`             | reserve          | Seller                                   | Positive (reserve applied to debt)                                              |
 
+**Pass-through entries report `payoutStatus: 'collected'`**
+
+The six **pass-through** types above (`tax`, `tax_refund`, `tax_remittance`, `shipping_fee`,
+`shipping_refund`, `shipping_label_cost`, i.e. `PASS_THROUGH_TYPES` in
+`settlementClassification.js`) are collected on the platform's behalf and are never owed to the
+seller as a payout, so the pending → scheduled → paid lifecycle described above does not apply to
+them. `normalizeLedgerEntry` — used by the seller and admin ledger list endpoints and the seller's
+CSV/PDF exports — overrides `payoutStatus` to `'collected'` for these entries regardless of the
+value stored on the row. `SellerFinancialsPanel` renders this as a dedicated **"Collected"** badge
+(`seller.financials.status.collected`) instead of "Pending payout" / "Scheduled" / "Paid".
+
 **Merchant / operator mirroring pattern**
 
 Each delivery event calls `buildMerchantLedgerDimensions` and `buildOperatorLedgerDimensions` to
@@ -4090,14 +4139,18 @@ Shippo adapter extracts the label cost from the transaction response and stores 
 
 **Tax remittance tracking**
 
-When the platform pays collected tax to a tax authority, admins record it via
+Admins record tax payments made to a tax authority from **Admin → Marketplace Financials → Tax
+remittances**, a panel that only renders when `FEATURE_TAX_REMITTANCE=true`. Its **Record tax
+remittance** button opens a modal with **Period** (`YYYY-MM`), **Jurisdiction**, **Amount**,
+**Currency**, **Date filed**, and **Notes** fields; submitting calls
 `POST /api/admin/platform-financials/tax-remittances`. The service creates a `TaxRemittance`
 document and calls `recordTaxRemittance`, which posts a `tax_remittance` debit against
 `resolveTaxLiabilityLedgerSellerId(PLATFORM_SELLER_ID)` — the Tax-Liability seller (`TAX_SELLER_ID`)
 when `FEATURE_TAX_LIABILITY_SELLER=true`, otherwise `PLATFORM_SELLER_ID`. The document starts as
 `'draft'`, the ledger entry is posted, and then it is promoted to `'filed'`. If the ledger call
-fails the document stays as `'draft'` for operator review rather than disappearing. Enable with
-`FEATURE_TAX_REMITTANCE=true` (default `false`).
+fails the document stays as `'draft'` for operator review rather than disappearing. On success the
+modal closes, a toast confirms the result, and the remittances table (Period / Jurisdiction / Amount
+/ Status / Filed at) and liability totals refresh.
 
 **Seller financials**
 
@@ -4389,13 +4442,14 @@ non-positive amount).
 
 **Request body:**
 
-| Field          | Type   | Required | Notes                                                |
-| -------------- | ------ | -------- | ---------------------------------------------------- |
-| `period`       | String | Yes      | `YYYY-MM` — the tax period being remitted            |
-| `amountCents`  | Number | Yes      | Positive integer (cents)                             |
-| `currency`     | String | Yes      | ISO 4217 code (e.g. `USD`)                           |
-| `jurisdiction` | String | No       | Identifies the taxing authority; default `'default'` |
-| `notes`        | String | No       | Free-text filing notes                               |
+| Field          | Type   | Required | Notes                                                 |
+| -------------- | ------ | -------- | ----------------------------------------------------- |
+| `period`       | String | Yes      | `YYYY-MM` — the tax period being remitted             |
+| `amountCents`  | Number | Yes      | Positive integer (cents)                              |
+| `currency`     | String | Yes      | ISO 4217 code (e.g. `USD`)                            |
+| `jurisdiction` | String | No       | Identifies the taxing authority; default `'default'`  |
+| `filedAt`      | String | No       | ISO date — backdates the filing date; defaults to now |
+| `notes`        | String | No       | Free-text filing notes                                |
 
 **Response:** the created `TaxRemittance` document with `status: 'filed'` and `ledgerEntryId`.
 
@@ -5730,7 +5784,9 @@ In `product.controller.js` we use a single helper:
   - `/api/auth/refresh-token` validates the cookie against Redis and atomically rotates to a new
     `jti` to prevent reuse of stolen tokens.
   - A dedicated rate limiter on the refresh-token route is enforced at the router level
-    (`auth.route.js`) to limit brute-force refresh attempts.
+    (`auth.route.js`) to limit brute-force refresh attempts. The cap is configurable via
+    `REFRESH_RATE_LIMIT` (default 30 per IP per 60 s) to leave headroom for legitimate
+    background traffic: page boots, per-tab heartbeats, and mobile apps behind shared CGNAT IPs.
 
 - Sliding window:
   - Each successful refresh or keep-alive `EXPIRE`s the `session_active_since:<userId>` key for
@@ -5769,16 +5825,28 @@ In `product.controller.js` we use a single helper:
     token. Only a valid refresh token (httpOnly cookie or `Authorization: Bearer <token>` header) is
     needed.
 
-- Redis resilience in keep-alive:
-  - If Redis returns a network error during a `keepAlive` call, the server responds with
-    `503 Service Unavailable` so clients can retry rather than logging out.
-  - If the refresh-token key is absent from Redis (cache miss) but the JWT signature is valid, the
-    handler re-stores the token in Redis (cache-heal) instead of issuing a `401`. This prevents
-    spurious logouts caused by Redis eviction or brief unavailability.
+- Redis resilience in keep-alive and refresh-token:
+  - If Redis returns a network error during a `keepAlive` or `refreshToken` call, the server
+    responds with `503 Service Unavailable` so clients can retry rather than logging out.
+  - If the refresh-token key is absent from Redis (cache miss) but the JWT signature is valid, both
+    handlers re-store the token in Redis (cache-heal) instead of issuing a `401`. This prevents
+    spurious logouts caused by Redis eviction or brief unavailability. The refresh handler skips
+    the heal when a rotation grace marker exists for the jti, so a token that was genuinely rotated
+    away moments earlier cannot be resurrected by a replay.
+  - Clients treat **only a `401`** from the refresh/keep-alive endpoints as a dead session.
+    Transient failures (network errors, `429` rate limits, `5xx`, `503`) never clear stored
+    credentials: the web `checkAuth` falls back to `GET /auth/keep-alive` (which self-authenticates
+    via the refresh cookie, no CSRF token needed) and retries the profile fetch once; the mobile
+    bootstrap keeps SecureStore tokens and shows the cached profile until a definitive `401`.
 
 - Mobile friendliness:
   - The mobile app runs a proactive session heartbeat: every 10 minutes and on app foreground, it
-    calls the refresh-token endpoint to keep the session alive within the 30-day sliding window.
+    calls `GET /auth/keep-alive` with the stored refresh token as a Bearer header. Keep-alive
+    slides the Redis TTLs **without rotating** the refresh token, so an app kill mid-heartbeat can
+    never orphan the token persisted in SecureStore (rotation remains reserved for
+    `/auth/refresh-token`, used at bootstrap and on `401`s).
+  - For mobile clients (`X-Mobile-Client: true`), keep-alive also returns the freshly minted access
+    token in the response body — React Native cannot read httpOnly cookies.
   - `GET /auth/keep-alive` accepts both httpOnly cookie refresh tokens and
     `Authorization: Bearer <refresh-token>` headers, so mobile clients can call it without relying
     on cookies.

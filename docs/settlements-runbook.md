@@ -47,6 +47,14 @@ Entries start with `payoutStatus=pending` and move through these phases:
 4. **Retryable**: a previously paid payout was reversed and is queued for re-execution with a
    regenerated payout idempotency key.
 
+This pending → scheduled → paid → retryable lifecycle applies to **payout-eligible** types only. The
+**pass-through** types (`tax`, `tax_refund`, `tax_remittance`, `shipping_fee`, `shipping_refund`,
+`shipping_label_cost` — `PASS_THROUGH_TYPES` in `settlementClassification.js`) are collected on the
+platform's behalf and never settled to the seller, so seller- and admin-facing ledger views
+(`normalizeLedgerEntry`) report their `payoutStatus` as `'collected'` regardless of the value stored
+on the row, and `SellerFinancialsPanel` shows a dedicated "Collected" badge instead of "Pending
+payout" / "Scheduled" / "Paid".
+
 Scheduler netting rule is carry-forward by design: each cycle nets all pending entries where
 `createdAt <= periodEnd`. This means pending rows from prior windows are intentionally included
 until they are scheduled/paid.
@@ -764,9 +772,11 @@ exceeded collections (e.g. labels were purchased for free/discounted shipping or
 When the platform pays collected tax to a tax authority, record the remittance via the admin panel
 or API before the next reconciliation run.
 
-**Admin panel:** Navigate to Admin → Marketplace Financials → Tax Remittances → Create. Fill in the
-period, amount, currency, and optionally the jurisdiction and filing notes. On success the document
-is filed and the ledger entry is posted automatically.
+**Admin panel:** Navigate to Admin → Marketplace Financials → Tax remittances and click **Record tax
+remittance**. The modal collects Period, Jurisdiction, Amount, Currency, Date filed, and Notes —
+fill in the period, amount, and currency, and optionally the jurisdiction, a backdated date filed,
+and filing notes. On success the document is filed and the ledger entry is posted automatically; the
+modal closes, a toast confirms the result, and the remittances table and liability totals refresh.
 
 **API:**
 

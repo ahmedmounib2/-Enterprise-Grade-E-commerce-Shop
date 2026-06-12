@@ -386,34 +386,52 @@ FEATURE_TAX_LIABILITY_SELLER=true
   merchant seller.
 - Reconciliation is unaffected: it aggregates tax purely by `type`, with no `sellerId` filter.
 
+### Seller-facing ledger status
+
+The seller ledger, financial summary, and CSV/PDF exports never show a payout status ("Pending
+payout" / "Scheduled" / "Paid") for `tax`, `tax_refund`, or `tax_remittance` rows. These are
+pass-through types (`PASS_THROUGH_TYPES` in `settlementClassification.js`), so
+`normalizeLedgerEntry` reports `payoutStatus: 'collected'` for them regardless of the value stored
+on the row, and `SellerFinancialsPanel` renders a dedicated **"Collected"** badge instead. This
+communicates that tax debited from the seller's side was passed through to the platform's
+tax-liability pool, not withheld from a payout the seller is owed. Payout-eligible types (`sale`,
+`commission`, `refund`, etc.) keep the normal pending → scheduled → paid lifecycle.
+
 ### Data model (`TaxRemittance`)
 
 `backend/src/models/taxRemittance.model.js`
 
-| Field           | Type     | Notes                                                      |
-| --------------- | -------- | ---------------------------------------------------------- |
-| `period`        | String   | `YYYY-MM` — the tax period being remitted                  |
-| `jurisdiction`  | String   | Identifies the taxing authority (default `'default'`)      |
-| `amountCents`   | Number   | Amount paid, in cents (positive, min 1)                    |
-| `currency`      | String   | ISO 4217 (e.g. `USD`)                                      |
-| `status`        | String   | `'draft'` → `'filed'` (→ `'paid'` if manually set)         |
-| `ledgerEntryId` | ObjectId | The `LedgerEntry._id` of the posted `tax_remittance` debit |
-| `filedAt`       | Date     | Timestamp when the record was promoted from draft          |
-| `notes`         | String   | Free-text filing notes (e.g. confirmation number)          |
-| `createdBy`     | ObjectId | Admin who recorded the remittance                          |
+| Field           | Type     | Notes                                                                                          |
+| --------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `period`        | String   | `YYYY-MM` — the tax period being remitted                                                      |
+| `jurisdiction`  | String   | Identifies the taxing authority (default `'default'`)                                          |
+| `amountCents`   | Number   | Amount paid, in cents (positive, min 1)                                                        |
+| `currency`      | String   | ISO 4217 (e.g. `USD`)                                                                          |
+| `status`        | String   | `'draft'` → `'filed'` (→ `'paid'` if manually set)                                             |
+| `ledgerEntryId` | ObjectId | The `LedgerEntry._id` of the posted `tax_remittance` debit                                     |
+| `filedAt`       | Date     | Filing date; defaults to the time the record is promoted from draft, or an admin-supplied date |
+| `notes`         | String   | Free-text filing notes (e.g. confirmation number)                                              |
+| `createdBy`     | ObjectId | Admin who recorded the remittance                                                              |
 
 Unique index on `{period, jurisdiction, currency}` is intentionally absent — multiple remittances
 per period are allowed (e.g. quarterly instalments).
 
 ### Admin workflow
 
-1. **Record a remittance** — Admin → Marketplace Financials → Tax Remittances → Create, or:
+1. **Record a remittance** — Admin → Marketplace Financials → Tax remittances → **Record tax
+   remittance** opens a modal with **Period** (`YYYY-MM`), **Jurisdiction**, **Amount**,
+   **Currency**, **Date filed**, and **Notes** fields. Submitting calls:
 
    ```
    POST /api/admin/platform-financials/tax-remittances
    { "period": "2026-05", "amountCents": 42500, "currency": "USD",
-     "jurisdiction": "US-Federal", "notes": "Q1 2026 payment" }
+     "jurisdiction": "US-Federal", "notes": "Q1 2026 payment",
+     "filedAt": "2026-05-15" }
    ```
+
+   `filedAt` (**Date filed**) is optional — leave it blank to use the time the remittance is
+   recorded. On success the modal closes, a toast confirms the result, and the remittances table and
+   liability totals refresh.
 
 2. **Review the list:**
 
@@ -430,7 +448,8 @@ per period are allowed (e.g. quarterly instalments).
 
 1. Create `TaxRemittance` with `status: 'draft'`.
 2. Call `recordTaxRemittance` (posts `tax_remittance` debit to ledger).
-3. Promote document to `status: 'filed'`, set `ledgerEntryId` and `filedAt`.
+3. Promote document to `status: 'filed'`, set `ledgerEntryId` and `filedAt` (the admin-supplied
+   filing date, or the current time if not provided).
 
 If step 2 throws, the document remains in `'draft'` — visible to admins for investigation — rather
 than disappearing silently. A `draft` record with no `ledgerEntryId` signals a failed ledger write.
@@ -459,12 +478,17 @@ not change how you record payments to authorities, and vice versa.
 
 Tax is computed from the order's product lines and the destination address (Section 1's fallback
 chain) — it has **no dependency** on `order.shippingMode` (`'flat' | 'tiered' | 'carrier' | null`).
-Whichever mode an order uses, the `tax`/`tax_refund` ledger entries are posted exactly as described
-in Section 10, and the [Tax-liability seller](#10-tax-remittance-tracking) routing
-(`FEATURE_TAX_LIABILITY_SELLER`) applies identically. What changes between modes is only how the
-**shipping charge itself** is accounted for; see the root `README.md`'s "Shipping mode and
-seller-retained shipping revenue" section for the full ledger detail. This section summarizes the
-tax-relevant differences.
+`order.shippingMode` is the **effective, region-specific** mode snapshotted at checkout: a seller
+can set a per-region mode on `shipping.regions[].mode` (falling back to the store-level
+`shipping.mode` when unset), so two orders from the same seller can carry different `shippingMode`
+values depending on the customer's destination — one delivering to a carrier region, another to a
+flat/tiered region. The ledger reads only this snapshot, so the accounting below is unchanged; only
+its per-order value now varies by destination. Whichever mode an order uses, the `tax`/`tax_refund`
+entries are posted exactly as described in Section 10, and the
+[Tax-liability seller](#10-tax-remittance-tracking) routing (`FEATURE_TAX_LIABILITY_SELLER`) applies
+identically. What changes between modes is only how the **shipping charge itself** is accounted for;
+see the root `README.md`'s "Shipping mode and seller-retained shipping revenue" section for the full
+ledger detail. This section summarizes the tax-relevant differences.
 
 ### Carrier mode (`order.shippingMode === 'carrier'`)
 
