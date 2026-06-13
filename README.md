@@ -5785,8 +5785,8 @@ In `product.controller.js` we use a single helper:
     `jti` to prevent reuse of stolen tokens.
   - A dedicated rate limiter on the refresh-token route is enforced at the router level
     (`auth.route.js`) to limit brute-force refresh attempts. The cap is configurable via
-    `REFRESH_RATE_LIMIT` (default 30 per IP per 60 s) to leave headroom for legitimate
-    background traffic: page boots, per-tab heartbeats, and mobile apps behind shared CGNAT IPs.
+    `REFRESH_RATE_LIMIT` (default 30 per IP per 60 s) to leave headroom for legitimate background
+    traffic: page boots, per-tab heartbeats, and mobile apps behind shared CGNAT IPs.
 
 - Sliding window:
   - Each successful refresh or keep-alive `EXPIRE`s the `session_active_since:<userId>` key for
@@ -5830,9 +5830,9 @@ In `product.controller.js` we use a single helper:
     responds with `503 Service Unavailable` so clients can retry rather than logging out.
   - If the refresh-token key is absent from Redis (cache miss) but the JWT signature is valid, both
     handlers re-store the token in Redis (cache-heal) instead of issuing a `401`. This prevents
-    spurious logouts caused by Redis eviction or brief unavailability. The refresh handler skips
-    the heal when a rotation grace marker exists for the jti, so a token that was genuinely rotated
-    away moments earlier cannot be resurrected by a replay.
+    spurious logouts caused by Redis eviction or brief unavailability. The refresh handler skips the
+    heal when a rotation grace marker exists for the jti, so a token that was genuinely rotated away
+    moments earlier cannot be resurrected by a replay.
   - Clients treat **only a `401`** from the refresh/keep-alive endpoints as a dead session.
     Transient failures (network errors, `429` rate limits, `5xx`, `503`) never clear stored
     credentials: the web `checkAuth` falls back to `GET /auth/keep-alive` (which self-authenticates
@@ -5841,10 +5841,10 @@ In `product.controller.js` we use a single helper:
 
 - Mobile friendliness:
   - The mobile app runs a proactive session heartbeat: every 10 minutes and on app foreground, it
-    calls `GET /auth/keep-alive` with the stored refresh token as a Bearer header. Keep-alive
-    slides the Redis TTLs **without rotating** the refresh token, so an app kill mid-heartbeat can
-    never orphan the token persisted in SecureStore (rotation remains reserved for
-    `/auth/refresh-token`, used at bootstrap and on `401`s).
+    calls `GET /auth/keep-alive` with the stored refresh token as a Bearer header. Keep-alive slides
+    the Redis TTLs **without rotating** the refresh token, so an app kill mid-heartbeat can never
+    orphan the token persisted in SecureStore (rotation remains reserved for `/auth/refresh-token`,
+    used at bootstrap and on `401`s).
   - For mobile clients (`X-Mobile-Client: true`), keep-alive also returns the freshly minted access
     token in the response body — React Native cannot read httpOnly cookies.
   - `GET /auth/keep-alive` accepts both httpOnly cookie refresh tokens and
@@ -8018,20 +8018,33 @@ _Admin expanded document viewer for uploaded seller verification documents._
 
 ### Seller Dashboard
 
-![Seller dashboard — Overview](./docs/screenshots/seller_dashboard_page.png) _Seller dashboard
-landing page overview._
+![Seller dashboard — Homepage (seller logged in)](./docs/screenshots/homepage_seller_LoggedIN.png)
+_Storefront homepage viewed while logged in as an approved seller (Seller link visible in the
+navbar)._
 
-![Seller dashboard — Orders panel](./docs/screenshots/seller__dashboard_orders_panel.png) _Seller
-order fulfilment panel with filters and status controls._
+![Seller dashboard — Orders panel](./docs/screenshots/seller_orders_panel.png) _Seller orders panel
+listing orders that include the seller's products, with status._
+
+![Seller dashboard — Order filters](./docs/screenshots/seller_ordrs_filters_panel.png) _Order
+filters panel — search by order ID, address & date, or email, and filter by status._
+
+![Seller dashboard — Order fulfilment panel](./docs/screenshots/seller_dashboard_oder_fulfilment_and_orderfilter_panel.png)
+_Seller order fulfilment panel with filters and status controls._
 
 ![Seller dashboard — Product creation](./docs/screenshots/seller_dashboard_create_product_form.png)
-_Seller create product form._
+_Seller create product form with multilingual name/description fields, tax category, shipping
+dimensions, and variant support._
 
-![Seller dashboard — Products panel](./docs/screenshots/seller_dashboard_products_panel_with_lots_of_products_from_different_categories.png)
-_Seller products panel showing products across categories._
+![Seller dashboard — Products tab](./docs/screenshots/seller_products_tab.png) _Products tab —
+catalog grouped by category, with bulk deal adjustment and review status._
 
-![Seller dashboard — Financials](./docs/screenshots/seller_dashboard_financials_panel.png) _Seller
-financial summary panel._
+![Seller dashboard — Financials panel](./docs/screenshots/seller_financials_panel.png) _Seller
+financials panel showing the current balance breakdown (sales, commission, fees, refunds) and
+upcoming/recent payouts._
+
+![Seller dashboard — Financials tab](./docs/screenshots/seller_dashboard_financials_tab.png)
+_Financials transaction ledger with per-order shipping income, commission, fees, and tax line
+items._
 
 ![Seller dashboard — Financial deductions breakdown](./docs/screenshots/seller_dashboard_financials_panel_deductions_Breakdown.png)
 _Detailed deductions breakdown in financials._
@@ -8039,32 +8052,34 @@ _Detailed deductions breakdown in financials._
 ![Seller dashboard — Plan summary](./docs/screenshots/seller_dashboard_Plan_summary.png) _Seller
 subscription plan summary._
 
-![Seller dashboard — Payment methods](./docs/screenshots/seller_dashboard_payment_method_panel.png)
-_Payment method panel._
+![Seller dashboard — Profile settings](./docs/screenshots/seller_dashboard_profile_settings.png)
+_Seller profile settings — store name, logo, banner, description, tagline, and contact details._
 
 ![Seller dashboard — Payment method update](./docs/screenshots/seller_dashboard_payment_method_update_form_expanded.png)
 _Expanded payment method update form._
 
-![Seller dashboard — Bank update confirmation](./docs/screenshots/seller_dashboard_bank_update_confirmation_message.png)
-_Confirmation message after submitting a bank update request._
+![Seller dashboard — Bank update consent](./docs/screenshots/seller_dashboard_bank_update_consent.png)
+_Consent dialog shown before submitting a bank account update, explaining the 1-2 business day
+review and storefront pause._
 
 ![Seller dashboard — Application details](./docs/screenshots/seller_dashboard_application_details_panel_showing_document_tiers_and_redacted_document.png)
 _Application details with document tiers and redacted documents._
 
-![Seller dashboard — Store settings](./docs/screenshots/seller_dashboard_store_settings_panel.png)
-_Store settings and policy configuration panel._
+![Seller dashboard — Shipping settings](./docs/screenshots/seller_shipping_settings.png) _Seller
+shipping settings — default shipping rate, radius-based local zone pricing, and per-region rates
+with map-based location selection._
 
-![Seller dashboard — QR code section](./docs/screenshots/seller_dashboard_seller_download_your_store_qr_code_section.png)
-_Download store QR code section._
+![Seller dashboard — Store policy settings](./docs/screenshots/seller_store_policy_settings.png)
+_Seller store policy settings — shipping and returns/refunds policy editors._
+
+![Seller dashboard — Store settings (pause & QR share)](./docs/screenshots/seller_dashboard_updated_store_setings_expanded_seller_pause_or_copyQR_Code_to_their_store_for_share.png)
+_Store settings expanded — pause store toggle and share-storefront QR code / link._
 
 ![Seller dashboard — Product moderation state](./docs/screenshots/seller_newly_created_products_are_draft_needto_submit_for_review.png)
 _Newly created products saved as draft and ready for submission for review._
 
 ![Seller dashboard — Upgrade flow to Stripe](./docs/screenshots/seller_upgrading_to_pro_plan_routed_toStripe_to_pay.png)
 _Upgrade to Pro plan routed to Stripe checkout._
-
-![Seller dashboard — Upgraded to Pro](./docs/screenshots/Seller_upgraded_to_pro_plan.png) _Seller
-upgraded to Pro plan confirmation state._
 
 ---
 
