@@ -8,8 +8,8 @@
 >   cancel/expire
 > - Stripe Checkout integration with robust webhook handling (PaymentIntent verification, refunds,
 >   expired sessions)
-> - Order export (PDF) & fulfilment tooling, GDPR data export, Sentry observability, and 89.28% test
->   coverage.
+> - Order export (PDF) & fulfilment tooling, GDPR data export, Sentry observability, and 90.02%
+>   backend test line coverage across 3,333 automated tests.
 
 ---
 
@@ -312,6 +312,8 @@
     - [Field-level PII encryption](#field-level-pii-encryption)
     - [Role \& Permission Matrix](#role--permission-matrix)
   - [Testing \& CI](#testing--ci)
+    - [Coverage](#coverage)
+    - [Critical workflows covered](#critical-workflows-covered)
     - [How to run tests](#how-to-run-tests)
     - [How to test the COD refund purge cron job](#how-to-test-the-cod-refund-purge-cron-job)
     - [Test status](#test-status)
@@ -355,7 +357,7 @@ Documentation in [`docs/`](docs/) is not scaffolding — it covers actively used
 security rotation procedures, settlement and payout operations, and CI/CD setup that are referenced
 during day-to-day development and deployment. The codebase is production-grade in both scope and
 discipline: distributed Redis locks, field-level PII encryption, HMAC-signed OAuth bridge codes,
-multi-stage Docker builds, and a full 129-suite / 1099-test backend test suite with CI enforcement
+multi-stage Docker builds, and a full 235-suite / 3,333-test backend test suite with CI enforcement
 on every PR.
 
 ---
@@ -2215,7 +2217,8 @@ Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
   - Rate limiting, input sanitization, NoSQL injection protection.
 
 - Testing
-  - Extensive unit/integration/E2E tests with 89.28% backend coverage.
+  - Extensive unit/integration/E2E tests: 3,333 backend tests across 235 suites with 90.02% line
+    coverage, plus 340 frontend tests across 47 suites. See [Testing & CI](#testing--ci).
 
 ---
 
@@ -6724,9 +6727,86 @@ and must never be modified through the standard seller application flow.
 
 ## Testing & CI
 
-- Tests: Jest unit & integration tests with mocks for Redis / email / cloudinary, supertest for
-  route-level tests, and Cypress for frontend E2E flows.
-- Coverage: Backend coverage is reported at **89.28%** (unit + integration).
+- Tests: Jest unit & integration tests with mocks for Redis / email / cloudinary, database-backed
+  tests using **mongodb-memory-server** (in-memory MongoDB) for model/service/integration specs,
+  **Supertest** for API/route-level tests, and **Cypress** for frontend E2E flows.
+- Scale: **3,333 automated tests across 235 suites** (backend, all passing), plus 340 frontend
+  tests across 47 suites — see [Test status](#test-status).
+- Coverage: see [Coverage](#coverage) below.
+- CI: the full suite runs on every pull request and push to `main` (GitHub Actions); a failing
+  suite blocks merge — see [CI/CD pipeline](#cicd-pipeline).
+
+### Coverage
+
+Backend coverage (unit + integration, `npm run test:coverage`):
+
+| Metric     | Coverage |
+| ---------- | -------: |
+| Statements |   88.36% |
+| Branches   |   74.10% |
+| Functions  |   89.08% |
+| Lines      |   90.02% |
+
+### Critical workflows covered
+
+The 3,333 backend tests provide unit, integration, and E2E coverage for the platform's core
+business workflows:
+
+- **Auth & session lifecycle** — login, registration, OAuth bridge codes, refresh-token rotation,
+  and the sliding 30-day session window (`auth.controller.spec.js`, `auth.route.spec.js`,
+  `auth.e2e.spec.js`, `bridgeCode.*`).
+- **Cart, checkout & stock reservation** — atomic stock decrement/restore on cancel/expire and
+  Stripe Checkout session creation/failure paths (`cart.controller.spec.js`, `cart.e2e.spec.js`,
+  `checkout.e2e.spec.js`, `checkout-failure.e2e.spec.js`, plus frontend `CartPage.test.jsx` /
+  `CheckoutPage.test.jsx`).
+- **Stripe payments, webhooks & disputes** — PaymentIntent verification, idempotent webhook
+  replay, refunds, and `charge.dispute.*` chargeback ingestion (`payment.controller.spec.js`,
+  `payment.webhook.controller.spec.js`, `payment.webhook.disputes.spec.js`,
+  `stripeDispute.webhook.spec.js`).
+- **Cash-on-delivery (COD)** — eligibility scoring, region-aware availability, abuse/risk controls,
+  refund workflow, and the encrypted-details purge cron (`codEligibility.service.spec.js`,
+  `payment.controller.cod-risk.spec.js`, `payment.codAbuse.spec.js`,
+  `codRefundWorkflow.service.spec.js`, `codRefundFlow.integration.spec.js`).
+- **Order lifecycle, returns & refunds** — status transition enforcement, return requests, and
+  prepaid/COD refund approval (`order.controller.spec.js`,
+  `order.controller.returnRequestGaps.spec.js`, `prepaidRefund.service.spec.js`,
+  `admin.approve-refund-prepaid.spec.js`, `seller.orders.controller.refunds.spec.js`).
+- **Seller onboarding, KYC & store closure** — application submission, document upload/review,
+  Stripe Connect onboarding, and the closure/eligibility/finalization flow
+  (`seller.apply.route.spec.js`, `seller.kyc.*.spec.js`, `connectOnboarding.service.spec.js`,
+  `seller.closure.controller.spec.js`, `sellerClosure.e2e.spec.js`).
+- **Settlements, payouts & ledger** — settlement scheduling/execution/reversal, manual payouts, and
+  ledger/liability reconciliation (`settlementExecution.service.spec.js`,
+  `settlementScheduler.service.spec.js`, `settlementBatchReverse.service.spec.js`,
+  `manualSettlementPayout.service.spec.js`, `ledger.service.spec.js`,
+  `liabilityReconciliation.service.spec.js`).
+- **Platform & seller financials / billing** — admin platform financial reporting, per-seller
+  financial summaries, and subscription billing idempotency/pagination
+  (`admin.platformFinancials.controller.spec.js`, `sellerFinancialSummary.service.spec.js`,
+  `sellerBilling.service.spec.js`, `billing.history.controller.spec.js`).
+- **Shipping & carrier integration** — shipment creation/labeling across Aramex, Shippo, and manual
+  providers, plus customer tracking and delivery-region resolution
+  (`shipping/dispatcher.spec.js`, `shipping/providers/*.spec.js`,
+  `seller.shipments.controller.spec.js`, `order.shipmentTracking.controller.spec.js`,
+  `shipping.e2e.spec.js`).
+- **Reviews & dispute resolution** — purchase-gated reviews with rating aggregation, and the
+  7-state dispute lifecycle with SLA enforcement and chargeback linkage (`review.*.spec.js`,
+  `ratingAggregate.service.spec.js`, `dispute.*.spec.js`, `dispute/stateMachine.spec.js`, frontend
+  `DisputeListPage.test.jsx` / `DisputeDetailPage.test.jsx`).
+- **GDPR data export & account deletion** — full user export bundle assembly and account
+  deletion/anonymization with seller cascade (`gdpr/assembleUserExport.spec.js`,
+  `users/deleteUserAccount.service.spec.js`).
+- **Admin moderation, audit & user management** — product moderation, the audit-log dashboard, and
+  admin user suspension/deletion (`admin.moderation.products.controller.spec.js`,
+  `admin.audit.controller.spec.js`, `admin.users.controller.spec.js`).
+- **Tax calculation & remittance** — Avalara provider integration, tax code mapping, and remittance
+  reporting (`tax/avalara.provider.spec.js`, `tax/taxRate.service.spec.js`,
+  `taxRemittance.service.spec.js`).
+- **Product catalog & storefront** — product CRUD/variants, search, category browsing, and store
+  pages (`createProduct.spec.js`, `searchProducts.spec.js`, `products.e2e.spec.js`,
+  `store.public.e2e.spec.js`, frontend `StorefrontPage.public.integration.test.jsx`).
+
+All paths above are relative to `backend/src/tests/` unless prefixed `frontend/`.
 
 ### How to run tests
 
@@ -6814,10 +6894,12 @@ You can test both the **pure purge function** and the **scheduled cron execution
 
 ### Test status
 
-- **Backend:** 129 suites, 1,099 tests — all passing.
-- **Frontend:** 18 suites, 60 tests — all passing.
-- **Coverage:** Backend test coverage: ~89% (unit + integration). Full test suite includes
-  authorization flows, stock reservation, Stripe webhooks, and end-to-end checkout scenarios.
+- **Backend:** 235 suites, 3,333 tests — all passing.
+- **Frontend:** 47 suites, 340 tests — all passing.
+- **Coverage:** see [Coverage](#coverage) above (90.02% lines / 88.36% statements / 89.08%
+  functions / 74.10% branches; unit + integration). Full test suite includes authorization flows,
+  stock reservation, Stripe webhooks, and end-to-end checkout scenarios — see
+  [Critical workflows covered](#critical-workflows-covered).
 - **CI enforcement:** Tests run on every pull request and push to `main` with no
   `continue-on-error`; a failing test suite blocks merge. See
   [`docs/ci-cd-setup.md`](docs/ci-cd-setup.md) for the full pipeline description.
