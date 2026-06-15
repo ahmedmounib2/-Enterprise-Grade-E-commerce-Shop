@@ -3,6 +3,10 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this
 repository.
 
+This repository serves both as a production codebase and as a long-term engineering learning
+environment. Optimize not only for correctness, but also for teaching, explainability, and transfer
+of debugging intuition.
+
 ---
 
 ## A. Development Commands
@@ -487,3 +491,99 @@ rule in Section 9 (clean markdown codeblock, no emojis, no collapse sections).
   place and `resize_nodes`/`move_nodes` to adjust rectangles. Only create or delete nodes when the
   content structure changes significantly (e.g., different number of placeholders). Never clear and
   rebuild an entire frame unless explicitly asked.
+
+## 16. Debugging, Root Cause Analysis, and Teaching Mode
+
+This repository is also used as a learning environment. When fixing bugs, do not act as a black box.
+
+After every bug fix or debugging task, include a **Debugging Notes** section explaining:
+
+### A. Root Cause
+
+- Describe the actual cause of the issue.
+- Explain why the bug occurred.
+- Distinguish symptoms from root causes.
+
+### B. Investigation Process
+
+Explain step-by-step how the issue was identified.
+
+Include:
+
+1. Initial symptoms.
+2. Hypotheses considered.
+3. Evidence used (logs, stack traces, code paths, state changes, etc.).
+4. Why alternative explanations were rejected.
+5. How the final root cause was confirmed.
+
+### C. Before vs After
+
+Show:
+
+- What the previous behavior was.
+- Why it was incorrect.
+- Why the new implementation works.
+
+### D. Concepts Involved
+
+List the underlying concepts responsible for the issue, such as:
+
+- async/await
+- race conditions
+- stale state
+- React rendering
+- useEffect dependencies
+- event propagation
+- closures
+- JWT expiration
+- Redis consistency
+- transactions
+- Stripe webhooks
+- MongoDB queries
+- caching
+- concurrency
+
+### E. How a Senior Engineer Might Have Suspected This
+
+Explain:
+
+- Which clues pointed toward the root cause.
+- Which warning signs should be recognized in the future.
+- What intuition experienced engineers often develop for this class of problem.
+
+### F. Prevention
+
+Describe:
+
+- Tests that could prevent this bug.
+- Logging or observability improvements.
+- Architectural improvements.
+- Validation or error-handling improvements.
+
+### G. Teaching Mode
+
+Assume the repository owner is learning.
+
+When fixing bugs:
+
+- Prefer explanation over magic.
+- Explain reasoning before conclusions.
+- Teach debugging methodology, not only solutions.
+- Optimize for long-term understanding rather than shortest output.
+- Avoid phrases like "fixed" without explaining why.
+- Treat AI as a senior pair programmer mentoring a junior engineer.
+
+### H. Learning Summary
+
+End every debugging task with:
+
+#### What I learned
+
+- Three to five concise lessons.
+- Patterns to remember.
+- Similar situations where the same thinking applies.
+
+The goal is not only to fix the current bug but to improve the repository owner's debugging and
+engineering skills over time.
+
+---
