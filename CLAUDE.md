@@ -520,7 +520,7 @@ Include:
 
 Show:
 
-- What the previous behavior was.
+- What the previous behaviour was.
 - Why it was incorrect.
 - Why the new implementation works.
 

@@ -16,7 +16,12 @@
   - [Pre-flight project checks](#pre-flight-project-checks)
   - [After running `expo prebuild`](#after-running-expo-prebuild)
     - [Minimal, reproducible flow we use](#minimal-reproducible-flow-we-use)
-    - [Verify autolinking (do these exact checks)](#verify-autolinking-do-these-exact-checks)
+  - [Cause](#cause)
+  - [Recovery Procedure](#recovery-procedure)
+  - [Verify Internal Flavor Exists](#verify-internal-flavor-exists)
+  - [Rebuild the Internal Debug Client](#rebuild-the-internal-debug-client)
+  - [Safety Branch Workflow](#safety-branch-workflow)
+  - [Verify Before Releasing](#verify-before-releasing)
   - [Build or refresh the custom dev client](#build-or-refresh-the-custom-dev-client)
     - [One-time or after native changes](#one-time-or-after-native-changes)
     - [Install the **Internal Debug** dev client (the one you use daily)](#install-the-internal-debug-dev-client-the-one-you-use-daily)
@@ -212,7 +217,7 @@ then you restore your customizations.
 
 ### Minimal, reproducible flow we use
 
-```bash
+````bash
 cd mobile
 npx expo prebuild --platform android --clean
 
@@ -221,7 +226,179 @@ npx expo prebuild --platform android --clean
 #   mobile/android/gradle.properties
 #   mobile/android/app/build.gradle
 #   mobile/android/app/src/main/AndroidManifest.xml
+
+# Recovering From `expo prebuild --clean` Overwriting Custom Android Setup
+
+## Symptoms
+
+After running:
+
+```bash
+cd mobile
+npx expo prebuild --clean
+````
+
+the following suddenly fail:
+
+```bash
+./gradlew tasks --all | grep assembleInternal
 ```
+
+No output appears, or:
+
+```text
+Cannot locate tasks that match ':app:assembleInternalDebug'
+```
+
+even though Internal Debug builds previously worked.
+
+---
+
+## Cause
+
+`expo prebuild --clean` regenerates:
+
+- mobile/android/
+- mobile/ios/
+
+and can overwrite custom files used by our Internal flavor.
+
+Affected files:
+
+```text
+mobile/android/app/build.gradle
+mobile/android/settings.gradle
+mobile/android/app/src/main/AndroidManifest.xml
+mobile/android/app/src/main/java/com/ahmedmonib/eshop/MainActivity.kt
+mobile/ios/Podfile
+```
+
+---
+
+## Recovery Procedure
+
+Restore custom files from Git:
+
+```bash
+git restore --source origin/main mobile/android/app/build.gradle
+
+git restore --source origin/main mobile/android/settings.gradle
+
+git restore --source origin/main mobile/android/app/src/main/AndroidManifest.xml
+
+git restore --source origin/main \
+mobile/android/app/src/main/java/com/ahmedmonib/eshop/MainActivity.kt
+
+git restore --source origin/main mobile/ios/Podfile
+```
+
+---
+
+## Verify Internal Flavor Exists
+
+```bash
+cd mobile/android
+
+./gradlew tasks --all | grep assembleInternal
+```
+
+Expected:
+
+```text
+app:assembleInternalDebug
+app:assembleInternalRelease
+```
+
+If these tasks appear, recovery succeeded.
+
+---
+
+## Rebuild the Internal Debug Client
+
+Remove old installations:
+
+```bash
+adb uninstall com.ahmedmonib.eshop.internal || true
+```
+
+Clean:
+
+```bash
+./gradlew clean
+```
+
+Build:
+
+```bash
+./gradlew :app:assembleInternalDebug
+```
+
+Install:
+
+```bash
+adb install -r \
+app/build/outputs/apk/internal/debug/app-internal-debug.apk
+```
+
+---
+
+## Safety Branch Workflow
+
+Before experimenting:
+
+```bash
+git checkout -b fix/internal-flavor-recovery
+```
+
+Perform recovery there.
+
+When everything works:
+
+```bash
+git switch main
+
+git merge fix/internal-flavor-recovery
+
+git push origin main
+```
+
+Then remove the temporary branch:
+
+```bash
+git branch -d fix/internal-flavor-recovery
+```
+
+---
+
+## Verify Before Releasing
+
+Always run:
+
+```bash
+cd mobile/android
+
+./gradlew tasks --all | grep assembleInternal
+```
+
+and ensure:
+
+```text
+app:assembleInternalDebug
+app:assembleInternalRelease
+```
+
+exist before creating:
+
+```bash
+./gradlew :app:assembleInternalRelease
+
+./gradlew bundleProdRelease
+```
+
+This guarantees that both Internal Debug and Production builds still use the custom Android
+configuration.
+
+````
 
 ### Verify autolinking (do these exact checks)
 
@@ -230,7 +407,7 @@ npx expo prebuild --platform android --clean
 cd mobile/android
 ./gradlew :app:dependencies --configuration internalDebugRuntimeClasspath \
   | grep -i -E "react-native-svg|horcrux|svg" || true
-```
+````
 
 > Newer RN/Expo may not add explicit lines to `settings.gradle`; that’s normal.
 
@@ -324,6 +501,40 @@ adb uninstall com.ahmedmonib.eshop.internal || true
 > other.
 
 ---
+
+````markdown
+## Rebranding the deep-link scheme
+
+Changing:
+
+```js
+scheme: "eshop";
+```
+````
+
+to:
+
+```js
+scheme: "vexflare";
+```
+
+is a native Android change.
+
+Because `mobile/android/` is committed to git, app.config.js changes are NOT automatically
+propagated.
+
+After updating AndroidManifest.xml:
+
+```bash
+cd mobile/android
+
+adb uninstall com.ahmedmonib.eshop.internal || true
+
+./gradlew clean
+./gradlew :app:assembleInternalDebug
+
+adb install -r app/build/outputs/apk/internal/debug/app-internal-debug.apk
+```
 
 ## Daily development loop
 

@@ -24,7 +24,7 @@ Only do this if you don’t already have it.
 **`mobile/.env.internal`**
 
 ```dotenv
-EXPO_PUBLIC_API_BASE_URL=https://api.ahmedmonib-eshop-demo.com
+EXPO_PUBLIC_API_BASE_URL=https://api.vexflare.com
 # Turn OFF pinning for internal testing
 EXPO_PUBLIC_SSL_PINNING_CERTS=
 ```
@@ -52,7 +52,7 @@ EXPO_PUBLIC_SSL_PINNING_CERTS=
 
 ```bash
 # 1) Optional: refresh the server cert (safe even if pinning is off)
-npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api
+npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api
 
 # 2) Pinning OFF
 npm -w mobile run env:internal
@@ -93,15 +93,26 @@ adb kill-server && adb start-server
 
 ---
 
-## Flow B — Production **AAB** (pinning **ON**)
+## Flow B — Production AAB (pinning ON)
 
-> Build flavor: **prodRelease** Package name: usually `com.ahmedmonib.eshop`
+> Build flavor: prodRelease Package name: com.ahmedmonib.eshop
 
 ```bash
-# 1) Refresh cert (ensures latest leaf; saved as mobile/certs/eshop_api.cer)
-npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api
+# 0) If app.config.js version/versionCode changed,
+# sync Expo config into the committed android folder
+cd mobile
+npx expo prebuild --platform android --no-install
 
-# 2) Pinning ON (env sets EXPO_PUBLIC_SSL_PINNING_CERTS=eshop_api and syncs cert to assets/)
+# Verify the values
+cd android
+grep -n "versionCode" app/build.gradle
+grep -n "versionName" app/build.gradle
+cd ../..
+
+# 1) Refresh cert
+npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api
+
+# 2) Pinning ON
 npm -w mobile run env:production
 
 # 3) Build AAB
@@ -112,6 +123,30 @@ cd -
 # 4) Upload to Play Console
 ls -lah mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab
 ls -lah mobile/android/app/build/outputs/mapping/prodRelease/mapping.txt
+
+```
+
+---
+
+## Version bump reproducible flow
+
+When changing:
+
+- `expo.version`
+- `android.versionCode`
+- `ios.buildNumber`
+- app name
+- icons
+- splash screen
+- scheme
+- intent filters
+
+always synchronize Expo configuration into the committed native projects before building:
+
+```bash
+cd mobile
+npx expo prebuild --platform android --no-install
+cd ..
 ```
 
 **Sanity check: AAB has the pinned cert in base assets**
