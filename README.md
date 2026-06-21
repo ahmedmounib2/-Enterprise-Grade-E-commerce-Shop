@@ -409,6 +409,71 @@ payments, order fulfilment tooling, and production observability.
 This repository is an npm **workspace monorepo**. Every app or shared package lives in its own
 workspace so tooling, builds, and deployments stay isolated but share a single lockfile.
 
+**High-level system architecture**
+
+```mermaid
+graph TB
+    Browser["React SPA"]
+    Mobile["React Native (Expo)"]
+    API["Express API"]
+    MongoDB[("MongoDB Atlas")]
+    Redis[("Redis")]
+    Stripe["Stripe"]
+    Shippo["Shippo"]
+    Cloudinary["Cloudinary"]
+
+    Browser --> API
+    Mobile --> API
+    API --> MongoDB
+    API --> Redis
+    API --> Stripe
+    API --> Shippo
+    API --> Cloudinary
+```
+
+**Request flow through the middleware pipeline**
+
+```mermaid
+graph TD
+    A["Browser Request"] --> B["Helmet + CSP"]
+    B --> C["CORS"]
+    C --> D["Rate Limiting"]
+    D --> E["CSRF Token"]
+    E --> F["Authentication"]
+    F --> G["Route Controller"]
+    G --> H["Service Layer"]
+    H --> I[("MongoDB / Redis")]
+```
+
+**Background jobs started at boot (server.js)**
+
+```mermaid
+graph TB
+    S["server.js startup"]
+    S --> J1["Settlement Scheduler"]
+    S --> J2["Subscription Renewal"]
+    S --> J3["Reserve Release"]
+    S --> J4["Settlement Reconciliation"]
+    S --> J5["COD Refund Purge"]
+    S --> J6["Payout Retry"]
+    S --> J7["COD Payout Reconciliation"]
+    S --> J8["Seller Closure Finalizer"]
+    S --> J9["Dispute SLA Escalation"]
+    S --> J10["Liability Reconciliation"]
+    S --> J11["Job Health Monitor"]
+    J1 --> JH[("JobHealth")]
+    J2 --> JH
+    J3 --> JH
+    J4 --> JH
+    J5 --> JH
+    J6 --> JH
+    J7 --> JH
+    J8 --> JH
+    J9 --> JH
+    J10 --> JH
+    J11 --> JH
+```
+
 ### Workspaces
 
 | Workspace    | Path        | Purpose                                                                                        |
@@ -926,6 +991,20 @@ step transition. When a seller returns to a partially completed application, the
 first incomplete step (the first step whose required fields are not yet filled) and resumes from
 there rather than always returning to step 1. This logic is enforced server-side; the frontend reads
 the `resumeStep` field from the API response and navigates accordingly.
+
+**Seller onboarding state machine**
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft
+    draft --> pending : submit application
+    pending --> verified : admin approves
+    pending --> rejected : admin rejects
+    pending --> action_required : docs requested
+    action_required --> pending : seller resubmits
+    verified --> [*]
+    rejected --> [*]
+```
 
 ### Seller store settings, storefront policies, and admin review flow
 
@@ -1967,6 +2046,27 @@ review per customer per store. See [Store Reviews](#store-reviews) for the full 
 
 ## Deployment surfaces & release workflow
 
+**Deployment topology**
+
+```mermaid
+graph TB
+    subgraph vercel["Vercel CDN"]
+        V["React SPA"]
+    end
+    subgraph railway["Railway"]
+        API["Express API"]
+    end
+    subgraph atlas["MongoDB Atlas"]
+        DB[("Replica Set")]
+    end
+    subgraph rediscloud["Redis"]
+        RD[("Upstash / ioRedis")]
+    end
+    V --> API
+    API --> DB
+    API --> RD
+```
+
 ### Frontend (Vercel)
 
 - Project **Root Directory** must be `frontend`.
@@ -1982,6 +2082,16 @@ review per customer per store. See [Store Reviews](#store-reviews) for the full 
   ```
 
 - Required environment variable: `PUBLIC_CLIENT_FALLBACK_URL=https://vexflare.com/reset-password`.
+
+**Frontend build & code-splitting pipeline**
+
+```mermaid
+graph LR
+    A["Vite Build"] --> B["Code-split chunks\nper page"]
+    B --> C["lazyWithRetry\nChunkLoadError recovery"]
+    C --> D["Suspense boundary\nspinner fallback"]
+    D --> E["Feature-gated routes\nVITE_FEATURE_* flags"]
+```
 
 ### Backend (Railway Docker image)
 
@@ -2776,6 +2886,30 @@ This section explains the exact runtime flow implemented by the backend payment 
 
 ---
 
+**Stripe checkout flow (createCheckoutSession)**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as Express API
+    participant R as Redis
+    participant S as Stripe
+    participant DB as MongoDB
+    C->>+API: POST /checkout/initiate
+    API->>+R: cacheAcquireLock(variantId)
+    R-->>-API: lock acquired
+    API->>+S: createPaymentIntent(amount)
+    S-->>-API: client_secret
+    API-->>-C: client_secret + draft order
+    C->>S: stripe.confirmPayment (Elements)
+    S->>+API: POST /webhooks/stripe (HMAC signed)
+    API->>API: constructEvent verify
+    API->>+DB: create Order + LedgerEntry (transaction)
+    DB-->>-API: committed
+    API->>R: cacheReleaseLock
+    API-->>-S: 200 OK
+```
+
 ### Stripe webhooks & async handling — `stripeWebhook`
 
 The webhook handler validates Stripe signatures and supports multiple events:
@@ -2845,6 +2979,42 @@ The webhook handler validates Stripe signatures and supports multiple events:
 > email) are logged but don't crash the handler.
 
 ---
+
+**Stripe webhook processing with idempotency**
+
+```mermaid
+sequenceDiagram
+    participant S as Stripe
+    participant API as Express API
+    participant DB as MongoDB
+    participant L as Ledger
+    S->>+API: POST /api/payments/webhook
+    API->>API: stripe.webhooks.constructEvent
+    API->>+DB: check idempotency key
+    DB-->>-API: not seen
+    API->>+DB: update Order status
+    DB-->>-API: saved
+    API->>+L: postLedgerEntry(type, amount)
+    L-->>-API: LedgerEntry._id
+    API->>DB: store idempotency key
+    API-->>-S: 200 OK
+```
+
+**Generic webhook idempotency gate**
+
+```mermaid
+sequenceDiagram
+    participant Stripe as Stripe
+    participant WH as Webhook handler
+    participant Cache as Redis NX
+    Stripe->>WH: event (event.id)
+    WH->>Cache: cacheSetNXJSON(key=event.id, ttl)
+    alt key already set
+        Cache-->>WH: duplicate -> res.json({received:true})
+    else acquired
+        WH->>WH: process (mutate state, post ledger)
+    end
+```
 
 ### COD flow (Cash-on-Delivery) — `createCODOrder` & `codCheckoutSuccess`
 
@@ -3080,6 +3250,71 @@ legacy beneficiary payload shapes.
    request body using `CHIMONEY_WEBHOOK_SECRET`.
 3. Confirm response has `received: true`.
 4. Verify matching via idempotency key (fallback provider refund id), and confirm order transition.
+
+**Refund processing pipeline**
+
+```mermaid
+graph TD
+    A["Refund request"] --> B["refundPlan.service\ncalculate refundable amount"]
+    B --> C["acquire refundLock\nlib/refundLock.js"]
+    C --> D{"Payment method?"}
+    D -->|"Stripe"| E["Stripe Refund API"]
+    D -->|"COD"| F["codRefundWorkflow"]
+    E --> G["post LedgerEntry\ntype: refund"]
+    F --> G
+    G --> H["update Order status"]
+    H --> I["release inventory"]
+    H --> J["release refundLock"]
+```
+
+**Partial refund: webhook dedup, order lock, compensating entries**
+
+```mermaid
+sequenceDiagram
+    participant Stripe as Stripe
+    participant WH as payment.controller webhook
+    participant Cache as Redis NX
+    participant Lock as withRefundLock(orderId)
+    participant Ledger as recordRefundLedger
+    Stripe->>WH: charge.refunded (event.id)
+    WH->>Cache: setNX processed_refund_event:{id} (24h)
+    alt duplicate
+        Cache-->>WH: exists -> ack & ignore
+    else first delivery
+        WH->>Lock: acquire order refund lock
+        Lock->>WH: update refundRecord status
+        WH->>Ledger: recordRefundLedger(amount, ratio)
+        Ledger->>Ledger: reserve_used (if any) ->refund (−)<br/>-> commission_reversal (+) -> tax/shipping refund
+        Note over WH: refundedAmountCents < total<br/>=> pending_refund (partiallyRefunded)
+    end
+```
+
+**Full refund also restores reserved stock**
+
+```mermaid
+sequenceDiagram
+    participant Stripe as Stripe
+    participant WH as webhook
+    participant Ledger as recordRefundLedger
+    participant Stock as stock service
+    Stripe->>WH: charge.refunded (full)
+    WH->>Ledger: full reversal entries
+    WH->>WH: refundedAmountCents >= total -> status refunded
+    WH->>Stock: restoreStockReservationByOrderId(order)
+```
+
+**Refund record status (order.refundRecords[])**
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> in_progress
+    in_progress --> completed: charge.refunded / refund.updated succeeded
+    in_progress --> failed: refund.updated failed
+    pending --> failed
+    completed --> [*]
+    failed --> [*]
+```
 
 ### Provider architecture & adapter contract (COD payouts)
 
@@ -4381,6 +4616,165 @@ SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked # Allows tests to proceed whe
 Common `created: false` reasons include `no_pending_entries`, `period_not_eligible`,
 `no_positive_payouts`, and `duplicate`.
 
+**Prepaid order: processor fee at payment, full ledger at delivery**
+
+```mermaid
+graph LR
+    A["order_placed<br/>(no ledger)"] --> B["payment resolved<br/>processor_fee (operator)<br/>+ processing_fee (per seller)"]
+    B --> C["dispatched<br/>(no ledger)"]
+    C --> D["delivered → recordDeliveryLedger():<br/>sale (+), commission (−)/platform_fee (+),<br/>tax pair, shipping entries"]
+    D --> E["settlement batch<br/>reserve withheld"]
+    E --> F["Stripe transfer<br/>payout paid"]
+```
+
+**COD order: commission only at delivery; disbursement + reimbursement on refund**
+
+```mermaid
+graph LR
+    A["cod_order_placed<br/>(no ledger, no Stripe)"] --> B["dispatched"]
+    B --> C["delivered → recordDeliveryLedger():<br/>commission (−)/platform_fee (+)<br/>NO sale entry"]
+    C --> D{"refund?"}
+    D -->|yes| E["cod_refund_disbursement (−) platform→customer<br/>cod_refund_reimbursement (−) seller→platform"]
+    D -->|no| F["settlement batch → payout"]
+```
+
+**Shipping ledger branch by shippingMode**
+
+```mermaid
+graph TD
+    A["delivered: shipping component"] --> B{"shippingMode"}
+    B -->|flat / tiered| C["shipping_revenue (+) to seller<br/>seller keeps shipping"]
+    B -->|carrier| D["shipping_fee (−) on seller<br/>shipping_fee (+) on Shipping seller"]
+    D --> E["shipping_label_cost (−)<br/>posted when label purchased"]
+```
+
+**Merchant rows are mirrored by operator rows for two-sided reconciliation**
+
+```mermaid
+graph LR
+    subgraph Merchant ["accountingScope=merchant / entrySide=merchant"]
+      M1["commission (−) seller"]
+      M2["tax (−) seller"]
+      M3["shipping_fee (−) seller (carrier)"]
+    end
+    subgraph Operator ["accountingScope=platform / entrySide=operator"]
+      O1["platform_fee (+) platform seller"]
+      O2["tax (+) tax-liability seller"]
+      O3["shipping_fee (+) shipping seller"]
+    end
+    M1 -. mirrors .-> O1
+    M2 -. mirrors .-> O2
+    M3 -. mirrors .-> O3
+```
+
+**Balances are computed from ledger rows, never stored**
+
+```mermaid
+graph LR
+    A["LedgerEntry rows<br/>(append-only)"] --> B["filter:<br/>accountingScope = merchant,<br/>payoutStatus ≠ paid,<br/>PAYOUT_ELIGIBLE_TYPES"]
+    B --> C["$group sum(amountCents)"]
+    C --> D["outstanding seller balance<br/>(derived)"]
+```
+
+**Settlement batch build (settlementScheduler.service.js)**
+
+```mermaid
+sequenceDiagram
+    participant Cron as settlementScheduler job
+    participant Lock as Redis lock
+    participant Sched as settlementScheduler.service
+    participant DB as MongoDB
+    Cron->>Lock: acquire settlement:scheduler:lock
+    alt not acquired
+        Lock-->>Cron: skip cycle
+    else acquired
+        Cron->>Sched: scheduleNextBatch(period)
+        Sched->>DB: find LedgerEntry {payoutStatus: pending,<br/>eligible types, createdAt <= periodEnd}
+        Sched->>Sched: group by seller, drop non-positive,<br/>exclude platform/shipping/tax sellers
+        Sched->>Sched: buildReserveWithholding per seller
+        Sched->>DB: create SettlementBatch (scheduled)
+        Sched->>DB: insertMany SettlementPayout (scheduled)
+        Sched->>DB: ledger rows -> payoutStatus scheduled + settlementBatchId
+        Sched->>DB: reserve rows -> type reserve, payoutStatus reserved
+        Cron->>Lock: release
+    end
+```
+
+**Stripe Connect transfer with preflight, balance check, and idempotency**
+
+```mermaid
+sequenceDiagram
+    participant Exec as settlementExecution.service
+    participant Stripe as Stripe Connect
+    participant DB as MongoDB
+    Exec->>Exec: check bank linkage + amount > 0
+    Exec->>Stripe: accounts.retrieve(connectId)
+    alt requirements due / transfers inactive / payouts disabled
+        Exec->>DB: payout -> manual_required
+    else account ready
+        Exec->>Stripe: balance.retrieve()
+        alt available < amount
+            Exec->>DB: payout -> failed (insufficient balance)
+        else funded
+            Exec->>Stripe: transfers.create(amount, dest,<br/>idempotencyKey settlement:batch:seller:ccy)
+            Note over Exec,Stripe: retry w/ backoff on retryable errors
+            Stripe-->>Exec: transfer id
+            Exec->>DB: payout -> paid, externalTransferId set
+        end
+    end
+```
+
+**Service interaction map — solid = synchronous write, dashed = async / detection**
+
+```mermaid
+graph TD
+    O["Order Service"] -->|status-change hook| L["Ledger Service"]
+    P["Stripe"] -->|webhook (async)| W["Webhook Handler"]
+    W --> L
+    L -->|append entries| DB[("LedgerEntry")]
+    S["Settlement Scheduler (cron)"] --> DB
+    S --> SB[("SettlementBatch / Payout")]
+    EX["Settlement Execution"] -->|transfers.create| P
+    R["Reconciliation (cron)"] -.->|detect drift| DB
+    R -.->|cross-check| P
+    R -.->|quarantine| SB
+```
+
+**SettlementBatch status (settlementBatch.model.js)**
+
+```mermaid
+stateDiagram-v2
+    [*] --> calculated
+    calculated --> scheduled
+    calculated --> skipped_no_positive_payouts
+    scheduled --> paid: all payouts paid
+    scheduled --> failed: all payouts failed
+    scheduled --> partial: mixed outcomes
+    scheduled --> retryable: has retryable payouts
+    partial --> paid
+    retryable --> paid
+    paid --> [*]
+    skipped_no_positive_payouts --> [*]
+```
+
+**SettlementPayout status (settlementPayout.model.js)**
+
+```mermaid
+stateDiagram-v2
+    [*] --> scheduled
+    scheduled --> processing
+    processing --> paid
+    processing --> failed
+    failed --> processing: payoutRetry claim
+    failed --> manual_required: retries exhausted
+    paid --> retryable: reversal requested
+    retryable --> processing
+    scheduled --> under_review: reconciliation flag
+    paid --> under_review: reconciliation flag
+    paid --> [*]
+    manual_required --> [*]
+```
+
 ### Admin marketplace financials API (`/api/admin/platform-financials/*`)
 
 Authorization for all routes below: `protectRoute` + `restrictTo('admin', 'staff')`.
@@ -5342,6 +5736,29 @@ For incident handling, remediation sequencing, and operator SOP details, use:
 
 - [`docs/settlements-runbook.md`](docs/settlements-runbook.md)
 
+**Reconciliation: batch + payout cross-check, quarantine on hard mismatch**
+
+```mermaid
+sequenceDiagram
+    participant Cron as settlementReconciliation job
+    participant Recon as reconciliation.service
+    participant DB as MongoDB
+    participant Stripe as Stripe
+    Cron->>Recon: checkBatchConsistency(batchId)
+    Recon->>DB: batch + payouts + ledger aggregate
+    Recon->>Recon: net ledger vs batch vs payouts
+    Cron->>Recon: checkPayoutWithStripe(payoutId)
+    alt externalTransferId present
+        Recon->>Stripe: transfers.retrieve(id)
+    else
+        Recon->>Stripe: transfers.list -> match metadata
+    end
+    alt transfer missing / status mismatch
+        Recon->>DB: payout -> under_review (quarantine)
+    end
+    Recon-->>Cron: discrepancy report (emailed)
+```
+
 ### Settlement Payout Retry & Cron Operations
 
 **Operator action endpoints (quick map):**
@@ -5521,6 +5938,48 @@ absorb transient Stripe/network instability and reduce unnecessary manual escala
       via migration/check.
 - [ ] Confirm job-health records/metrics are updating for `settlement_scheduler` and `payout_retry`.
 - [ ] Confirm alert channel/email recipients receive a controlled test notification.
+
+**Failure-mode to recovery mapping**
+
+```mermaid
+graph TD
+    A{"Failure mode"}
+    A -->|Stripe outage / timeout| B["retryable error -> backoff retry<br/>(settlementExecution)"]
+    A -->|duplicate webhook| C["Redis NX dedup -> ack & ignore"]
+    A -->|failed transfer| D["payout failed -> payoutRetry.job"]
+    D --> E{"retryCount < max?"}
+    E -->|yes| F["claim & retry<br/>(new idempotency key)"]
+    E -->|no| G["manual_required (dead-letter)<br/>+ alert email"]
+    A -->|COD payout stuck| H["codPayoutReconciliation poll<br/>-> complete / manual review"]
+    A -->|ledger/payout drift| I["reconciliation -> under_review"]
+```
+
+**Failed payout recovery (payoutRetry.job)**
+
+```mermaid
+sequenceDiagram
+    participant Cron as payoutRetry.job
+    participant Lock as Redis lock
+    participant DB as MongoDB
+    participant Stripe as Stripe
+    Cron->>Lock: acquire settlement:payout-retry:lock
+    Cron->>DB: find payouts {status: failed, retryCount < max}
+    loop each payout
+        Cron->>DB: findOneAndUpdate claim<br/>(failed -> processing, guard retryCount)
+        alt not claimed
+            DB-->>Cron: skip (already taken)
+        else claimed
+            Cron->>Stripe: executeStripePayout (new idempotency key)
+            alt paid
+                Cron->>DB: status paid, retryCount 0
+            else failed & retryCount >= max
+                Cron->>DB: status manual_required + alert email
+            else failed
+                Cron->>DB: status failed, retryCount++
+            end
+        end
+    end
+```
 
 ### Stripe Connect prerequisites (seller payouts)
 
@@ -5879,6 +6338,43 @@ an unnecessary logout.
 
 ---
 
+**Login & authenticated request (JWT + Redis session)**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as Express API
+    participant DB as MongoDB
+    participant R as Redis
+    C->>+API: POST /auth/login
+    API->>+DB: find user + bcrypt.compare
+    DB-->>-API: user record
+    API->>R: SET userId:jti (TTL 30d)
+    API-->>-C: Set-Cookie: jwt(15m) + refresh-token(30d)
+    Note over C,API: Authenticated request
+    C->>+API: GET /api/protected (jwt cookie)
+    API->>API: verify JWT signature + expiry
+    API-->>-C: 200 OK
+```
+
+**Refresh-token rotation**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as Express API
+    participant R as Redis
+    C->>+API: POST /auth/refresh (refresh-token cookie)
+    API->>API: verify HMAC signature + expiry
+    API->>+R: GET userId:jti
+    R-->>-API: jti valid
+    API->>R: DEL old jti
+    API->>R: SET new jti (TTL 30d)
+    API-->>-C: Set-Cookie: jwt(new 15m) + refresh-token(rotated)
+    Note over C,API: On revoked or expired token
+    API-->>C: 401 — clear cookies
+```
+
 ## Order fulfilment, PDF export & canceled order labeling
 
 - Admin UI supports exporting order details to PDF for fulfilment and label printing. Export
@@ -5914,6 +6410,32 @@ COD orders in early statuses (`order_placed`, `processing`) can now be cancelled
 the seller to have completed COD payout bank details. The eligibility check for COD-specific payout
 fields is skipped until the order has reached a stage where a refund disbursement is actually
 needed.
+
+**Order status state machine (order.model.js)**
+
+```mermaid
+stateDiagram-v2
+    [*] --> order_placed: prepaid checkout completed
+    [*] --> cod_order_placed: COD checkout
+    [*] --> payment_failed: payment_intent.payment_failed
+    payment_failed --> order_placed: checkout.session.completed (recovered)
+    payment_failed --> expired: session expires
+    order_placed --> processing
+    cod_order_placed --> processing
+    processing --> dispatched
+    dispatched --> delivered: recordDeliveryLedger() posts entries
+    order_placed --> pending_refund: partial refund
+    delivered --> pending_refund: partial refund
+    pending_refund --> refunded: full refund completed
+    order_placed --> refunded: full pre-delivery refund
+    delivered --> refunded
+    pending_refund --> refund_rejected
+    order_placed --> cancelled
+    delivered --> externally_refunded_needs_review: refund outside platform
+    refunded --> [*]
+    cancelled --> [*]
+    expired --> [*]
+```
 
 ### Shipment model
 
@@ -6684,6 +7206,42 @@ history remains consistent.
 - **Job-health alerting:** settlement and payout cron job health alerts fan out via email (to the
   admin recipient list) and optionally to a Slack webhook (`OPS_SLACK_WEBHOOK`).
 
+**Error taxonomy and handling**
+
+```mermaid
+graph TD
+    ERR["Runtime Error"] --> OE["Operational Error"]
+    ERR --> PE["Programmer Error"]
+    OE --> R["Retryable\n429 / 503 / timeout"]
+    OE --> NR["Non-Retryable\n400 / 401 / 403 / 404 / 422"]
+    PE --> SN["Sentry capture + alert"]
+    R --> BK["Exponential backoff\nbackground jobs"]
+    NR --> CR["Structured JSON response\nto client"]
+```
+
+**Tracing one financial event from Stripe id to audit trail**
+
+```mermaid
+graph LR
+    A["Stripe event.id"] --> B["[Webhook] log<br/>+ Redis NX key"]
+    B --> C["[refund-ledger:webhook] log<br/>orderId, refundId, amountCents,<br/>APP_VERSION, GIT_SHA, pid"]
+    C --> D["LedgerEntry.actor + idempotencyKey<br/>(queryable audit trail)"]
+    D --> E["Sentry (scrubbed) on error"]
+```
+
+**Security middleware chain**
+
+```mermaid
+graph TD
+    REQ["Incoming Request"] --> HLM["Helmet + CSP"]
+    HLM --> COR["CORS origin whitelist"]
+    COR --> RL["Rate Limiter\n1000 GET / 100 POST per 15 min"]
+    RL --> SAN["mongo-sanitize + HPP"]
+    SAN --> CSR["CSRF double-submit token"]
+    CSR --> JWT["JWT httpOnly cookie auth"]
+    JWT --> APP["Application Logic"]
+```
+
 ### Field-level PII encryption
 
 Sensitive personal data is encrypted at rest using AES-256-GCM via
@@ -6950,6 +7508,20 @@ For the full setup guide including branch protection rules and secret scanning c
 [`docs/ci-cd-setup.md`](docs/ci-cd-setup.md).
 
 ---
+
+**CI/CD pipeline**
+
+```mermaid
+graph LR
+    PR["Pull Request"] --> GH["GitHub Actions CI"]
+    GH --> L["ESLint + Stylelint"]
+    GH --> T["Jest + Supertest\nmongodb-memory-server"]
+    L --> MA["Merge to main"]
+    T --> MA
+    MA --> VD["Vercel Deploy\nfrontend SPA"]
+    MA --> RD["Railway Deploy\nbackend API"]
+    MA --> EA["EAS Update\nmobile OTA"]
+```
 
 ## How to run locally (no Docker)
 
@@ -7901,6 +8473,49 @@ raw Redis usage in controllers/services.
 > Important nuance: REST is great for cache-style operations. For strict atomicity (Lua / multi /
 > strong concurrency guarantees), TCP is preferred in production. That’s the intended split:
 > **Railway/Prod = TCP**, dev can use REST for cache-read-heavy paths if TCP is blocked.
+
+**Redis responsibilities**
+
+```mermaid
+graph LR
+    R[("Redis")]
+    R --> A["Session Store"]
+    R --> B["Auth Token Cache"]
+    R --> C["Application Cache"]
+    R --> D["Distributed Locks"]
+```
+
+**Cache read path (stampede-safe)**
+
+```mermaid
+graph TD
+    A["Read request"] --> B{"Redis GET hit?"}
+    B -->|"hit"| C["Return cached JSON"]
+    B -->|"miss"| D["cacheSetNXJSON\nset-if-not-exists"]
+    D -->|"first writer"| E["Query MongoDB"]
+    E --> F["cacheSetJSON with TTL"]
+    F --> G["Return fresh data"]
+    D -->|"already written"| H["Short wait + retry GET"]
+    H --> B
+```
+
+**Stock reservation with distributed lock**
+
+```mermaid
+graph TD
+    A["checkout: reserve variant"] --> B["cacheAcquireLock(variantId)"]
+    B --> C{"lock acquired?"}
+    C -->|"yes"| D["read stock from DB"]
+    D --> E{"stock > 0?"}
+    E -->|"yes"| F["MongoDB transaction\ndecrement stock"]
+    F --> G["cacheReleaseLock"]
+    G --> H["proceed to payment"]
+    E -->|"no"| I["cacheReleaseLock"]
+    I --> J["return out-of-stock"]
+    C -->|"busy"| K{"retry budget?"}
+    K -->|"yes, backoff"| B
+    K -->|"exhausted"| L["return 409 Conflict"]
+```
 
 ### Environment variables
 

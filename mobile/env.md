@@ -100,9 +100,42 @@ Handy tips:
 ### Mobile workspace
 
 - Expo project defined in `mobile/` with custom dev client.
-- `app.config.js` declares `scheme: 'eshop'` and Android intent filters.
+- `app.config.js` declares the base `scheme: 'vexflare'` (used by the JS layer via
+  `Constants.expoConfig`) plus Android intent filters. The legacy `eshop://` scheme is still
+  accepted by the manifest for backwards compatibility.
 - Development build installed on physical device(s) via Gradle (`./gradlew installDebug`).
 - `.env` management handled through scripts (see [Mobile `.env` profiles](#mobile-env-profiles)).
+
+#### Per-flavor URL schemes
+
+All three Android variants are installed side by side, so each one registers a **distinct** custom
+URL scheme. Without this, Android cannot tell which app a `vexflare://oauth` callback belongs to and
+shows the "open with…" chooser. The scheme is injected into `AndroidManifest.xml` via the
+`${appScheme}` manifest placeholder, set per flavor/build-type in `android/app/build.gradle`:
+
+| Variant        | applicationId                       | scheme              | OAuth callback              |
+| -------------- | ----------------------------------- | ------------------- | --------------------------- |
+| Production     | `com.ahmedmonib.eshop`              | `vexflare`          | `vexflare://oauth`          |
+| Internal       | `com.ahmedmonib.eshop.internal`     | `vexflare-internal` | `vexflare-internal://oauth` |
+| Internal Debug | `com.ahmedmonib.eshop.internal.dev` | `vexflare-dev`      | `vexflare-dev://oauth`      |
+
+At runtime the JS layer cannot read the native manifest, so `mobile/src/utils/appScheme.js` derives
+the active scheme from `expo-application`'s `Application.applicationId` and forces it into every
+`createURL()` call. **Keep that mapping in sync with `build.gradle` and `AndroidManifest.xml`.**
+
+Launch the internal debug variant on a connected device:
+
+```bash
+cd mobile
+npx expo run:android \
+  --variant internalDebug \
+  --app-id com.ahmedmonib.eshop.internal.dev
+```
+
+> **After `expo prebuild --clean`:** the regenerated `AndroidManifest.xml` and `build.gradle` cannot
+> express per-flavor schemes (the Expo config is flavor-agnostic). Re-apply the `${appScheme}`
+> placeholder in the manifest and the per-flavor/-build-type `manifestPlaceholders` in
+> `build.gradle` before committing the regenerated files.
 
 ---
 
@@ -110,22 +143,22 @@ Handy tips:
 
 ### Frontend (Vercel)
 
-| Variable                     | Description                                                                                | Where                                             |
-| ---------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------- |
-| `PUBLIC_CLIENT_FALLBACK_URL` | HTTPS URL for the web reset page (`https://www.ahmedmonib-eshop-demo.com/reset-password`). | Vercel Project → Settings → Environment Variables |
+| Variable                     | Description                                                               | Where                                             |
+| ---------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------- |
+| `PUBLIC_CLIENT_FALLBACK_URL` | HTTPS URL for the web reset page (`https://vexflare.com/reset-password`). | Vercel Project → Settings → Environment Variables |
 
 Additional Vercel config lives in `frontend/vercel.json` (install/build commands, rewrites,
 headers).
 
 ### Backend (Railway)
 
-| Variable                     | Description                                                    | Typical value                                          |
-| ---------------------------- | -------------------------------------------------------------- | ------------------------------------------------------ |
-| `PUBLIC_CLIENT_FALLBACK_URL` | Matches the Vercel fallback so emails share the same SPA link. | `https://www.ahmedmonib-eshop-demo.com/reset-password` |
-| `MOBILE_RESET_REDIRECT_URI`  | Custom-scheme deep link for password resets.                   | `eshop://reset-password`                               |
-| `MOBILE_MAIL_CONFIRM_URI`    | Custom-scheme deep link for mailing confirmations.             | `eshop://mailing/confirm`                              |
-| `MAIL_CONFIRM_WEB_URL`       | Optional HTTPS override used inside confirmation emails.       | `https://shop.example.com/mailing/confirm`             |
-| `MOBILE_OAUTH_REDIRECT_URI`  | Custom-scheme deep link for OAuth return.                      | `eshop://oauth`                                        |
+| Variable                     | Description                                                    | Typical value                              |
+| ---------------------------- | -------------------------------------------------------------- | ------------------------------------------ |
+| `PUBLIC_CLIENT_FALLBACK_URL` | Matches the Vercel fallback so emails share the same SPA link. | `https://vexflare.com/reset-password`      |
+| `MOBILE_RESET_REDIRECT_URI`  | Custom-scheme deep link for password resets.                   | `eshop://reset-password`                   |
+| `MOBILE_MAIL_CONFIRM_URI`    | Custom-scheme deep link for mailing confirmations.             | `eshop://mailing/confirm`                  |
+| `MAIL_CONFIRM_WEB_URL`       | Optional HTTPS override used inside confirmation emails.       | `https://shop.example.com/mailing/confirm` |
+| `MOBILE_OAUTH_REDIRECT_URI`  | Custom-scheme deep link for OAuth return.                      | `eshop://oauth`                            |
 
 > **Branding tip:** The public-facing app name shown in the Google Play Console (e.g. "Ecommerce")
 > can differ from the internal deep-link scheme (`eshop://…`). Only change the scheme and the values
@@ -150,7 +183,7 @@ The Expo app reads `EXPO_PUBLIC_API_BASE_URL` from `.env` in `mobile/`. Three pr
 | Emulator   | `.env.emu`        | `http://10.0.2.2:5001/api`                | Android emulator hitting backend on host machine via special alias.                                   |
 | LAN device | `.env.lan`        | `http://<local-ip>:5001/api`              | Physical device on same Wi-Fi calling local backend.                                                  |
 | Tunnel     | `.env.tunnel`     | `https://<your-ngrok>.ngrok-free.app/api` | Physical device over HTTPS via ngrok tunnel (default for sharing).                                    |
-| Production | `.env.production` | `https://api.ahmedmonib-eshop-demo.com`   | Final release builds targeting the live Railway API (leave off `/api`; the mobile client appends it). |
+| Production | `.env.production` | `https://api.vexflare.com`                | Final release builds targeting the live Railway API (leave off `/api`; the mobile client appends it). |
 
 Switch between them with the helper scripts (run from repo root):
 
@@ -164,6 +197,23 @@ npm -w mobile run env:production
 > Whenever you edit a profile, restart Metro with `-c` (`npx expo start --tunnel -c`) to bust the
 > cache.
 
+#### Google Maps key (mobile checkout map)
+
+The mobile app holds **no** Google Maps key. There is intentionally no
+`EXPO_PUBLIC_GOOGLE_MAPS_API_KEY`:
+
+- **Address autocomplete** calls the backend Places proxy (`/api/shipping/places/*`).
+- **The checkout map** (`AddressMapWebView`, a WebView) fetches its key at runtime from
+  `GET /api/shipping/maps/config`, which returns the server-side `GOOGLE_PLACES_API_KEY` (falling
+  back to `GOOGLE_MAPS_API_KEY`) from `backend/.env`.
+
+Why: an app-restricted (package + SHA-1) key fails inside a WebView — Google treats the WebView page
+as a foreign/null origin and shows "This page didn't load Google Maps correctly" (`gm_authFailure`).
+The page is loaded with a real `baseUrl` origin (`https://vexflare.com`), so the backend key may be
+left unrestricted **or** HTTP-referrer restricted to that origin (preferred). Enable **Maps
+JavaScript API** and **Geocoding API** on that key. If the key is missing or blocked, the map shows
+the shared "Map unavailable — enter your address manually" fallback.
+
 For a **release build**, always run `npm -w mobile run env:production` (from the repo root) before
 invoking Gradle or EAS. The script copies `.env.production` into `mobile/.env`, embedding the public
 Railway hostname inside the bundle, and mirrors any `.cer` files under `mobile/certs/` into
@@ -172,9 +222,8 @@ is enabled but the requested certificates are missing, the helper now aborts wit
 error so you never accidentally ship a build that will throw `Network request failed` on every API
 call. The mobile API client trims trailing slashes and automatically appends `/api`, so the
 production profile deliberately omits the suffix—this keeps the setting in sync with Railway's
-`SERVER_URL` value. Run
-`npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api` to snapshot
-the current production certificate before switching to the production profile.
+`SERVER_URL` value. Run `npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api` to
+snapshot the current production certificate before switching to the production profile.
 
 ### Transport security & pinning
 
@@ -371,7 +420,7 @@ Sanity checks:
 - [ ] Refresh the pinned TLS certificate before each store submission:
 
   ```bash
-  npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api
+  npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api
   ```
 
 - [ ] Switch the Expo env to production (this also mirrors the `.cer` files into
@@ -530,7 +579,7 @@ npm -w mobile run env:tunnel
 ```bash
 cd mobile
 
-npx expo start --tunnel --dev-client --clear
+npx expo start --dev-client --clear
 ```
 
 1. Scan the QR code with the installed development build.
@@ -553,7 +602,9 @@ Clear Expo cache:
 
 ```bash
 rm -rf .expo
-npx expo start --tunnel --clear
+npx expo run:android \
+--variant internalDebug \
+--app-id com.ahmedmonib.eshop.internal.dev
 ```
 
 #### Notes
