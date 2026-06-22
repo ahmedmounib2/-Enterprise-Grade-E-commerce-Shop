@@ -140,6 +140,14 @@ Some screenshots and historical references may still contain the previous domain
     - [Backend (Railway Docker image)](#backend-railway-docker-image)
     - [Mobile app (Expo custom dev client)](#mobile-app-expo-custom-dev-client)
   - [Mobile deep-link flow overview](#mobile-deep-link-flow-overview)
+    - [Payment return (Stripe checkout) — direct 303 redirect](#payment-return-stripe-checkout--direct-303-redirect)
+    - [OAuth login (Google/Facebook) — in-process interception](#oauth-login-googlefacebook--in-process-interception)
+    - [Why two strategies?](#why-two-strategies)
+    - [Supported return schemes](#supported-return-schemes)
+    - [Key files](#key-files)
+    - [Testing matrix](#testing-matrix)
+    - [Password reset deep-link flow](#password-reset-deep-link-flow)
+    - [Other deep-linked flows](#other-deep-linked-flows)
   - [Mobile app architecture \& features](#mobile-app-architecture--features)
     - [Key capabilities](#key-capabilities)
     - [Native integrations](#native-integrations)
@@ -326,6 +334,13 @@ Some screenshots and historical references may still contain the previous domain
   - [Security \& observability](#security--observability)
     - [Field-level PII encryption](#field-level-pii-encryption)
     - [Role \& Permission Matrix](#role--permission-matrix)
+  - [Technical SEO](#technical-seo)
+    - [Crawl control (robots.txt)](#crawl-control-robotstxt)
+    - [Dynamic sitemap](#dynamic-sitemap)
+    - [Structured data (JSON-LD)](#structured-data-json-ld)
+    - [Canonical URLs \& hreflang](#canonical-urls--hreflang)
+    - [Page indexing coverage](#page-indexing-coverage)
+    - [SEO roadmap (Stage 4)](#seo-roadmap-stage-4)
   - [Testing \& CI](#testing--ci)
     - [Coverage](#coverage)
     - [Critical workflows covered](#critical-workflows-covered)
@@ -990,7 +1005,9 @@ client.
 step transition. When a seller returns to a partially completed application, the backend detects the
 first incomplete step (the first step whose required fields are not yet filled) and resumes from
 there rather than always returning to step 1. This logic is enforced server-side; the frontend reads
-the `resumeStep` field from the API response and navigates accordingly.
+the `resumeStep` field from the API response and navigates accordingly. On logout, client-side
+onboarding drafts (`sellerPreOnboarding`, `sellerProofOfAddressDraft`) are cleared from local
+storage to prevent stale state from leaking to the next user on shared devices.
 
 **Seller onboarding state machine**
 
@@ -2108,22 +2125,27 @@ graph LR
 
 - Required Railway variables:
 
-  | Key                          | Example                                                    | Notes                                   |
-  | ---------------------------- | ---------------------------------------------------------- | --------------------------------------- |
-  | `SESSION_SECRET`             | `base64:Vh1YhGq7...`                                       | Generate a 32+ byte random string.      |
-  | `SESSION_REDIS_PREFIX`       | `session:`                                                 | Optional; keep consistent across envs.  |
-  | `PUBLIC_CLIENT_FALLBACK_URL` | `https://vexflare.com/reset-password`                      | Must match the frontend fallback.       |
-  | `MOBILE_RESET_REDIRECT_URI`  | `eshop://reset-password`                                   | Deep link opened by reset emails.       |
-  | `MOBILE_MAIL_CONFIRM_URI`    | `eshop://mailing/confirm`                                  | Deep link opened by mailing emails.     |
-  | `MAIL_CONFIRM_WEB_URL`       | `https://shop.example.com/mailing/confirm?token={{token}}` | Overrides the browser confirmation URL. |
-  | `MOBILE_OAUTH_REDIRECT_URI`  | `eshop://oauth`                                            | Deep link used by OAuth providers.      |
+  | Key                          | Example                                                    | Notes                                                 |
+  | ---------------------------- | ---------------------------------------------------------- | ----------------------------------------------------- |
+  | `SESSION_SECRET`             | `base64:Vh1YhGq7...`                                       | Generate a 32+ byte random string.                    |
+  | `SESSION_REDIS_PREFIX`       | `session:`                                                 | Optional; keep consistent across envs.                |
+  | `PUBLIC_CLIENT_FALLBACK_URL` | `https://vexflare.com/reset-password`                      | Must match the frontend fallback.                     |
+  | `MOBILE_RESET_REDIRECT_URI`  | `vexflare://reset-password`                                | Fallback deep link for reset emails (see note below). |
+  | `MOBILE_MAIL_CONFIRM_URI`    | `vexflare://mailing/confirm`                               | Deep link opened by mailing emails.                   |
+  | `MAIL_CONFIRM_WEB_URL`       | `https://shop.example.com/mailing/confirm?token={{token}}` | Overrides the browser confirmation URL.               |
+  | `MOBILE_OAUTH_REDIRECT_URI`  | `vexflare://oauth`                                         | Deep link used by OAuth providers.                    |
 
+- **`MOBILE_RESET_REDIRECT_URI` note:** Newer app versions send a per-flavor `scheme` field
+  (`vexflare`, `vexflare-internal`, or `vexflare-dev`) in the `POST /api/auth/forgot-password`
+  request body. When present, the backend uses that scheme to construct the deep link instead of
+  `MOBILE_RESET_REDIRECT_URI`. The env var remains the fallback for older app versions that do not
+  send `scheme`. See [Password reset deep-link flow](#password-reset-deep-link-flow) for details.
 - Redeploy whenever you change env vars, email templates, or native deep-link paths.
 
 ### Mobile app (Expo custom dev client)
 
-- Expo project lives in `mobile/` with a custom dev client that registers the `eshop://` scheme and
-  Android intent filters.
+- Expo project lives in `mobile/` with a custom dev client that registers the `vexflare://` scheme
+  and Android intent filters.
 - Install/update the dev client after native or deep-link changes:
 
   ```bash
@@ -2135,7 +2157,7 @@ graph LR
 - Deep-link smoke test:
 
   ```bash
-  npx uri-scheme open "eshop://reset-password?token=TEST123&email=user%40example.com" --android
+  npx uri-scheme open "vexflare://reset-password?token=TEST123&email=user%40example.com" --android
   ```
 
 Refer to [`mobile/env.md`](mobile/env.md) for the full run-mode matrix and env profiles.
@@ -2144,12 +2166,176 @@ Refer to [`mobile/env.md`](mobile/env.md) for the full run-mode matrix and env p
 
 ## Mobile deep-link flow overview
 
-- Password reset emails include both a web fallback (`PUBLIC_CLIENT_FALLBACK_URL`) and a deep link
-  (`MOBILE_RESET_REDIRECT_URI`).
-- Android intent filters in `mobile/app.config.js` accept the `eshop://` scheme and route to the
-  Expo app.
-- Navigation prefixes: `['eshop://', 'exp+eshop-mobile://']` with screen config
-  `{ ResetPassword: 'reset-password' }`.
+The app returns from external browsers (Stripe Checkout, Google/Facebook OAuth) into the native app
+using **two distinct deep-link strategies**, because the two flows hand control back to the app in
+fundamentally different ways. Both work across the dev client over tunnel, the internal APK, and
+production with a single shared code path each.
+
+### Payment return (Stripe checkout) — direct 303 redirect
+
+- The mobile client builds the return link with `createReturnDeepLink()`
+  (`mobile/src/utils/appScheme.js`) and sends it as `successUrl` / `cancelReturnUrl` to
+  `POST /payments/create-checkout-session`.
+- `createReturnDeepLink()` is **environment-aware** (it does _not_ force a scheme):
+  - **Dev server present** (Expo Go / dev client / tunnel — detected via
+    `Constants.expoConfig.hostUri`): it uses Expo's bare `ExpoLinking.createURL(path)`, which the
+    running client actually re-opens — `vexflare://checkout-success` on a development build, or
+    `exp://<host>/--/checkout-success` under Expo Go. Forcing the per-flavor scheme here would emit
+    `vexflare-dev://…`, which the tunnelled dev client cannot open (Stripe's redirect dead-ends with
+    "this site can't be reached").
+  - **Installed standalone build** (no dev server): it forces the active flavor's scheme via
+    `getAppScheme()` — `vexflare://` (production), `vexflare-internal://` (internal APK),
+    `vexflare-dev://` (dev build) — so the redirect re-opens the exact app that started checkout.
+- The backend validates the link against `ALLOWED_RETURN_PROTOCOLS`
+  (`backend/src/controllers/payment.controller.js`) and passes it **directly to Stripe as
+  `success_url`** — there is **no `/checkout-return` server bridge**.
+- Stripe performs a **server-side 303 redirect** to that deep link. A Chrome Custom Tab honors a 303
+  all the way to a registered custom scheme, so the OS re-opens the app on `PurchaseSuccessPage`,
+  which calls `GET /payments/checkout-success` to confirm the order.
+- **Cold-start safety:** `PurchaseSuccessPage` (`mobile/src/screens/PurchaseSuccessPage.js`)
+  restores the Bearer token before issuing authenticated requests, so a deep-link cold start cannot
+  fire a request without auth.
+
+### OAuth login (Google/Facebook) — in-process interception
+
+- The mobile client opens the provider with `WebBrowser.openAuthSessionAsync(target, redirectUrl)`
+  (`mobile/src/screens/LoginScreen.js`, `mobile/src/screens/SignupPage.js`), passing
+  `createAppDeepLink('oauth')` as the watched `redirectUrl`. `expo-web-browser` intercepts the
+  redirect **in-process** — the OS never has to resolve the scheme from a Custom Tab.
+- `createAppDeepLink()` **always forces the per-flavor scheme** via `getAppScheme()`:
+  `vexflare://oauth` (production), `vexflare-internal://oauth` (internal APK),
+  `vexflare-dev://oauth` (dev build), and the `exp`/`exp+vexflare-mobile` dev-client scheme under
+  Expo tooling. Forcing the flavor scheme is safe here precisely because the redirect is intercepted
+  in-process.
+- After the provider callback the backend redirects to the per-flavor deep link via a bridge page
+  (`buildMobileTarget` + `sendMobileBridgePage` in `backend/src/app.js`). On Android the bridge
+  emits an **Android Intent URL**
+  (`intent://oauth?code=…#Intent;scheme=vexflare;package=com.ahmedmonib.eshop;end`) so the redirect
+  survives Chrome Custom Tabs' block on gesture-less custom-scheme navigation.
+- The returned URL carries a short-lived, one-shot HMAC **bridge code** (not raw tokens);
+  `AuthProvider` exchanges it via `POST /api/auth/oauth-signup`
+  (`backend/src/controllers/auth.controller.js`). See the bridge-code details below.
+
+### Why two strategies?
+
+- **Payment** cannot intercept in-process — Stripe owns the hosted checkout page and issues a real
+  303 redirect. The link therefore has to be a scheme the **OS** resolves, which is why the dev
+  client must use Expo's environment-aware (generic / `exp`) link rather than a forced
+  `vexflare-dev://`.
+- **OAuth** uses `openAuthSessionAsync`, which resolves the redirect inside the browser session, so
+  it can (and should) use the **flavor-specific** scheme to disambiguate between build types when
+  several flavors are installed side by side.
+
+### Supported return schemes
+
+```text
+Payment — ALLOWED_RETURN_PROTOCOLS (backend/src/controllers/payment.controller.js)
+  http:                      web fallback
+  https:                     web fallback
+  vexflare:                  production APK + dev-client generic link
+  vexflare-internal:         internal APK
+  vexflare-dev:              development build
+  eshop:                     legacy, kept for backward compatibility
+  exp* (startsWith 'exp')    exp:// (Expo Go) and exp+vexflare-mobile:// (dev client launcher)
+
+OAuth — mobile deep-link helpers (getAppScheme / createAppDeepLink)
+  vexflare://oauth                     production APK
+  vexflare-internal://oauth            internal APK
+  vexflare-dev://oauth                 development build
+  exp+vexflare-mobile://…/oauth        Expo dev client
+  exp://…/oauth                        Expo Go
+
+Password reset — ALLOWED_MOBILE_SCHEMES (backend/src/controllers/auth.controller.js)
+  vexflare://reset-password            production APK
+  vexflare-internal://reset-password   internal APK
+  vexflare-dev://reset-password        development build
+  eshop://reset-password               legacy / env var fallback
+```
+
+### Key files
+
+```text
+mobile/src/utils/appScheme.js        getAppScheme() → flavor scheme (OAuth, payment, reset);
+                                     createReturnDeepLink() → env-aware link (payment);
+                                     isDevServerEnvironment() → Constants.expoConfig.hostUri probe
+mobile/src/screens/CheckoutPage.js   builds the payment return link via createReturnDeepLink()
+mobile/src/screens/LoginScreen.js    OAuth via openAuthSessionAsync + createAppDeepLink('oauth')
+mobile/src/screens/SignupPage.js     same OAuth pattern for the signup path
+mobile/src/screens/ForgotPasswordPage.js  sends scheme: getAppScheme() to forgot-password endpoint
+mobile/src/auth/AuthProvider.js      handles the intercepted OAuth URL + bridge-code exchange
+backend/src/controllers/payment.controller.js  ALLOWED_RETURN_PROTOCOLS + success_url passthrough
+backend/src/app.js                   OAuth provider callback → per-flavor deep-link bridge page
+backend/src/controllers/auth.controller.js     ALLOWED_MOBILE_SCHEMES + flavor-specific reset link;
+                                               POST /api/auth/oauth-signup bridge-code exchange
+frontend/src/pages/MobileResetPasswordPage.jsx  bridge page: auto-opens deep link, web fallback
+```
+
+### Testing matrix
+
+```text
+Environment            Payment flow                          OAuth flow                                 Password reset
+---------------------  ------------------------------------  -----------------------------------------  -------------------------------------------
+Production APK         works — vexflare:// (flavor scheme)   works — vexflare:// (flavor scheme)        works — vexflare:// (flavor scheme)
+Internal APK          works — vexflare-internal://          works — vexflare-internal://               works — vexflare-internal://
+Prod Debug            works — vexflare-dev://               works — vexflare-dev://                    works — vexflare-dev://
+Dev client + tunnel   works — generic vexflare:// (bare     works — vexflare-dev:// / Expo launcher,   falls back to MOBILE_RESET_REDIRECT_URI
+                      createURL); SERVER_URL must be the    intercepted in-process by                  (dev server env does not send scheme)
+                      ngrok / HTTPS URL                     openAuthSessionAsync
+Expo Go               limited — exp:// may work, not        limited — openAuthSessionAsync has         limited — falls back to env var
+                      officially supported                  constraints, not officially supported
+```
+
+Notes:
+
+- **Dev client + tunnel** requires `SERVER_URL` (backend) to be the public ngrok / HTTPS origin so
+  Stripe can reach it and the 303 returns to the device.
+- **Multiple flavors installed:** OAuth and password reset both rely on the flavor-specific scheme
+  to disambiguate; the installed-build payment link is also flavor-specific, while the dev-client
+  payment link is generic.
+- **Cold-start auth races** are handled by `PurchaseSuccessPage` restoring Bearer auth before
+  authenticated calls.
+
+### Password reset deep-link flow
+
+The mobile password reset uses **flavor-specific deep links** so tapping the reset email opens only
+the app that initiated the request, with no Android chooser dialog.
+
+1. `ForgotPasswordPage` sends `POST /api/auth/forgot-password` with
+   `{ email, client: 'mobile', mobile: true, scheme: getAppScheme() }`. The `scheme` field carries
+   the active flavor's scheme (`vexflare`, `vexflare-internal`, or `vexflare-dev`).
+2. The backend validates `scheme` against a hardcoded whitelist (`vexflare`, `vexflare-internal`,
+   `vexflare-dev`, `eshop`). If valid, it constructs the deep link as
+   `{scheme}://reset-password?…#token=…`. Invalid or missing schemes fall back to the
+   `MOBILE_RESET_REDIRECT_URI` env var (default `eshop://reset-password`), preserving backward
+   compatibility with older app versions.
+3. The deep link is wrapped in a bridge URL
+   (`https://vexflare.com/mobile/reset-password?…&deepLink={scheme}://…&webFallback=…`).
+4. The user taps the email link → the frontend bridge page (`MobileResetPasswordPage.jsx`) loads →
+   after 300 ms it calls `window.location.assign(deepLink)` to trigger the native deep link. If the
+   app does not open within 1.8 s, the page falls back to the web reset form.
+5. Android resolves the flavor-specific scheme (e.g. `vexflare-internal://`) and opens only the
+   matching app — no chooser.
+
+**Key files:**
+
+```text
+mobile/src/screens/ForgotPasswordPage.js     sends scheme in the request body
+mobile/src/utils/appScheme.js                getAppScheme() → flavor scheme
+backend/src/controllers/auth.controller.js   validateMobileScheme() + buildMobileResetDeepLink()
+frontend/src/pages/MobileResetPasswordPage.jsx  bridge page (auto-opens deep link)
+shared/auth/deepLinkValidator.js             extractResetParamsFromUrl() (scheme-agnostic)
+```
+
+### Other deep-linked flows
+
+- Android intent filters in `mobile/app.config.js` accept the `vexflare://` scheme and route to the
+  Expo app. Per-flavor variants (`vexflare-internal://`, `vexflare-dev://`) are resolved at runtime
+  by `src/utils/appScheme.js` based on `applicationId`.
+- Navigation prefixes (`AppNavigator.js`): the active flavor's `${getAppScheme()}://` plus the
+  static set `['eshop://', 'vexflare://', 'exp+eshop-mobile://', 'exp+vexflare-mobile://']` and the
+  dynamic `ExpoLinking.createURL('/')`, with screen config that maps `checkout-success` →
+  `PurchaseSuccess`, `checkout-cancel` → `PurchaseCancel`, and `reset-password` → `ResetPassword`
+  (among others).
 - `extractResetParams` normalizes `token`/`code` query params and surfaces them as React Navigation
   route params.
 - **Reset-password token delivery:** the reset token is delivered in the URL **fragment**
@@ -2158,13 +2344,20 @@ Refer to [`mobile/env.md`](mobile/env.md) for the full run-mode matrix and env p
 - `ResetPassword` screen lives in both auth and authed stacks so the user always lands on the
   correct screen whether the app is cold-started or already in memory.
 - **OAuth signup bridge-code flow:** after OAuth authentication the backend issues a short-lived,
-  one-shot HMAC-signed bridge code and redirects to the mobile deep link as
-  `eshop://oauth?code=<bridge_code>`. `AuthProvider` exchanges the code via a server-side API call
-  instead of reading `accessToken`/`refreshToken` directly from query parameters. This prevents
-  token leakage through server logs, referrer headers, and deep-link history.
+  one-shot HMAC-signed bridge code and redirects to the mobile app. On Android, the bridge page
+  emits an **Android Intent URL**
+  (`intent://oauth?code=…#Intent;scheme=vexflare;package=com.ahmedmonib.eshop;end`) instead of a raw
+  custom-scheme redirect, because Chrome Custom Tabs block auto-redirects to custom schemes.
+  `AuthProvider` exchanges the code via a server-side API call instead of reading
+  `accessToken`/`refreshToken` directly from query parameters. This prevents token leakage through
+  server logs, referrer headers, and deep-link history.
   - Bridge codes are signed with `OAUTH_BRIDGE_SECRET` and expire after `OAUTH_BRIDGE_TTL_SECONDS`
     (default `300` seconds).
   - The `/auth/oauth-signup` endpoint is rate-limited to 5 requests per minute.
+  - The OAuth nonce is cleared only after a successful bridge exchange. If the exchange fails
+    (network error, server 5xx), the nonce survives so the user can retry without being silently
+    trapped; a localized error toast is shown instead. Concurrent deep-link deliveries are deduped
+    to prevent double-exchange attempts.
   - See [`docs/security/webhook-rotation.md`](docs/security/webhook-rotation.md) for
     `OAUTH_BRIDGE_SECRET` rotation instructions.
 - Metro logs beginning with `🔗` confirm the linking handlers fired; re-run
@@ -2205,6 +2398,10 @@ Refer to [`mobile/env.md`](mobile/env.md) for the full run-mode matrix and env p
 - **Radial gradient background:** `ThemeRadialBackground` is applied as a full-screen overlay in
   `AppNavigator.js`, providing the emerald gradient that matches the web frontend across all
   screens.
+- **Theme cold-start safety:** `ThemeContext` defaults to `'light'` when `useColorScheme()` returns
+  `null` during cold start (common on deep-link launches) and adopts the real system scheme once
+  resolved. This prevents wrong theme colors from flashing before the system preference is
+  available.
 - **Deep-link aware navigation:** Any email CTA (reset password, mailing confirmation, OAuth
   completion) can launch straight into the appropriate native screen thanks to the linking config
   described above.
@@ -6283,6 +6480,29 @@ In `product.controller.js` we use a single helper:
     other devices still hold active refresh tokens for this user. If none remain,
     `session_active_since:<userId>` is also deleted.
 
+- OAuth social-login account linking:
+  - When a user signs in with Google or Facebook and a local account with the same verified email
+    already exists, the provider identity is automatically linked onto the existing account rather
+    than returning a 409 conflict or creating a duplicate. This applies symmetrically to both
+    providers.
+  - `email_verified` from Google is coerced to boolean (`true`, `"true"`, and `1` are all accepted)
+    to handle workspace and edge accounts that return non-boolean values.
+  - A controller-level fallback catches E11000 duplicate-key errors: if the email already exists and
+    the provider has verified it, the account is auto-linked and the user is logged in.
+  - Provider-specific verification rules gate auto-link to prevent account takeover: Google requires
+    `email_verified`; Facebook requires the email to be the account's primary, confirmed address.
+  - If the matched local account was **unverified** (email/password signup whose code was never
+    entered), the auto-link sets `verified = true`. This is intentional and safe: the provider has
+    already proven the user controls that mailbox, which is exactly what the email-verification code
+    proves. The original password remains valid, so after linking the account can sign in with
+    either email/password **or** the OAuth provider. Local password login stays blocked only while
+    the account is still unverified and no OAuth link has occurred.
+
+- Web checkAuth single-flight lock:
+  - `checkAuth()` uses a single-flight lock that ensures only one refresh-token rotation runs at a
+    time. Concurrent callers (React StrictMode double-mount, multi-tab visibility changes) wait for
+    the in-flight rotation to complete and share its result instead of racing.
+
 - Email enumeration prevention:
   - `POST /api/auth/login` returns a generic `401 Unauthorized` for both unknown email addresses and
     incorrect passwords — the response body does not distinguish between the two cases.
@@ -6894,6 +7114,20 @@ available as a drop-in fallback by swapping the import. Translations are resolve
 - Failures never block the parent operation (order update, refund, payout execution, moderation
   decision, etc.).
 
+**Sender domains & verification:**
+
+- Two From identities: order/marketing mail uses `RESEND_FROM_EMAIL` (`ORDERS_FROM`); account mail
+  (verification code, password reset) uses `SUPPORT_EMAIL` (`SUPPORT_FROM`), which falls back to
+  `RESEND_FROM_EMAIL` when unset so a missing value never yields a malformed `Name <undefined>`.
+- The From domain must **exactly match a domain verified in Resend**. The verified domain is the
+  `email.vexflare.com` subdomain — **not** the apex `vexflare.com`. Sending from the apex makes
+  Resend reject every message (`{ error }` with "Domain not verified"); the SDK returns that on a
+  4xx rather than throwing, so the senders log it explicitly instead of silently returning `false`.
+- `verifyResendSenderDomains()` runs at startup (`server.js`, non-blocking) and logs a warning if a
+  configured sender domain isn't among the verified Resend domains (checked live via
+  `domains.list()`, falling back to the `RESEND_VERIFIED_DOMAINS` allowlist), catching this
+  misconfiguration at boot rather than at first send.
+
 **Event catalogue (in addition to earlier order-confirmation and dispute emails):**
 
 | Function                          | Trigger                             | Recipient |
@@ -7297,6 +7531,131 @@ and must never be modified through the standard seller application flow.
 
 ---
 
+## Technical SEO
+
+### Crawl control (robots.txt)
+
+`frontend/public/robots.txt` defines the crawl policy for all search engines:
+
+- **Allowed:** All public routes — homepage, product pages, category pages, store pages, deals, new
+  releases, best sellers, search, about, contact, policies.
+- **Disallowed:** Authentication routes (`/login`, `/signup`, `/oauth-signup`, `/verify-email`,
+  `/forgot-password`, `/reset-password`), user-gated pages (`/checkout`, `/checkout-success`,
+  `/purchase-cancel`, `/orders`, `/profile`, `/cart`, `/wishlist`), admin and seller dashboards
+  (`/secret-dashboard`, `/seller/dashboard`, `/seller/apply`, `/seller/pre-apply`), disputes,
+  notifications, marketing campaigns, mobile bridge pages, and unsubscribe pages.
+- **Sitemap declaration:** `Sitemap: https://www.vexflare.com/sitemap.xml`
+
+The file is served as a static asset from the Vercel frontend deployment. Vercel's SPA rewrite
+explicitly excludes `/robots.txt` from being rewritten to `index.html`.
+
+### Dynamic sitemap
+
+The sitemap is generated dynamically by the backend API and served at
+`GET /api/sitemap.xml`. A Vercel rewrite proxies `https://www.vexflare.com/sitemap.xml` to
+`https://api.vexflare.com/api/sitemap.xml`, keeping the public URL at the canonical path.
+
+**What the sitemap includes:**
+
+| URL type      | Pattern                   | Source query                                                                 | Priority | Changefreq |
+| ------------- | ------------------------- | ---------------------------------------------------------------------------- | -------- | ---------- |
+| Static pages  | `/`, `/deals`, `/about`…  | Hardcoded list (15 pages)                                                    | 0.2–1.0  | daily–yearly |
+| Products      | `/product/:_id`           | `Product.find({ visibility: 'visible', approvalStatus: 'approved', hidden: { $ne: true } })` | 0.9      | weekly     |
+| Stores        | `/stores/:slug`           | `Store.find({ status: 'active' })`                                           | 0.8      | weekly     |
+| Categories    | `/category/:slug`         | `Category.find({ isActive: true })`                                          | 0.7      | weekly     |
+
+**Implementation details:**
+
+- **Service:** `backend/src/services/sitemap.service.js` — `generateSitemap()` runs three parallel
+  MongoDB queries (`.select()` + `.lean()` for minimal memory), builds the XML via template
+  literals, and caches the result.
+- **Route:** `backend/src/routes/sitemap.route.js` — `GET /sitemap.xml` handler. Returns
+  `Content-Type: application/xml; charset=utf-8` with `Cache-Control: public, max-age=3600,
+  s-maxage=3600`.
+- **Caching:** Redis key `sitemap:xml` with a **1-hour TTL** (`cacheGetJSON` / `cacheSetJSON` from
+  `lib/cache/cache.js`). On cache miss, the service regenerates from the database. On Redis failure,
+  it falls through to fresh generation without crashing.
+- **Base URL:** Reads `CLIENT_URL` env var (defaults to `https://www.vexflare.com`), trailing slash
+  stripped.
+- **XML escaping:** An `escapeXml()` helper handles `&`, `<`, `>`, `"`, `'` in slugs.
+- **`lastmod`:** Uses `updatedAt` from each document, formatted as `YYYY-MM-DD`.
+
+**Vercel rewrite** (`frontend/vercel.json`):
+
+```json
+{ "source": "/sitemap.xml", "destination": "https://api.vexflare.com/api/sitemap.xml" }
+```
+
+The previous static `frontend/public/sitemap.xml` (15 hardcoded URLs, no products/stores/categories)
+has been removed.
+
+### Structured data (JSON-LD)
+
+Structured data is rendered as `<script type="application/ld+json">` tags via a `JsonLd` React
+component in the document head.
+
+| Schema          | Page          | Component                              | Key properties                                                    |
+| --------------- | ------------- | -------------------------------------- | ----------------------------------------------------------------- |
+| Organization    | Homepage      | `frontend/src/pages/HomePage.jsx`      | name, url, logo, contactPoint (customer service)                  |
+| OnlineStore     | Homepage      | `frontend/src/pages/HomePage.jsx`      | name, url, currenciesAccepted (USD), paymentAccepted, SearchAction |
+| Product         | Product page  | `frontend/src/components/ProductPage.jsx` | name, description, image[], url, offers (price, currency, availability) |
+| BreadcrumbList  | Product page  | `frontend/src/components/ProductPage.jsx` | Home → Category → Product (position-tracked)                      |
+| BreadcrumbList  | Category page | `frontend/src/pages/CategoryPage.jsx`  | Home → ancestor categories → current category                     |
+
+Product availability maps to `https://schema.org/InStock` or `https://schema.org/OutOfStock` based
+on stock status. The SearchAction target is
+`https://www.vexflare.com/search?q={search_term_string}`.
+
+### Canonical URLs & hreflang
+
+Implemented in `frontend/src/hooks/useDocumentHead.js`, applied on every page:
+
+- **Canonical:** `<link rel="canonical" href="https://www.vexflare.com{pathname}">` — all pages
+  point to the `www` domain, preventing duplicate content across bare domain and subdomains.
+- **Hreflang:** Four `<link rel="alternate" hreflang="...">` tags for `en`, `ar`, `es`, `fr`, plus
+  an `x-default` pointing to the base canonical URL. Format:
+  `https://www.vexflare.com{pathname}?lang={locale}`.
+- **Open Graph:** `og:title`, `og:description`, `og:url`, `og:image` (defaults to
+  `https://www.vexflare.com/branding/og-image.png`).
+- **Twitter Card:** `summary_large_image` format with title, description, and image.
+- **Robots meta:** Default `index, follow` on all pages; pages can opt into `noindex, follow` via
+  the `noindex` parameter.
+
+### Page indexing coverage
+
+| Route pattern                        | Indexed | Notes                                  |
+| ------------------------------------ | ------- | -------------------------------------- |
+| `/`                                  | Yes     | Homepage                               |
+| `/deals`, `/best-sellers`, `/new`    | Yes     | Collection pages                       |
+| `/search`                            | No      | `noindex` — dynamic query results      |
+| `/product/:id`                       | Yes     | In sitemap with `lastmod`              |
+| `/stores/:slug`                      | Yes     | In sitemap with `lastmod`              |
+| `/category/:slug`                    | Yes     | In sitemap with `lastmod`              |
+| `/about`, `/contact`                 | Yes     | Static informational                   |
+| `/services`, `/case-studies`, `/architecture` | Yes | Feature-flagged but included in sitemap |
+| `/policies/*`                        | Yes     | Privacy, terms, shipping, refund       |
+| `/support/delete-account`            | Yes     | Legal compliance page                  |
+| `/login`, `/signup`, `/oauth-signup` | No      | Disallowed in robots.txt               |
+| `/checkout`, `/orders`, `/profile`   | No      | Disallowed in robots.txt               |
+| `/cart`, `/wishlist`                 | No      | Disallowed in robots.txt               |
+| `/seller/*`, `/secret-dashboard`     | No      | Disallowed in robots.txt               |
+| `/disputes`, `/notifications`        | No      | Disallowed in robots.txt               |
+
+### SEO roadmap (Stage 4)
+
+Remaining work for future iterations:
+
+- **FAQ schema** — add `FAQPage` JSON-LD on product pages (from seller-provided Q&A).
+- **Review schema** — add `AggregateRating` and `Review` structured data on product pages (data
+  already exists in the review model).
+- **Image alt audit** — verify all product images, category banners, and store logos have descriptive
+  `alt` text.
+- **Core Web Vitals** — LCP, CLS, INP measurement and optimization pass.
+- **Sitemap index** — refactor to a sitemap index with sub-sitemaps if product count exceeds 40K.
+- **Open Graph per product** — set `og:image` to the product's primary image on product pages (currently uses default branding image).
+
+---
+
 ## Testing & CI
 
 - Tests: Jest unit & integration tests with mocks for Redis / email / cloudinary, database-backed
@@ -7325,8 +7684,10 @@ The 3,333 backend tests provide unit, integration, and E2E coverage for the plat
 workflows:
 
 - **Auth & session lifecycle** — login, registration, OAuth bridge codes, refresh-token rotation,
-  and the sliding 30-day session window (`auth.controller.spec.js`, `auth.route.spec.js`,
-  `auth.e2e.spec.js`, `bridgeCode.*`).
+  the sliding 30-day session window, email-based OAuth auto-link (Google + Facebook), and the web
+  checkAuth single-flight lock (`auth.controller.spec.js`, `auth.route.spec.js`, `auth.e2e.spec.js`,
+  `bridgeCode.*`, `oauthLoginLink.spec.js`, `mobileDeepLink.spec.js`,
+  `useUserStore.checkAuth.test.js`).
 - **Cart, checkout & stock reservation** — atomic stock decrement/restore on cancel/expire and
   Stripe Checkout session creation/failure paths (`cart.controller.spec.js`, `cart.e2e.spec.js`,
   `checkout.e2e.spec.js`, `checkout-failure.e2e.spec.js`, plus frontend `CartPage.test.jsx` /
@@ -8352,13 +8713,16 @@ SETTLEMENT_LOCK_REDIS_FALLBACK_POLICY=run_unlocked
 # Email Service (Resend — active provider; SendGrid available as fallback)
 # Set RESEND_API_KEY to use Resend (the default). To use SendGrid instead, swap the
 # import in backend/src/lib/email.js and set SENDGRID_API_KEY.
+# From addresses MUST be on a Resend-verified domain — use the verified subdomain
+# (email.vexflare.com), not the apex (vexflare.com), or Resend rejects every send.
 RESEND_API_KEY=
-RESEND_FROM_EMAIL=your-email@example.com
+RESEND_VERIFIED_DOMAINS=email.vexflare.com
+RESEND_FROM_EMAIL=orders@email.vexflare.com
 RESEND_FROM_NAME="Vexflare"
 SENDGRID_API_KEY=
 SENDGRID_FROM_EMAIL=your-email@example.com
 SENDGRID_FROM_NAME="Vexflare"
-SUPPORT_EMAIL=your-support@example.com
+SUPPORT_EMAIL=support@email.vexflare.com
 
 # Cloudinary
 CLOUDINARY_CLOUD_NAME=

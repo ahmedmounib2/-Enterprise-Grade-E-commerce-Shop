@@ -145,12 +145,12 @@ type-checking.
 
 ## Troubleshooting
 
-| Symptom                          | Fix                                                                                                                                  |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Metro shows `EADDRINUSE`         | Stop other Metro instances (`pkill -f "react-native"`) or reboot Metro with `npm -w mobile run start:local -- --reset-cache`.        |
-| Device/emulator stuck on splash  | Reload from the developer menu (`r` double-tap) or clear the Expo Go data from Android settings.                                     |
-| Deep links open the web fallback | Ensure `MOBILE_RESET_REDIRECT_URI=eshop://reset-password` is set in your backend `.env` and the device installed the latest Expo Go. |
-| Cannot reach the API from device | Switch to the appropriate `.env` profile (`env:lan` or `env:tunnel`) and restart Metro.                                              |
+| Symptom                          | Fix                                                                                                                                                                                                  |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Metro shows `EADDRINUSE`         | Stop other Metro instances (`pkill -f "react-native"`) or reboot Metro with `npm -w mobile run start:local -- --reset-cache`.                                                                        |
+| Device/emulator stuck on splash  | Reload from the developer menu (`r` double-tap) or clear the Expo Go data from Android settings.                                                                                                     |
+| Deep links open the web fallback | Ensure `MOBILE_RESET_REDIRECT_URI=eshop://reset-password` is set in your backend `.env`. Installed builds send a per-flavor `scheme` that overrides this var; update the app if the chooser appears. |
+| Cannot reach the API from device | Switch to the appropriate `.env` profile (`env:lan` or `env:tunnel`) and restart Metro.                                                                                                              |
 
 ---
 
