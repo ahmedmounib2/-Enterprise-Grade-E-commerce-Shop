@@ -7338,10 +7338,18 @@ whitelist to prevent unintended data exposure.
 
 **Consent logging**
 
-- `POST /api/users/me/consent` — records a consent event (e.g., marketing opt-in, terms acceptance)
-  to the `ConsentLog` collection for the authenticated user. The `logConsent` handler appends an
-  entry with the consent type, version, and timestamp; existing entries are never modified,
-  preserving a full immutable audit trail.
+- `POST /api/users/consent-log` — public, no-auth endpoint (rate-limited 10 req/min per IP). Logs
+  the visitor's cookie consent decision. Anonymous visitors are identified by a client-generated UUID
+  stored in localStorage (`eshop_anon_id`). IP addresses are hashed (SHA-256 truncated to 16 chars)
+  before storage — the raw IP is never persisted. `ConsentLog` fields: `anonymousId`, `userId`
+  (nullable), `action` (`accepted` / `declined` / `withdrawn`), `ipAddress` (hashed), `userAgent`,
+  `version`, `timestamp`. See [Architecture page — Consent Management](#) for the full flow.
+- `POST /api/users/me/merge-consent` — auth required. Called on login and signup to merge consent
+  records previously associated with the anonymous `eshop_anon_id` into the authenticated user
+  record.
+- `POST /api/users/me/consent` — auth required. Records consent events for the authenticated user
+  (e.g., marketing opt-in, terms acceptance) to the `ConsentLog` collection. Entries are never
+  modified, preserving a full immutable audit trail.
 
 **Account deletion (soft-delete lifecycle)**
 
@@ -7551,18 +7559,18 @@ explicitly excludes `/robots.txt` from being rewritten to `index.html`.
 
 ### Dynamic sitemap
 
-The sitemap is generated dynamically by the backend API and served at
-`GET /api/sitemap.xml`. A Vercel rewrite proxies `https://www.vexflare.com/sitemap.xml` to
+The sitemap is generated dynamically by the backend API and served at `GET /api/sitemap.xml`. A
+Vercel rewrite proxies `https://www.vexflare.com/sitemap.xml` to
 `https://api.vexflare.com/api/sitemap.xml`, keeping the public URL at the canonical path.
 
 **What the sitemap includes:**
 
-| URL type      | Pattern                   | Source query                                                                 | Priority | Changefreq |
-| ------------- | ------------------------- | ---------------------------------------------------------------------------- | -------- | ---------- |
-| Static pages  | `/`, `/deals`, `/about`…  | Hardcoded list (15 pages)                                                    | 0.2–1.0  | daily–yearly |
-| Products      | `/product/:_id`           | `Product.find({ visibility: 'visible', approvalStatus: 'approved', hidden: { $ne: true } })` | 0.9      | weekly     |
-| Stores        | `/stores/:slug`           | `Store.find({ status: 'active' })`                                           | 0.8      | weekly     |
-| Categories    | `/category/:slug`         | `Category.find({ isActive: true })`                                          | 0.7      | weekly     |
+| URL type     | Pattern                  | Source query                                                                                 | Priority | Changefreq   |
+| ------------ | ------------------------ | -------------------------------------------------------------------------------------------- | -------- | ------------ |
+| Static pages | `/`, `/deals`, `/about`… | Hardcoded list (15 pages)                                                                    | 0.2–1.0  | daily–yearly |
+| Products     | `/product/:_id`          | `Product.find({ visibility: 'visible', approvalStatus: 'approved', hidden: { $ne: true } })` | 0.9      | weekly       |
+| Stores       | `/stores/:slug`          | `Store.find({ status: 'active' })`                                                           | 0.8      | weekly       |
+| Categories   | `/category/:slug`        | `Category.find({ isActive: true })`                                                          | 0.7      | weekly       |
 
 **Implementation details:**
 
@@ -7570,8 +7578,8 @@ The sitemap is generated dynamically by the backend API and served at
   MongoDB queries (`.select()` + `.lean()` for minimal memory), builds the XML via template
   literals, and caches the result.
 - **Route:** `backend/src/routes/sitemap.route.js` — `GET /sitemap.xml` handler. Returns
-  `Content-Type: application/xml; charset=utf-8` with `Cache-Control: public, max-age=3600,
-  s-maxage=3600`.
+  `Content-Type: application/xml; charset=utf-8` with
+  `Cache-Control: public, max-age=3600, s-maxage=3600`.
 - **Caching:** Redis key `sitemap:xml` with a **1-hour TTL** (`cacheGetJSON` / `cacheSetJSON` from
   `lib/cache/cache.js`). On cache miss, the service regenerates from the database. On Redis failure,
   it falls through to fresh generation without crashing.
@@ -7594,13 +7602,13 @@ has been removed.
 Structured data is rendered as `<script type="application/ld+json">` tags via a `JsonLd` React
 component in the document head.
 
-| Schema          | Page          | Component                              | Key properties                                                    |
-| --------------- | ------------- | -------------------------------------- | ----------------------------------------------------------------- |
-| Organization    | Homepage      | `frontend/src/pages/HomePage.jsx`      | name, url, logo, contactPoint (customer service)                  |
-| OnlineStore     | Homepage      | `frontend/src/pages/HomePage.jsx`      | name, url, currenciesAccepted (USD), paymentAccepted, SearchAction |
-| Product         | Product page  | `frontend/src/components/ProductPage.jsx` | name, description, image[], url, offers (price, currency, availability) |
-| BreadcrumbList  | Product page  | `frontend/src/components/ProductPage.jsx` | Home → Category → Product (position-tracked)                      |
-| BreadcrumbList  | Category page | `frontend/src/pages/CategoryPage.jsx`  | Home → ancestor categories → current category                     |
+| Schema         | Page          | Component                                 | Key properties                                                          |
+| -------------- | ------------- | ----------------------------------------- | ----------------------------------------------------------------------- |
+| Organization   | Homepage      | `frontend/src/pages/HomePage.jsx`         | name, url, logo, contactPoint (customer service)                        |
+| OnlineStore    | Homepage      | `frontend/src/pages/HomePage.jsx`         | name, url, currenciesAccepted (USD), paymentAccepted, SearchAction      |
+| Product        | Product page  | `frontend/src/components/ProductPage.jsx` | name, description, image[], url, offers (price, currency, availability) |
+| BreadcrumbList | Product page  | `frontend/src/components/ProductPage.jsx` | Home → Category → Product (position-tracked)                            |
+| BreadcrumbList | Category page | `frontend/src/pages/CategoryPage.jsx`     | Home → ancestor categories → current category                           |
 
 Product availability maps to `https://schema.org/InStock` or `https://schema.org/OutOfStock` based
 on stock status. The SearchAction target is
@@ -7623,23 +7631,23 @@ Implemented in `frontend/src/hooks/useDocumentHead.js`, applied on every page:
 
 ### Page indexing coverage
 
-| Route pattern                        | Indexed | Notes                                  |
-| ------------------------------------ | ------- | -------------------------------------- |
-| `/`                                  | Yes     | Homepage                               |
-| `/deals`, `/best-sellers`, `/new`    | Yes     | Collection pages                       |
-| `/search`                            | No      | `noindex` — dynamic query results      |
-| `/product/:id`                       | Yes     | In sitemap with `lastmod`              |
-| `/stores/:slug`                      | Yes     | In sitemap with `lastmod`              |
-| `/category/:slug`                    | Yes     | In sitemap with `lastmod`              |
-| `/about`, `/contact`                 | Yes     | Static informational                   |
-| `/services`, `/case-studies`, `/architecture` | Yes | Feature-flagged but included in sitemap |
-| `/policies/*`                        | Yes     | Privacy, terms, shipping, refund       |
-| `/support/delete-account`            | Yes     | Legal compliance page                  |
-| `/login`, `/signup`, `/oauth-signup` | No      | Disallowed in robots.txt               |
-| `/checkout`, `/orders`, `/profile`   | No      | Disallowed in robots.txt               |
-| `/cart`, `/wishlist`                 | No      | Disallowed in robots.txt               |
-| `/seller/*`, `/secret-dashboard`     | No      | Disallowed in robots.txt               |
-| `/disputes`, `/notifications`        | No      | Disallowed in robots.txt               |
+| Route pattern                                 | Indexed | Notes                                   |
+| --------------------------------------------- | ------- | --------------------------------------- |
+| `/`                                           | Yes     | Homepage                                |
+| `/deals`, `/best-sellers`, `/new`             | Yes     | Collection pages                        |
+| `/search`                                     | No      | `noindex` — dynamic query results       |
+| `/product/:id`                                | Yes     | In sitemap with `lastmod`               |
+| `/stores/:slug`                               | Yes     | In sitemap with `lastmod`               |
+| `/category/:slug`                             | Yes     | In sitemap with `lastmod`               |
+| `/about`, `/contact`                          | Yes     | Static informational                    |
+| `/services`, `/case-studies`, `/architecture` | Yes     | Feature-flagged but included in sitemap |
+| `/policies/*`                                 | Yes     | Privacy, terms, shipping, refund        |
+| `/support/delete-account`                     | Yes     | Legal compliance page                   |
+| `/login`, `/signup`, `/oauth-signup`          | No      | Disallowed in robots.txt                |
+| `/checkout`, `/orders`, `/profile`            | No      | Disallowed in robots.txt                |
+| `/cart`, `/wishlist`                          | No      | Disallowed in robots.txt                |
+| `/seller/*`, `/secret-dashboard`              | No      | Disallowed in robots.txt                |
+| `/disputes`, `/notifications`                 | No      | Disallowed in robots.txt                |
 
 ### SEO roadmap (Stage 4)
 
@@ -7648,11 +7656,12 @@ Remaining work for future iterations:
 - **FAQ schema** — add `FAQPage` JSON-LD on product pages (from seller-provided Q&A).
 - **Review schema** — add `AggregateRating` and `Review` structured data on product pages (data
   already exists in the review model).
-- **Image alt audit** — verify all product images, category banners, and store logos have descriptive
-  `alt` text.
+- **Image alt audit** — verify all product images, category banners, and store logos have
+  descriptive `alt` text.
 - **Core Web Vitals** — LCP, CLS, INP measurement and optimization pass.
 - **Sitemap index** — refactor to a sitemap index with sub-sitemaps if product count exceeds 40K.
-- **Open Graph per product** — set `og:image` to the product's primary image on product pages (currently uses default branding image).
+- **Open Graph per product** — set `og:image` to the product's primary image on product pages
+  (currently uses default branding image).
 
 ---
 
