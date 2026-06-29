@@ -9160,7 +9160,7 @@ catalog grouped by category, with bulk deal adjustment and review status._
 financials panel showing the current balance breakdown (sales, commission, fees, refunds) and
 upcoming/recent payouts._
 
-![Seller dashboard — Financials tab](./docs/screenshots/seller_dashboard_financials_tab.png)
+![Seller dashboard — Financials tab](./docs/screenshots/seller_dashboard_financial_tab.png)
 _Financials transaction ledger with per-order shipping income, commission, fees, and tax line
 items._
 
