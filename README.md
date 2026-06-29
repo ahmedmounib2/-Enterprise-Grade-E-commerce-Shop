@@ -2985,6 +2985,14 @@ VITE_GOOGLE_MAPS_MAP_ID           Optional Cloud Map ID to enable AdvancedMarker
 EXPO_PUBLIC_GOOGLE_MAPS_API_KEY   REMOVED — the mobile map now fetches the server key from
                                   /api/shipping/maps/config; do not set this.
 
+# ── Analytics (frontend) ─────────────────────────────────────────────────────
+VITE_GA_ID                        GA4 Measurement ID (e.g. G-XXXXXXXXXX), embedded at Vite build time
+                                  (frontend/src/lib/analytics.js). When unset, analytics no-ops.
+                                  Events fire only after analytics_storage consent is granted —
+                                  GA4 Consent Mode v2 default-denied is pushed before gtag.js loads,
+                                  and the cookie-consent decision is logged via POST
+                                  /api/users/consent-log (see GDPR & user data export).
+
 # ── COD / cache / Mongo resilience ───────────────────────────────────────────
 REDIS_OP_TIMEOUT_MS               Per-op bound for cache reads/writes (stock, cart) so a slow Redis
                                   fails fast instead of hanging the request.
@@ -3339,6 +3347,31 @@ COD checkout now enforces a seller-level **negative outstanding ledger balance p
 ### Return request + COD refund workflow
 
 endpoints.
+
+**Line-item partial refunds (paid + COD)**
+
+- Refunds support selecting specific line items and quantities, not just whole orders. The customer
+  picks items on the order-detail modal; the return request carries `items[]` of
+  `{ productId, variantKey, quantity }` and `order.returnRequest.requestedItems[]` persists the
+  selection. A line is keyed by `productId` + `buildVariantKey(variantAttributes)`.
+- Approval reuses the same approve endpoints. `computeRefundPlan` prices each selected line from the
+  amount actually charged (`price × (1 − deal)`) and attributes each seller **exactly** their items
+  — never a proportional split. Returnable quantity per line is `ordered − already-refunded`, where
+  already-refunded comes from `getRefundedQuantities` (sum of `refundRecords[].items[]` on completed
+  records); `validateRefundItemsInput` re-checks it server-side.
+- **Admin-initiated:** an admin can start a partial refund without a customer return request
+  (`POST /api/admin/orders/:id/refund/approve` with `items[]`). **Seller scoping:** a seller may
+  refund only the items they sold; a multi-seller COD return must be approved by an admin (one COD
+  payout goes to the customer). Sellers cannot initiate refunds — only approve customer requests.
+- **Shipping:** not refunded on partials by default. It is included only when the return reason is
+  eligible (`refundShippingEligible`, e.g. defective/wrong item) or an admin passes
+  `refundShipping=true`; **never for COD partials**.
+- **Stripe vs COD:** Stripe issues a partial Refund for the computed amount; COD pays the customer
+  via the payout workflow and debits each seller through the ledger (`cod_refund_reimbursement`).
+  Concurrency/idempotency: per-order refund lock + unique `idempotencyKey` + remaining-quantity
+  recheck. A partial covering all remaining items flips the order to `refunded`; otherwise the UI
+  shows **Partially Refunded** — a status derived from items coverage (the stored status stays
+  `refunded`/`pending_refund`; `refundRecords[].items[]` distinguishes partial from full).
 
 **Customer return request endpoint**
 
@@ -7339,11 +7372,14 @@ whitelist to prevent unintended data exposure.
 **Consent logging**
 
 - `POST /api/users/consent-log` — public, no-auth endpoint (rate-limited 10 req/min per IP). Logs
-  the visitor's cookie consent decision. Anonymous visitors are identified by a client-generated UUID
-  stored in localStorage (`eshop_anon_id`). IP addresses are hashed (SHA-256 truncated to 16 chars)
-  before storage — the raw IP is never persisted. `ConsentLog` fields: `anonymousId`, `userId`
-  (nullable), `action` (`accepted` / `declined` / `withdrawn`), `ipAddress` (hashed), `userAgent`,
-  `version`, `timestamp`. See [Architecture page — Consent Management](#) for the full flow.
+  the visitor's cookie consent decision. Anonymous visitors are identified by a client-generated
+  UUID stored in localStorage (`eshop_anon_id`). IP addresses are hashed (SHA-256 truncated to 16
+  chars) before storage — the raw IP is never persisted. `ConsentLog` fields: `anonymousId`,
+  `userId` (nullable), `action` (`accepted` / `declined` / `withdrawn`), `ipAddress` (hashed),
+  `userAgent`, `version`, `timestamp`. See [Architecture page — Consent Management](#) for the full
+  flow. The same consent decision drives **GA4 Consent Mode v2**: `analytics_storage` defaults to
+  denied (pushed before `gtag.js` loads in `frontend/src/lib/analytics.js`) and analytics events
+  fire only after the visitor grants consent.
 - `POST /api/users/me/merge-consent` — auth required. Called on login and signup to merge consent
   records previously associated with the anonymous `eshop_anon_id` into the authenticated user
   record.
