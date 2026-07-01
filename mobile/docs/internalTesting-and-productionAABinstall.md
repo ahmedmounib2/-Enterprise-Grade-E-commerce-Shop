@@ -1,149 +1,166 @@
-Totally fine to keep your **existing commands** — they already do the right things. The only
-“gotchas” that were tripping you up were:
+# Internal testing APK & production AAB — install & SSL pinning
 
-1. **Order matters** (pull → env → build).
-2. **Path matters** when installing the APK from repo root.
-3. Make sure **pinning is OFF for internal builds** (otherwise you’ll get “Network error” if the
-   cert name/env don’t match).
+Practical reference for building the **internal sideload APK** and the **production Play Console
+AAB**, installing them on a device, and keeping TLS certificate pinning working. It complements
+[`build-and-install.md`](./build-and-install.md) (the EAS command reference) and
+[`../../docs/deployment.md`](../../docs/deployment.md) (the full runbook); this page focuses on the
+**certificate / pinning** mechanics and the **on-device install** gotchas.
 
-Below is a clean, repeatable flow using your scripts, plus two tiny improvements.
+Three things that commonly trip people up:
 
----
+1. **Order matters:** `cert:pull` → `env:<profile>` (which syncs the cert into place) → build.
+2. **Path matters:** install the APK with an **absolute** path, or `adb` fails with `cannot stat`.
+3. **Pinning must be OFF for internal builds** — otherwise a cert/env mismatch surfaces at runtime
+   as a "Network error".
 
-# ✅ What your commands already do
-
-- `npm -w mobile run cert:pull -- --host ... --name eshop_api` → saves `mobile/certs/eshop_api.cer`
-  (DER leaf) from your server.
-
-- `npm -w mobile run env:production` → runs `scripts/use-env.sh production` which:
-  - copies `mobile/.env.production` → `mobile/.env`
-  - runs `scripts/sync-ssl-certs.js` which **copies all `.cer` files to**
-    `mobile/android/app/src/main/assets/` (this is the correct place for `react-native-ssl-pinning`
-    on Android).
-  - also validates that `EXPO_PUBLIC_SSL_PINNING_CERTS` names exist in `mobile/certs`.
-
-- Gradle build (APK or AAB) then packages the cert into:
-  - APK: `assets/eshop_api.cer`
-  - AAB: `base/assets/eshop_api.cer`
-
-You can see that in your logs already, so the copying step works 👍
+> **Managed-workflow note.** EAS regenerates `android/` from `app.config.js` on every build, and the
+> `withSslPinningCerts` config plugin copies `mobile/certs/*.cer` into the app assets at prebuild.
+> The `internal` EAS profile ships with pinning **off** (no cert needed); production pinning needs
+> the cert made available to EAS — see [Production pinning on EAS](#production-pinning-on-eas).
 
 ---
 
-# 🧭 Canonical flows (memorize these)
+## How the certificate gets into a build
 
-## A) Internal testing APK (pinning OFF)
+- `npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api` → saves the DER leaf
+  certificate to `mobile/certs/eshop_api.cer` from the live server. The `.cer` is **git-ignored** —
+  a fetched artifact, not committed.
+- `npm -w mobile run env:<profile>` → runs `scripts/use-env.sh`, which:
+  - copies `mobile/.env.<profile>` → `mobile/.env`,
+  - runs `scripts/sync-ssl-certs.js` (copies every `.cer` into the local
+    `android/app/src/main/assets/`, the correct location for `react-native-ssl-pinning` on Android),
+  - validates that the names listed in `EXPO_PUBLIC_SSL_PINNING_CERTS` exist under `mobile/certs`.
+- On an **EAS** build, the `withSslPinningCerts` config plugin performs the equivalent copy at
+  prebuild — but only if a `.cer` is present in the build (it is not on EAS unless you provide it;
+  see below).
+
+When present, the packaged cert lands at `assets/eshop_api.cer` in an APK and
+`base/assets/eshop_api.cer` in an AAB.
+
+---
+
+## Canonical flows
+
+### A) Internal testing APK (pinning OFF)
 
 ```bash
-# 1) (Optional but safe) refresh cert
-npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api
+# 1) (optional) refresh the cert — harmless even with pinning off
+npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api
 
-# 2) Use an internal env with pinning OFF (see “Add this script” below)
-npm -w mobile run env:internal
+# 2) Build the APK on EAS (internal profile → com.ahmedmonib.eshop.internal, pinning off).
+#    EAS prebuilds android/ from app.config.js and signs with the dashboard keystore.
+eas build --platform android --profile internal
 
-# 3) Build APK
-cd mobile/android && ./gradlew clean :app:assembleInternalRelease && cd -
-
-# 4) Install (from repo root, use absolute path to avoid “cannot stat”)
-APK_ABS="$(realpath mobile/android/app/build/outputs/apk/internal/release/app-internal-release.apk)"
+# 3) Download the APK from the EAS dashboard, then install with an ABSOLUTE path:
+APK_ABS="$(realpath ~/Downloads/<downloaded>.apk)"
 adb devices -l
-adb push "$APK_ABS" /data/local/tmp/eshop-internal.apk
-adb shell pm install -r /data/local/tmp/eshop-internal.apk
+adb uninstall com.ahmedmonib.eshop.internal || true   # avoid a signature-mismatch on reinstall
+adb install -r "$APK_ABS"
+
+# WSL, APK sitting in the Windows Downloads folder:
+# adb install -r "/mnt/c/Users/<you>/Downloads/<downloaded>.apk"
 ```
 
-> If install hangs: try `adb kill-server && adb start-server`, switch to Wi-Fi ADB, or unplug/replug
-> USB.
+> If install hangs: `adb kill-server && adb start-server`, switch to Wi-Fi ADB, or re-plug USB. If
+> it fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, a build with the same id but a different
+> signing key is already installed — uninstall it first (shown above).
 
-## B) Production AAB (pinning ON)
+The `internal` EAS profile runs with pinning off (`EXPO_PUBLIC_SSL_PINNING_CERTS` unset) and injects
+the public runtime env (`EXPO_PUBLIC_API_BASE_URL`, `EXPO_PUBLIC_WEB_ASSET_ORIGIN`, and the
+`EXPO_PUBLIC_FEATURE_*` flags), so the app talks to the production API and renders
+categories/product images.
+
+### B) Production AAB (pinning ON)
 
 ```bash
-# 1) Refresh cert
-npm -w mobile run cert:pull -- --host api.ahmedmonib-eshop-demo.com --name eshop_api
+# 1) Refresh the cert
+npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api
 
-# 2) Production env (pinning ON) — this copies the cert into assets
-npm -w mobile run env:production
+# 2) Build the AAB on EAS (production profile → com.ahmedmonib.eshop, signed by the dashboard keystore)
+eas build --platform android --profile production
 
-# 3) Build AAB
-cd mobile/android && ./gradlew clean :app:bundleProdRelease && cd -
-
-# 4) Upload these to Play Console
-ls -lah mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab
-ls -lah mobile/android/app/build/outputs/mapping/prodRelease/mapping.txt
+# 3) Download the AAB from the EAS dashboard and upload it to the Play Console.
+#    The R8 mapping.txt is attached to the same build (Artifacts panel) — keep it for deobfuscation.
 ```
+
+#### Production pinning on EAS
+
+`mobile/certs/*.cer` is git-ignored, so EAS clones the repo without it and the pinning plugin no-ops
+— a production AAB built on EAS ships **without** the pinned cert unless you provide it. To pin in
+production, either:
+
+- add an `eas-build-post-install` hook that runs `cert:pull` before prebuild, or
+- upload the cert as an EAS **file** secret and have the plugin/hook place it under `mobile/certs/`.
+
+For a fully **local** production build, `npm -w mobile run env:production` copies the cert into
+assets before you run the Gradle `bundleRelease` (see `build-and-install.md` → "Manual build").
 
 ---
 
-# 🧩 Add this small improvement (one-time)
+## Local env profiles
 
-You already have `env:emu`, `env:lan`, `env:tunnel`, `env:production`. Add an **internal** profile
-with pinning OFF so your test APK never fails on pinning.
+`use-env.sh` swaps `mobile/.env` (API base URL, pinning certs, feature flags). All profiles already
+exist as npm scripts:
 
-### 1) `mobile/.env.internal` (new)
+```bash
+npm -w mobile run env:internal     # production API, pinning OFF — for on-device internal testing
+npm -w mobile run env:production   # production API, pinning ON  — EXPO_PUBLIC_SSL_PINNING_CERTS=eshop_api
+npm -w mobile run env:tunnel       # ngrok API — the daily dev client
+npm -w mobile run env:emu          # emulator (10.0.2.2)
+npm -w mobile run env:lan          # physical device on the LAN
+```
+
+`mobile/.env.internal` keeps pinning off (a blank cert list disables pinning):
 
 ```dotenv
-EXPO_PUBLIC_API_BASE_URL=https://api.ahmedmonib-eshop-demo.com
-# Turn OFF pinning for internal testing (leave blank)
-EXPO_PUBLIC_SSL_PINNING_CERTS=
+EXPO_PUBLIC_API_BASE_URL=https://api.vexflare.com
+EXPO_PUBLIC_SSL_PINNING_CERTS=          # blank = pinning OFF
 ```
 
-### 2) `mobile/package.json` (add script)
-
-```diff
-  "scripts": {
-+   "env:internal": "bash ./scripts/use-env.sh internal",
-    "env:emu": "bash ./scripts/use-env.sh emu",
-    "env:lan": "bash ./scripts/use-env.sh lan",
-    "env:tunnel": "bash ./scripts/use-env.sh tunnel",
-    "env:production": "bash ./scripts/use-env.sh production",
-```
-
-> You don’t need to change `sync-ssl-certs.js` — it already copies `.cer` files to **assets**, which
-> is correct for Android.
+> `sync-ssl-certs.js` needs no changes — it already copies `.cer` files into `assets/`, the correct
+> Android location.
 
 ---
 
-# 🧪 Quick verifications
+## Verifications
 
-- **APK/AAB contains the cert**:
+- **Is the cert packaged?** (only relevant when pinning is on)
 
   ```bash
-  unzip -l mobile/android/app/build/outputs/apk/internal/release/app-internal-release.apk | grep -i 'assets/eshop_api\.cer'
-  unzip -l mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab | grep -i 'assets/eshop_api\.cer'
+  unzip -l ~/Downloads/<downloaded>.apk | grep -i 'assets/eshop_api\.cer'
+  unzip -l ~/Downloads/<downloaded>.aab | grep -i 'assets/eshop_api\.cer'
   ```
 
-- **Runtime logs** (when you tap “Login”), look for pinning failures:
+- **Runtime logs** — tap "Login" and watch for TLS/pinning failures:
 
   ```bash
   adb logcat -c
   adb logcat -s ReactNativeJS,OkHttp,SSL,Conscrypt,ConnectivityService,AndroidRuntime
   ```
 
-- **If internal APK says “Network error”**:
-  - Ensure you built with `npm -w mobile run env:internal` (pinning OFF).
-  - Clear app data and retry:
+- **"Network error" on the internal APK** → the build has pinning on but no matching cert. Confirm
+  it was built from the `internal` profile (pinning off), then clear app data and retry:
 
-    ```bash
-    adb shell pm clear com.ahmedmonib.eshop
-    ```
-
----
-
-# 🔎 Why you saw “cannot stat …apk”
-
-You ran `adb push` from the repo root while using a **relative path** that only exists if you’re
-inside `mobile/android`. Use the absolute path trick shown above (`APK_ABS="$(realpath …)"`), and it
-won’t matter where you run the command from.
+  ```bash
+  adb shell pm clear com.ahmedmonib.eshop.internal
+  ```
 
 ---
 
-# TL;DR
+## "cannot stat …apk" when installing
 
-- **Keep using your commands** — they’re good.
-- The correct order is **cert:pull → env:<profile> (which syncs certs) → build**.
-- Use a dedicated **`env:internal`** (pinning OFF) for the APK you test on-device.
-- Use **`env:production`** (pinning ON, `EXPO_PUBLIC_SSL_PINNING_CERTS=eshop_api`) for your Play
-  AAB.
+`adb push` / `adb install` with a **relative** path only resolves from the directory the artifact
+lives in, so running it from the repo root fails with `cannot stat`. Always compute an absolute path
+first (`APK_ABS="$(realpath …)"`) — then it works from anywhere, including installing a
+Windows-downloaded APK from WSL via `/mnt/c/Users/<you>/Downloads/…`.
 
-If you still hit “Network error” with the **internal** build, we’ll inspect logs next and check the
-fetch/axios layer to ensure your pinning toggle is only applied when `EXPO_PUBLIC_SSL_PINNING_CERTS`
-is set.
+---
+
+## TL;DR
+
+- Order: **`cert:pull` → `env:<profile>` (syncs the cert) → `eas build`**.
+- **Internal** = pinning OFF (`env:internal`), quick sideload APK, `com.ahmedmonib.eshop.internal`.
+- **Production** = pinning ON, AAB to Play; on EAS the cert must be provided (post-install hook or
+  file secret) or pinning silently no-ops.
+- Install with an **absolute** APK path; uninstall a conflicting package first if the signing key
+  differs.

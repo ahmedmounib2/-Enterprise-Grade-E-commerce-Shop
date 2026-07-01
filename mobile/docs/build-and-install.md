@@ -1,347 +1,275 @@
+# Android builds: EAS internal APK & production AAB
+
+Muscle-memory reference for producing an **internal sideload APK** and a **Play Console AAB** with
+**EAS Build** (Expo **managed** workflow). The native `android/` project is **not** committed — EAS
+generates it from `mobile/app.config.js` (`expo prebuild`) at build time. There are **no Gradle
+flavors**; the app variant is selected by `APP_VARIANT` (see below).
+
+> TL;DR: `eas build --profile internal` → download APK → `adb install`. For Play:
+> `eas build --profile production` → download AAB → upload to the Console.
+
 ---
 
-# Android builds: Internal APK sideload & Production AAB
+## App variants
 
-Use this as your “muscle-memory” reference for building and installing **internal release APKs** (pinning **OFF**) and **Play Console AABs** (pinning **ON**). It assumes you’re working from the monorepo root.
+`mobile/app.config.js` reads `process.env.APP_VARIANT` and sets a distinct `applicationId`,
+deep-link scheme, and launcher name per build. Each `eas.json` profile sets `APP_VARIANT` in its
+`env`, so all three apps can be installed on one device at once:
 
-> TL;DR: **cert:pull → env:<profile> → build**.
-> Internal APKs must have **pinning OFF** and you **must uninstall** any debug build that shares the same `applicationId` before installing a release (signature mismatch).
+| Variant / profile | applicationId                   | Scheme              | Output             |
+| ----------------- | ------------------------------- | ------------------- | ------------------ |
+| `production`      | `com.ahmedmonib.eshop`          | `vexflare`          | AAB (Play Console) |
+| `internal`        | `com.ahmedmonib.eshop.internal` | `vexflare-internal` | APK (sideload)     |
+| `development`     | `com.ahmedmonib.eshop.dev`      | `vexflare-dev`      | local dev-client   |
+
+Locally, pick the variant with the env var, e.g. `APP_VARIANT=development npx expo run:android`.
 
 ---
 
 ## Prereqs
 
 - Device connected (`adb devices -l` shows it as `device`).
-- Java 17 / Android SDK set (see `mobile/docs/dev-setup.md`).
-- Your env scripts: `env:internal`, `env:production` (details below).
+- Java 17 / Android SDK set (see `mobile/custom-dev-setup.md`).
+- Logged in to EAS (`eas whoami`), with the upload keystore uploaded to the Expo dashboard.
 
 ---
 
-## One-time: add **internal** env (pinning OFF)
-
-Only do this if you don’t already have it.
-
-**`mobile/.env.internal`**
-
-```dotenv
-EXPO_PUBLIC_API_BASE_URL=https://api.vexflare.com
-# Turn OFF pinning for internal testing
-EXPO_PUBLIC_SSL_PINNING_CERTS=
-```
-
-**`mobile/package.json`**
-
-```diff
-  "scripts": {
-+   "env:internal": "bash ./scripts/use-env.sh internal",
-    "env:production": "bash ./scripts/use-env.sh production",
-    "env:emu": "bash ./scripts/use-env.sh emu",
-    "env:lan": "bash ./scripts/use-env.sh lan",
-    "env:tunnel": "bash ./scripts/use-env.sh tunnel"
-  }
-```
-
-> The `use-env.sh` script also runs `sync-ssl-certs.js`, which copies any `mobile/certs/*.cer` into
-> `android/app/src/main/assets/` so the **pinned** builds can find them.
-
----
-
-## Flow A — Internal testing **APK** (pinning **OFF**)
-
-> Build flavor: **internalRelease** Package name: usually `com.ahmedmonib.eshop.internal`
-
-```bash
-# 1) Optional: refresh the server cert (safe even if pinning is off)
-npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api
-
-# 2) Pinning OFF
-npm -w mobile run env:internal
-
-# 3) Build internal release APK
-cd mobile/android
-./gradlew clean :app:assembleInternalRelease
-cd -
-
-# 4) Before installing, remove any existing build with the *same* applicationId
-#    (prevents INSTALL_FAILED_UPDATE_INCOMPATIBLE signature errors)
-adb uninstall com.ahmedmonib.eshop.internal || true
-
-# 5) Install (use absolute path so it works from repo root)
-APK_ABS="$(realpath mobile/android/app/build/outputs/apk/internal/release/app-internal-release.apk)"
-adb devices -l
-adb push "$APK_ABS" /data/local/tmp/eshop-internal.apk
-adb shell pm install -r /data/local/tmp/eshop-internal.apk
-
-
-#if its stuck run this to verify its moving in another terminal
-adb logcat | rg INSTALL
-```
-
-**Verify APK contains your cert (it may or may not be used when pinning is off):**
-
-```bash
-unzip -l "$APK_ABS" | grep -i 'assets/eshop_api\.cer' || echo "No pinned cert in APK (ok for internal)"
-```
-
-**If install hangs/fails:**
-
-```bash
-adb kill-server && adb start-server
-# or switch to Wi-Fi ADB
-# adb pair <ip>:<pair-port> && adb connect <ip>:<debug-port>
-```
-
----
-
-## Flow B — Production AAB (pinning ON)
-
-> Build flavor: prodRelease Package name: com.ahmedmonib.eshop
-
-```bash
-# 0) If app.config.js version/versionCode changed,
-# sync Expo config into the committed android folder
-cd mobile
-npx expo prebuild --platform android --no-install
-
-# Verify the values
-cd android
-grep -n "versionCode" app/build.gradle
-grep -n "versionName" app/build.gradle
-cd ../..
-
-# 1) Refresh cert
-npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api
-
-# 2) Pinning ON
-npm -w mobile run env:production
-
-# 3) Build AAB
-cd mobile/android
-./gradlew clean :app:bundleProdRelease
-cd -
-
-# 4) Upload to Play Console
-ls -lah mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab
-ls -lah mobile/android/app/build/outputs/mapping/prodRelease/mapping.txt
-
-```
-
----
-
-## Version bump reproducible flow
-
-When changing:
-
-- `expo.version`
-- `android.versionCode`
-- `ios.buildNumber`
-- app name
-- icons
-- splash screen
-- scheme
-- intent filters
-
-always synchronize Expo configuration into the committed native projects before building:
+## Internal testing APK (EAS)
 
 ```bash
 cd mobile
-npx expo prebuild --platform android --no-install
-cd ..
+# Build the internal APK on EAS (com.ahmedmonib.eshop.internal, scheme vexflare-internal).
+# eas.json's `internal` profile sets APP_VARIANT=internal and buildType apk.
+eas build --platform android --profile internal
+
+# When the build finishes, download the APK from the EAS dashboard / build URL, then:
+APK_ABS="$(realpath ~/Downloads/<downloaded>.apk)"
+adb uninstall com.ahmedmonib.eshop.internal || true   # avoid signature-mismatch on reinstall
+adb install -r "$APK_ABS"
+
+
+# windows install path when apk is at downloads folder
+adb install -r "/mnt/c/Users/Admin/Downloads/<downloaded>.apk"
 ```
 
-**Sanity check: AAB has the pinned cert in base assets**
-
-```bash
-unzip -l mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab | grep -i 'assets/eshop_api\.cer'
-```
-
-> Remember to bump `versionCode`/`versionName` for Play uploads (in
-> `mobile/android/app/build.gradle` or `gradle.properties` depending on your setup).
+> Internal builds run with SSL pinning **OFF** (`EXPO_PUBLIC_SSL_PINNING_CERTS` empty), so no
+> certificate is needed. See `docs/deployment.md` → "SSL certificate pinning".
+>
+> The `internal` and `production` profiles also inject the public runtime env in `eas.json`
+> (`EXPO_PUBLIC_API_BASE_URL`, `EXPO_PUBLIC_WEB_ASSET_ORIGIN`, and the `EXPO_PUBLIC_FEATURE_*`
+> flags), so an EAS build renders categories / product images and feature-gated UI the same as a
+> local build that sourced them from `.env.production`. The `development` profile intentionally
+> omits them — the dev client gets them from your local `.env` (e.g.
+> `npm -w mobile run env:tunnel`).
 
 ---
 
-## Verify AAB versionCode/versionName (important for Play Console uploads)
+## Production AAB (EAS)
 
-Sometimes Expo/Gradle caches old native values, causing Google Play to reject uploads with:
+```bash
+# 1) Bump `version` and `android.versionCode` in mobile/app.config.js.
+# 2) Build the AAB on EAS (com.ahmedmonib.eshop, scheme vexflare). EAS signs it with the
+#    keystore you uploaded to the Expo dashboard.
+eas build --platform android --profile production
+
+# 3) Download the AAB from the EAS dashboard and upload it to the Play Console.
+```
+
+---
+
+## Manual build (local fallback)
+
+EAS is the primary workflow. For an **offline / local** build, generate `android/` with
+`expo prebuild` (the `APP_VARIANT` prefix bakes in the application ID + scheme), then run Gradle.
+There are **no Gradle flavors**, so the tasks are the plain `assembleRelease` / `bundleRelease` (no
+`Internal`/`Prod` infix). The `withReleaseSigning` config plugin injects the release signing config
+automatically, so a **release** build needs the keystore exported first:
+
+Production AAB (→ Play Console):
+
+```bash
+
+export ESHOP_ANDROID_KEYSTORE=~/Dev/secrets/eshop-upload-keystore.jks
+export ESHOP_ANDROID_KEYSTORE_PASSWORD='<from Bitwarden>'
+export ESHOP_ANDROID_KEY_ALIAS='<from Bitwarden>'
+export ESHOP_ANDROID_KEY_PASSWORD='<from Bitwarden>'
+
+cd mobile
+APP_VARIANT=production npx expo prebuild --platform android
+cd android && ./gradlew clean bundleRelease
+# output: app/build/outputs/bundle/release/app-release.aab
+```
+
+Internal sideload APK:
+
+```bash
+export ESHOP_ANDROID_KEYSTORE=~/Dev/secrets/eshop-upload-keystore.jks
+export ESHOP_ANDROID_KEYSTORE_PASSWORD='<from Bitwarden>'
+export ESHOP_ANDROID_KEY_ALIAS='<from Bitwarden>'
+export ESHOP_ANDROID_KEY_PASSWORD='<from Bitwarden>'
+
+cd mobile
+APP_VARIANT=internal npx expo prebuild --platform android
+cd android && ./gradlew clean assembleRelease
+# output: app/build/outputs/apk/release/app-release.apk
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+
+Local development client (debug build, no keystore needed):
+
+```bash
+cd mobile
+adb devices -l                    # must show one device
+adb uninstall com.ahmedmonib.eshop.dev || true   # remove old dev client
+APP_VARIANT=development npx expo run:android   # installs com.ahmedmonib.eshop.dev
+```
+
+> If the `ESHOP_ANDROID_*` vars are missing on a **release** build, the signing plugin fails fast
+> with a clear "Missing release keystore configuration" error rather than producing an unsigned
+> build. `expo prebuild` overwrites `android/` from `app.config.js` on each run.
+
+---
+
+## OTA updates (EAS Update — JavaScript only)
+
+EAS Update ships **JavaScript-only** fixes over-the-air to installed builds, without a new APK/AAB.
+
+```bash
+# Publish a JS-only fix to the internal channel
+eas update --channel internal --message "fix: <describe the fix>"
+
+# Publish a JS-only fix to the production channel
+eas update --channel production --message "fix: <describe the fix>"
+```
+
+Verify the update appears in the Expo dashboard, then relaunch the app on a device on that channel —
+it downloads and applies on the next launch (the launch-time hook in `src/hooks/useOTAUpdates.js`).
+
+**Rollback:**
+
+```bash
+# Rollback internal
+eas update:rollback --channel internal
+
+# Rollback production
+eas update:rollback --channel production
+```
+
+When you need a rollback:
+
+- The published OTA introduced a crash, white screen, or broken flow that reaches users on their
+  next app launch — roll back immediately to restore the last good JS bundle without cutting a new
+  build.
+- A regression was caught on the `internal` channel before promoting to production — roll back
+  `internal`, fix, and re-publish.
+- The "JS-only" fix turns out to need a native change (works in the dev client but errors on the
+  installed binary) — roll back, then ship the native change via `eas build`.
+- A rollback is itself a new update pointing at the previous bundle, so users receive it on their
+  next launch (it does not instantly remove the bad update). If a correct fix is ready quickly,
+  prefer "fix forward" (publish a new good update) — it has the same reach as a rollback.
+
+> ⚠️ OTAs only reach builds sharing the same `runtimeVersion` (currently `appVersion`). If you bump
+> the version in `app.config.js`, you must do a fresh store build before OTA updates resume. OTAs
+> cannot change native code — for native changes, use `eas build`.
+
+> **First build per channel must be on EAS.** The very first build for a given channel (e.g.,
+> `internal` or `production`) must run on EAS (`eas build`) to create the update branch on Expo's
+> servers. After that first EAS build, the branch exists permanently. Subsequent builds — whether on
+> EAS or built locally with `expo prebuild` + `./gradlew` — will receive OTA updates automatically
+> on that channel.
+
+---
+
+## Verify AAB versionCode/versionName (before a Play upload)
+
+Play rejects re-used version codes:
 
 ```txt
 Version code X has already been used
 ```
 
-Even if `app.config.js` was updated.
+Verify the downloaded AAB before uploading.
 
 ### Install bundletool once
 
 ```bash
-mkdir -p ~/tools
-cd ~/tools
-
+mkdir -p ~/tools && cd ~/tools
 wget https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar
 ```
 
-### Inspect the generated AAB
+### Inspect the AAB
 
 ```bash
 java -jar ~/tools/bundletool-all-1.17.2.jar dump manifest \
-  --bundle ~/Dev/fullstack/ecommerce-mern-website/mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab \
-  --xpath /manifest/@android:versionCode
-```
-
-Check version name too:
-
-```bash
+  --bundle ~/Downloads/<app>.aab --xpath /manifest/@android:versionCode
 java -jar ~/tools/bundletool-all-1.17.2.jar dump manifest \
-  --bundle ~/Dev/fullstack/ecommerce-mern-website/mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab \
-  --xpath /manifest/@android:versionName
+  --bundle ~/Downloads/<app>.aab --xpath /manifest/@android:versionName
 ```
 
-Expected example:
+If the values are wrong, fix `version` / `android.versionCode` in `app.config.js` and rebuild — EAS
+regenerates the native project on every build, so there is no stale native cache to clear.
 
-```txt
-38
-1.38.0
-```
-
-### If the AAB still contains old values
-
-Expo native Android config is out of sync.
-
-Regenerate native Android files:
-
-```bash
-cd mobile
-
-npx expo prebuild --platform android
-```
-
-Then rebuild cleanly:
-
-```bash
-cd android
-
-./gradlew clean
-rm -rf app/build
-
-./gradlew :app:bundleProdRelease
-```
-
-Re-run the bundletool checks afterward before uploading to Play Console.
-
-### Verify generated file timestamp
-
-```bash
-ls -lah mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab
-```
-
-Always upload the freshly generated `.aab`.
+---
 
 ## Common pitfalls & quick fixes
 
 ### 1) `INSTALL_FAILED_UPDATE_INCOMPATIBLE: ... signatures do not match`
 
-You tried to install a **release** over a **debug** (or vice-versa) that shares the same
-`applicationId`.
-
-Fix:
+You're installing over an existing app with the same `applicationId` but a different signing key
+(e.g. a local dev build vs the EAS-signed APK).
 
 ```bash
-# Choose the package that conflicts and uninstall it, then install again
 adb shell pm list packages | grep eshop
-adb uninstall com.ahmedmonib.eshop.internal || true   # internal flavor
-adb uninstall com.ahmedmonib.eshop          || true   # prod flavor
+adb uninstall com.ahmedmonib.eshop.internal || true
+adb uninstall com.ahmedmonib.eshop          || true
 ```
 
-> Tip: Use distinct `applicationId`/`applicationIdSuffix` per flavor so debug/dev client and release
-> can coexist.
+> The three variants (`…eshop` / `…eshop.internal` / `…eshop.dev`) have distinct application IDs and
+> coexist fine — conflicts only happen when reinstalling the **same** id signed by a different key.
 
-### 2) “Network error” on internal APK
+### 2) “Network error” on the internal APK
 
-Internal builds should have pinning **OFF**:
-
-- You **must** build after `npm -w mobile run env:internal`.
-- Clear app data and retry:
-
-  ```bash
-  adb shell pm clear com.ahmedmonib.eshop.internal
-  ```
-
-- Check runtime logs while you hit Login:
-
-  ```bash
-  adb logcat -c
-  adb logcat -s ReactNativeJS,OkHttp,SSL,Conscrypt,ConnectivityService,AndroidRuntime
-  ```
-
-### 3) Using relative paths with `adb push`
-
-Always compute an **absolute** APK path:
+Internal builds ship with pinning **OFF**. Clear app data and check runtime logs:
 
 ```bash
-APK_ABS="$(realpath mobile/android/app/build/outputs/apk/internal/release/app-internal-release.apk)"
-adb push "$APK_ABS" /data/local/tmp/eshop-internal.apk
+adb shell pm clear com.ahmedmonib.eshop.internal
+adb logcat -c
+adb logcat -s ReactNativeJS,OkHttp,SSL,Conscrypt,ConnectivityService,AndroidRuntime
 ```
 
-### 4) “Where did my cert go?”
+### 3) `adb install` / push path
 
-- The env script copies `mobile/certs/*.cer` → `android/app/src/main/assets/`
-- Verify after build:
-
-  ```bash
-  unzip -l "$APK_ABS" | grep -i 'assets/eshop_api\.cer' || true
-  unzip -l mobile/android/app/build/outputs/bundle/prodRelease/app-prod-release.aab | grep -i 'assets/eshop_api\.cer'
-  ```
-
----
-
-## Clean build checklist (when switching branches or native deps changed)
+Always compute an **absolute** path to the downloaded artifact:
 
 ```bash
-npm ci
+APK_ABS="$(realpath ~/Downloads/<downloaded>.apk)"
+adb install -r "$APK_ABS"
+```
 
-# quick sanity that native tooling is present
-test -d node_modules/@react-native/gradle-plugin && echo "RN gradle plugin OK"
-test -d node_modules/expo-modules-autolinking/android && echo "Expo autolinking OK"
-test -d node_modules/expo/packages/expo-gradle-plugin && echo "Expo gradle plugin OK"
+If `install` hangs, reset ADB or switch to Wi-Fi ADB:
 
-cd mobile/android
-./gradlew --stop || true
-rm -rf ~/.gradle/kotlin .cxx app/build app/.cxx
-./gradlew clean
-
+```bash
 adb kill-server && adb start-server
-adb devices -l
+# adb pair <ip>:<pair-port> && adb connect <ip>:<debug-port>
 ```
 
 ---
 
 ## Useful one-liners
 
-**See packages installed on device:**
-
 ```bash
 adb shell pm list packages | grep eshop
 adb shell dumpsys package com.ahmedmonib.eshop.internal | sed -n '1,60p'
-```
-
-**Find Gradle variants / verify tasks:**
-
-```bash
-cd mobile/android
-./gradlew :app:tasks --all | grep -i -E 'assemble|bundle|install'
-```
-
-**Confirm flavor dimensions (if unsure):**
-
-```bash
-rg "productFlavors|applicationId" mobile/android/app/build.gradle -n
+adb kill-server && adb start-server && adb devices -l
 ```
 
 ---
 
 ## Mental model
 
-- **Internal APK** = quick sideload, **pinning OFF**, app id like `com.ahmedmonib.eshop.internal`.
-  Never install over a debug with the same id (different signatures).
-
-- **Play AAB** = **pinning ON**, cert packaged into assets, uploaded to Console. Always bump
-  version, keep `mapping.txt` for deobfuscation.
+- **Internal APK** = quick sideload via `eas build --profile internal`, pinning **OFF**, id
+  `com.ahmedmonib.eshop.internal`. Its distinct id means it coexists with prod.
+- **Play AAB** = `eas build --profile production`, signed by the Expo-dashboard keystore, uploaded
+  to the Console. Bump `versionCode` for every upload.
+- **No Gradle flavors, no committed `android/`** — EAS prebuilds the native project from
+  `app.config.js` on each build, and `APP_VARIANT` selects the id/scheme.

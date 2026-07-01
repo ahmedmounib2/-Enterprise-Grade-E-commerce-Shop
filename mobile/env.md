@@ -37,20 +37,20 @@
 | Surface | Location    | Tech                | Deploy target             | Highlights                                                                                                                                        |
 | ------- | ----------- | ------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Web app | `frontend/` | Vite + React        | **Vercel**                | SPA rewrites defined in `frontend/vercel.json`; `/api/*` rewrites to Railway backend; production install forced with `npm ci --legacy-peer-deps`. |
-| API     | `backend/`  | Node + Express      | **Railway**               | Emits reset emails with per-flavor deep link and web fallback URLs.                                                                               |
-| Mobile  | `mobile/`   | Expo + React Native | Local (custom dev client) | Handles per-flavor custom scheme for password reset & OAuth flows.                                                                                |
+| API     | `backend/`  | Node + Express      | **Railway**               | Emits reset emails with per-variant deep link and web fallback URLs.                                                                              |
+| Mobile  | `mobile/`   | Expo + React Native | Local (custom dev client) | Handles per-variant custom scheme for password reset & OAuth flows.                                                                               |
 
 **Deep-link flow recap**
 
 1. Mobile `ForgotPasswordPage` sends `POST /api/auth/forgot-password` with
    `{ email, client: 'mobile', mobile: true, scheme: getAppScheme() }`, where `scheme` is the active
-   flavor's scheme (e.g. `vexflare-internal` for the internal build).
+   variant's scheme (e.g. `vexflare-internal` for the internal build).
 2. Backend validates the scheme against a whitelist and generates
    `deepLink={scheme}://reset-password?...#token=...` plus
    `webFallback=https://<vercel-app>/reset-password`. Old app versions that omit `scheme` fall back
    to `MOBILE_RESET_REDIRECT_URI` (default `eshop://reset-password`).
-3. Android intent filters accept the per-flavor scheme and open only the matching app (no chooser).
-4. Navigation prefixes include the active flavor's `getAppScheme()://` plus legacy schemes
+3. Android intent filters accept the per-variant scheme and open only the matching app (no chooser).
+4. Navigation prefixes include the active variant's `getAppScheme()://` plus legacy schemes
    (`eshop://`, `vexflare://`). Config `{ ResetPassword: 'reset-password' }` ensures both logged-in
    and anonymous users land on the `ResetPassword` screen.
 
@@ -105,44 +105,41 @@ Handy tips:
 ### Mobile workspace
 
 - Expo project defined in `mobile/` with custom dev client.
-- `app.config.js` declares the base `scheme: 'vexflare'` (used by the JS layer via
-  `Constants.expoConfig`) plus Android intent filters. The legacy `eshop://` scheme is still
-  accepted by the manifest for backwards compatibility.
-- Development build installed on physical device(s) via Gradle (`./gradlew installDebug`).
+- `app.config.js` declares a per-variant `scheme` (see the table below; `vexflare` for production)
+  selected by `process.env.APP_VARIANT` and read by the JS layer via `Constants.expoConfig`, plus
+  Android intent filters. The legacy `eshop://` scheme is still accepted by the manifest for
+  backwards compatibility.
+- Development build installed via `APP_VARIANT=development npx expo run:android`.
 - `.env` management handled through scripts (see [Mobile `.env` profiles](#mobile-env-profiles)).
 
-#### Per-flavor URL schemes
+#### Per-variant URL schemes
 
-All four Android variants are installed side by side, so each one registers a **distinct** custom
-URL scheme. Without this, Android cannot tell which app an OAuth or password-reset callback belongs
-to and shows the "open with…" chooser. The scheme is injected into `AndroidManifest.xml` via the
-`${appScheme}` manifest placeholder, set per flavor/build-type in `android/app/build.gradle`:
+The three app variants install side by side, so each registers a **distinct** custom URL scheme.
+Without this, Android cannot tell which app an OAuth or password-reset callback belongs to and shows
+the "open with…" chooser. The scheme is set from `process.env.APP_VARIANT` in `app.config.js`, which
+prebuild injects into `AndroidManifest.xml`:
 
-| Variant        | applicationId                       | scheme              | OAuth callback              | Reset deep link                      |
-| -------------- | ----------------------------------- | ------------------- | --------------------------- | ------------------------------------ |
-| Production     | `com.ahmedmonib.eshop`              | `vexflare`          | `vexflare://oauth`          | `vexflare://reset-password`          |
-| Internal       | `com.ahmedmonib.eshop.internal`     | `vexflare-internal` | `vexflare-internal://oauth` | `vexflare-internal://reset-password` |
-| Prod Debug     | `com.ahmedmonib.eshop.dev`          | `vexflare-dev`      | `vexflare-dev://oauth`      | `vexflare-dev://reset-password`      |
-| Internal Debug | `com.ahmedmonib.eshop.internal.dev` | `vexflare-dev`      | `vexflare-dev://oauth`      | `vexflare-dev://reset-password`      |
+| `APP_VARIANT` | applicationId                   | scheme              | OAuth callback              | Reset deep link                      |
+| ------------- | ------------------------------- | ------------------- | --------------------------- | ------------------------------------ |
+| `production`  | `com.ahmedmonib.eshop`          | `vexflare`          | `vexflare://oauth`          | `vexflare://reset-password`          |
+| `internal`    | `com.ahmedmonib.eshop.internal` | `vexflare-internal` | `vexflare-internal://oauth` | `vexflare-internal://reset-password` |
+| `development` | `com.ahmedmonib.eshop.dev`      | `vexflare-dev`      | `vexflare-dev://oauth`      | `vexflare-dev://reset-password`      |
 
 At runtime the JS layer cannot read the native manifest, so `mobile/src/utils/appScheme.js` derives
 the active scheme from `expo-application`'s `Application.applicationId` and forces it into every
 `createURL()` call and the `scheme` field sent to the forgot-password endpoint. **Keep that mapping
-in sync with `build.gradle` and `AndroidManifest.xml`.**
+in sync with the `VARIANTS` map in `app.config.js`.**
 
-Launch the internal debug variant on a connected device:
+Launch the development variant on a connected device:
 
 ```bash
 cd mobile
-npx expo run:android \
-  --variant internalDebug \
-  --app-id com.ahmedmonib.eshop.internal.dev
+APP_VARIANT=development npx expo run:android
 ```
 
-> **After `expo prebuild --clean`:** the regenerated `AndroidManifest.xml` and `build.gradle` cannot
-> express per-flavor schemes (the Expo config is flavor-agnostic). Re-apply the `${appScheme}`
-> placeholder in the manifest and the per-flavor/-build-type `manifestPlaceholders` in
-> `build.gradle` before committing the regenerated files.
+> `android/` is git-ignored and regenerated by `expo prebuild` / EAS from `app.config.js`, so the
+> per-variant scheme comes straight from the `VARIANTS` map — there is nothing to re-apply in the
+> manifest after a prebuild.
 
 ---
 
@@ -159,13 +156,13 @@ headers).
 
 ### Backend (Railway)
 
-| Variable                     | Description                                                                                   | Typical value                              |
-| ---------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `PUBLIC_CLIENT_FALLBACK_URL` | Matches the Vercel fallback so emails share the same SPA link.                                | `https://vexflare.com/reset-password`      |
-| `MOBILE_RESET_REDIRECT_URI`  | Fallback deep link for password resets (overridden when the app sends a per-flavor `scheme`). | `eshop://reset-password`                   |
-| `MOBILE_MAIL_CONFIRM_URI`    | Custom-scheme deep link for mailing confirmations.                                            | `eshop://mailing/confirm`                  |
-| `MAIL_CONFIRM_WEB_URL`       | Optional HTTPS override used inside confirmation emails.                                      | `https://shop.example.com/mailing/confirm` |
-| `MOBILE_OAUTH_REDIRECT_URI`  | Custom-scheme deep link for OAuth return.                                                     | `eshop://oauth`                            |
+| Variable                     | Description                                                                                    | Typical value                              |
+| ---------------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `PUBLIC_CLIENT_FALLBACK_URL` | Matches the Vercel fallback so emails share the same SPA link.                                 | `https://vexflare.com/reset-password`      |
+| `MOBILE_RESET_REDIRECT_URI`  | Fallback deep link for password resets (overridden when the app sends a per-variant `scheme`). | `eshop://reset-password`                   |
+| `MOBILE_MAIL_CONFIRM_URI`    | Custom-scheme deep link for mailing confirmations.                                             | `eshop://mailing/confirm`                  |
+| `MAIL_CONFIRM_WEB_URL`       | Optional HTTPS override used inside confirmation emails.                                       | `https://shop.example.com/mailing/confirm` |
+| `MOBILE_OAUTH_REDIRECT_URI`  | Custom-scheme deep link for OAuth return.                                                      | `eshop://oauth`                            |
 
 > **Branding tip:** The public-facing app name shown in the Google Play Console (e.g. "Ecommerce")
 > can differ from the internal deep-link scheme (`eshop://…`). Only change the scheme and the values
@@ -448,9 +445,8 @@ Sanity checks:
 - [ ] Build fresh release artifacts and archive the mapping file:
 
   ```bash
-  cd mobile/android
-  ./gradlew clean bundleRelease
-  ./gradlew assembleRelease          # optional for APK sideloading
+  eas build --platform android --profile production   # AAB for Play (mapping.txt in the EAS Artifacts panel)
+  eas build --platform android --profile internal      # optional APK for sideloading
   ```
 
 - [ ] Smoke-test on a device/emulator using the release APK (login, stock/restock, checkout).
@@ -609,9 +605,8 @@ Clear Expo cache:
 
 ```bash
 rm -rf .expo
-npx expo run:android \
---variant internalDebug \
---app-id com.ahmedmonib.eshop.internal.dev
+cd mobile
+APP_VARIANT=development npx expo run:android
 ```
 
 #### Notes
