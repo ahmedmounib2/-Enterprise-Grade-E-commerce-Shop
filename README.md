@@ -219,6 +219,7 @@ Some screenshots and historical references may still contain the previous domain
       - [System relationship diagram (simplified)](#system-relationship-diagram-simplified)
       - [Settlement and payout flow](#settlement-and-payout-flow)
       - [Ledger lifecycle narrative (delivery -\> payout -\> reserve release)](#ledger-lifecycle-narrative-delivery---payout---reserve-release)
+      - [Production-hardening capabilities (July 2026 finance audit)](#production-hardening-capabilities-july-2026-finance-audit)
       - [Seller ledger exports (CSV + PDF) and filter](#seller-ledger-exports-csv--pdf-and-filter)
         - [Export data shape](#export-data-shape)
         - [Amount formatting fix](#amount-formatting-fix)
@@ -4333,6 +4334,35 @@ flowchart TD
 7. Reserve release job creates `reserve_release` rows when hold windows expire.
 8. Released reserves flow back into future settlement eligibility; reversals/retries keep correction
    audit trails.
+
+#### Production-hardening capabilities (July 2026 finance audit)
+
+A full money-lifecycle audit hardened the engine end to end (all details and operator procedures
+live in `docs/settlements-runbook.md`):
+
+- **Reserve redesign** — `reserve_release` is payout-eligible: scheduled releases and refund-time
+  reserve applications post credits the next settlement batch sweeps, so withheld reserves always
+  return to the seller and a reserve-funded refund charges the seller exactly once.
+- **Chargeback accounting** — a lost Stripe dispute posts refund-equivalent reversal entries plus a
+  `dispute_fee` row (runbook §13); disputed amounts clamp future refund plans. No restock.
+- **COD book cleanup** — COD refunds post exactly two full-amount rows (`cod_refund_disbursement`
+  - `cod_refund_reimbursement`); COD never touches the tax/shipping liability pools (runbook §5,
+    tax-book §10).
+- **Payout reaper & execution preflight** — payouts stranded in `processing` by a crashed worker are
+  resolved via Stripe transfer-metadata lookup, and execution blocks to `manual_required` when
+  post-scheduling refunds exceed a threshold (runbook §2, §5).
+- **Seller debt monitor** — a daily job reports aged negative balances and auto-sets `payoutHold`
+  past a threshold; automated hold releases never clear admin-set holds (runbook §14).
+- **Hardened refund paths** — refund approvals and cancellations run under a per-order lock with
+  in-flight refunds counted against the refundable budget and stable Stripe idempotency keys; COD
+  refund state transitions are compare-and-set guarded.
+
+New environment variables (see `backend/.env.example` for annotated defaults):
+`SETTLEMENT_PAYOUT_STALE_PROCESSING_MINUTES`, `SETTLEMENT_EXECUTION_NEGATIVE_DELTA_CENTS`,
+`DISPUTE_FEE_CENTS`, and the `SELLER_DEBT_MONITOR_*` / `SELLER_DEBT_*_THRESHOLD_CENTS` family. In
+production the server now refuses to boot if the synthetic ledger accounts (`PLATFORM_SELLER_ID` /
+`SHIPPING_SELLER_ID`, plus `TAX_SELLER_ID` behind `FEATURE_TAX_LIABILITY_SELLER`) fail to resolve
+after `ensureAdminStore()`.
 
 The payout system is implemented as a **double-entry style operational ledger** at seller level:
 

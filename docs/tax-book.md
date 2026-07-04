@@ -1,6 +1,6 @@
 # Tax Book — admin & maintainer guide
 
-How tax is calculated, configured, and audited in `ahmedmonib-eshop-demo.com`. The engine lives in
+How tax is calculated, configured, and audited in `vexflare.com`. The engine lives in
 `backend/src/services/tax/`; this guide is the operational reference. For the architecture summary
 see the **Category-based tax engine** section of the root `README.md`.
 
@@ -340,13 +340,19 @@ previously causing `InvalidAddress` rejections that silently fell back to `TAX_R
 
 ### Overview
 
-The platform collects `tax` ledger entries (positive, operator-side mirror) on every delivered order
-and negative `tax_refund` entries on refunds. These operator mirrors are credited to
-`PLATFORM_SELLER_ID` by default, or to the dedicated tax-liability seller (`TAX_SELLER_ID`) when
-`FEATURE_TAX_LIABILITY_SELLER` is enabled — see _Tax-liability seller_ below. Without recording
-outflows to tax authorities, the platform tax-liability pool grows without bound and the admin
-dashboard shows "outstanding tax liability" that never resolves. Tax remittance tracking closes this
-loop.
+The platform collects `tax` ledger entries (positive, operator-side mirror) on every delivered
+**prepaid** order and negative `tax_refund` entries on prepaid refunds. These operator mirrors are
+credited to `PLATFORM_SELLER_ID` by default, or to the dedicated tax-liability seller
+(`TAX_SELLER_ID`) when `FEATURE_TAX_LIABILITY_SELLER` is enabled — see _Tax-liability seller_ below.
+Without recording outflows to tax authorities, the platform tax-liability pool grows without bound
+and the admin dashboard shows "outstanding tax liability" that never resolves. Tax remittance
+tracking closes this loop.
+
+> **COD orders never touch the tax-liability pool.** The seller collects the full amount — including
+> tax — in cash at the door, so the platform never holds COD tax; remitting it is the seller's
+> obligation. Neither COD delivery nor COD refund posts `tax` / `tax_refund` rows (a COD refund
+> claws back the full amount, tax included, via `cod_refund_reimbursement` — see the settlements
+> runbook §5). The pool and `taxNetLiabilityCents` therefore reflect prepaid volume only.
 
 ### Feature flag
 
