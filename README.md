@@ -372,6 +372,7 @@ Some screenshots and historical references may still contain the previous domain
     - [Admin Dashboard](#admin-dashboard)
     - [Mobile](#mobile)
   - [Demo credentials (web \& mobile)](#demo-credentials-web--mobile)
+  - [Commercial Availability](#commercial-availability)
   - [Additional documentation](#additional-documentation)
   - [Contact / commercial enquiries](#contact--commercial-enquiries)
 
@@ -9330,6 +9331,22 @@ client). Update or rotate as needed before sharing broadly.
 
 > **Note:** These are placeholder credentials. Contact the platform administrator for actual demo
 > access.
+
+---
+
+## Commercial Availability
+
+The Vexflare Marketplace Platform is commercially available through Vexflare Technologies.
+
+The platform is delivered as a professionally implemented marketplace solution under a perpetual commercial license.
+
+Implementation, licensing, ownership, and Managed Platform Support are described on the Vexflare website.
+
+For commercial enquiries:
+
+<https://vexflare.com/services>
+
+<https://vexflare.com/licensing>
 
 ---
 
