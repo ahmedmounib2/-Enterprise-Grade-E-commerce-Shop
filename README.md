@@ -371,7 +371,6 @@ Some screenshots and historical references may still contain the previous domain
     - [Seller Dashboard](#seller-dashboard)
     - [Admin Dashboard](#admin-dashboard)
     - [Mobile](#mobile)
-  - [Commercial license (proprietary) \& selling notes](#commercial-license-proprietary--selling-notes)
   - [Demo credentials (web \& mobile)](#demo-credentials-web--mobile)
   - [Additional documentation](#additional-documentation)
   - [Contact / commercial enquiries](#contact--commercial-enquiries)
@@ -9317,17 +9316,6 @@ with status tracking._
 
 ![Mobile — Profile tools](./docs/screenshots/mobile-app-profile-page-delete-acount&exportData-section-light.jpg)
 _Profile management, GDPR export, and delete account actions._
-
-## Commercial license (proprietary) & selling notes
-
-Check LICENSE_PROPRIETARY.txt
-
-**Selling notes**:
-
-- Deliverables to include: source code, deployment scripts, environment setup, 30 days of
-  post-delivery support, documentation, and optional maintenance plan.
-- For buyers: the app is horizontally scalable — to increase capacity, upgrade MongoDB/Redis/hosting
-  plans and scale server replicas behind a load balancer.
 
 ---
 
