@@ -4539,6 +4539,9 @@ The platform uses a **signed double-entry ledger** where `amountCents > 0` is a 
 merchant-scoped row and a platform/operator-scoped mirror — so both sides of each transaction are
 always on record.
 
+- A JournalEntry model (feature-flagged via `JOURNAL_LEDGER_ENABLED`) groups each transaction's
+  postings into a single balanced document for audit and review.
+
 **Entry type reference**
 
 | Type                       | Settlement class | Who it touches                           | Sign convention (merchant side)                                                 |
@@ -7486,7 +7489,11 @@ history remains consistent.
   signing out the user on all cookie-bearing clients.
 - **CSRF:** `csrf-csrf` (double-submit cookie pattern) replaces the removed `csurf` dependency. The
   `X-Mobile-Client` CSRF bypass has been removed; all clients must go through the standard
-  double-submit flow. The `/api/csrf-token` endpoint issues the CSRF cookie.
+  double-submit flow. The `/api/csrf-token` endpoint issues the CSRF cookie. `/api/contact-us` and
+  `/api/mailing/subscribe` are exempt: both are public, anonymous, state-mutation-free endpoints,
+  and the CSRF token's identifier falls back to `req.ip`, which iCloud Private Relay rotates per
+  request — causing false-positive 403s for iPhone Safari users. The rate limiter remains the abuse
+  boundary for both routes.
 - **Rate limiting** (tiered):
   - Global **GET / HEAD**: 1 000 requests per 15 min — applied to all roles, including admin.
   - Global **mutating** (POST / PUT / PATCH / DELETE): 100 requests per 15 min.
@@ -9121,6 +9128,14 @@ _Admin UI — Create product with variants (dark theme)._
 ---
 
 ### Analytics & Campaigns
+
+The admin analytics dashboard supports **filtering by seller**: a dropdown (backed by
+`GET /api/analytics/sellers`) scopes the summary cards and the daily sales chart to a single seller
+via `GET /api/analytics?sellerId=…`, with seller-scoped revenue computed from order line items
+rather than order totals. Sellers get the same view from the **Analytics tab** in the seller
+dashboard (`GET /api/seller/analytics`), showing their own products, sales, merchandise revenue,
+distinct customers, and a 7-day daily sales chart — always scoped server-side to the authenticated
+seller.
 
 ![Admin — Analytics dashboard (dark)](./docs/screenshots/admin_panel_analytics_dark.png) _Admin
 analytics dashboard — sales, users, revenue._
