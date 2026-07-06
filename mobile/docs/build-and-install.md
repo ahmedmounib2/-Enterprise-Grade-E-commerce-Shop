@@ -83,7 +83,25 @@ EAS is the primary workflow. For an **offline / local** build, generate `android
 `expo prebuild` (the `APP_VARIANT` prefix bakes in the application ID + scheme), then run Gradle.
 There are **no Gradle flavors**, so the tasks are the plain `assembleRelease` / `bundleRelease` (no
 `Internal`/`Prod` infix). The `withReleaseSigning` config plugin injects the release signing config
-automatically, so a **release** build needs the keystore exported first:
+automatically, so a **release** build needs the keystore exported first.
+
+**Pre-build checklist (every manual build):**
+
+1. **Set the right `.env` first** — unlike EAS (which injects env from `eas.json`), a local build
+   bakes in whatever `mobile/.env` currently holds:
+   - Vexflare (Dev): `npm -w mobile run env:tunnel` (ngrok API URL, feature flags, etc.)
+   - Vexflare (Internal): `npm -w mobile run env:internal` (production API URL + correct feature
+     flags)
+2. **Clean prebuild when switching variants** — always regenerate `android/` with `--clean`:
+   `APP_VARIANT=development npx expo prebuild --platform android --clean` or
+   `APP_VARIANT=internal npx expo prebuild --platform android --clean`.
+3. **Uninstall old conflicting apps** before installing the new build:
+
+   ```bash
+   adb uninstall com.ahmedmonib.eshop.dev || true
+   adb uninstall com.ahmedmonib.eshop.internal || true
+   adb uninstall com.ahmedmonib.eshop || true
+   ```
 
 Production AAB (→ Play Console):
 
@@ -94,8 +112,13 @@ export ESHOP_ANDROID_KEYSTORE_PASSWORD='<from Bitwarden>'
 export ESHOP_ANDROID_KEY_ALIAS='<from Bitwarden>'
 export ESHOP_ANDROID_KEY_PASSWORD='<from Bitwarden>'
 
+
 cd mobile
-APP_VARIANT=production npx expo prebuild --platform android
+# Wipe Metro's cache
+npx expo start --clear &
+sleep 5 && kill %1   # Start Metro to clear its cache, then stop it
+
+APP_VARIANT=production npx expo prebuild --platform android --clean
 cd android && ./gradlew clean bundleRelease
 # output: app/build/outputs/bundle/release/app-release.aab
 ```
@@ -108,20 +131,42 @@ export ESHOP_ANDROID_KEYSTORE_PASSWORD='<from Bitwarden>'
 export ESHOP_ANDROID_KEY_ALIAS='<from Bitwarden>'
 export ESHOP_ANDROID_KEY_PASSWORD='<from Bitwarden>'
 
+# Set the internal env FIRST (production API URL + correct feature flags):
+npm -w mobile run env:internal
+
 cd mobile
-APP_VARIANT=internal npx expo prebuild --platform android
-cd android && ./gradlew clean assembleRelease
+APP_VARIANT=internal npx expo prebuild --platform android --clean
+
+# Wipe Metro's cache
+npx expo start --clear &
+sleep 5 && kill %1   # Start Metro to clear its cache, then stop it
+
+cd android && ./gradlew assembleRelease
 # output: app/build/outputs/apk/release/app-release.apk
+adb uninstall com.ahmedmonib.eshop.internal || true
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
 Local development client (debug build, no keystore needed):
 
 ```bash
+# Set the dev/tunnel env FIRST (ngrok API URL, feature flags, etc.):
+npm -w mobile run env:tunnel
+
 cd mobile
 adb devices -l                    # must show one device
-adb uninstall com.ahmedmonib.eshop.dev || true   # remove old dev client
+adb uninstall com.ahmedmonib.eshop.dev || true      # remove old conflicting builds
+adb uninstall com.ahmedmonib.eshop.internal || true
+adb uninstall com.ahmedmonib.eshop || true
+
+# Clean prebuild when switching variants:
+APP_VARIANT=development npx expo prebuild --platform android --clean
+
+# Build + install (either form):
 APP_VARIANT=development npx expo run:android   # installs com.ahmedmonib.eshop.dev
+# …or with Gradle directly:
+cd android && ./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 > If the `ESHOP_ANDROID_*` vars are missing on a **release** build, the signing plugin fails fast

@@ -173,12 +173,24 @@ adb devices -l
 ## Manage mobile environment profiles
 
 ```bash
-npm -w mobile run env:emu     # Android emulator (10.0.2.2)
-npm -w mobile run env:lan     # Physical device on LAN
-npm -w mobile run env:tunnel  # ngrok HTTPS (default for sharing)
+npm -w mobile run env:emu        # Android emulator (10.0.2.2)
+npm -w mobile run env:lan        # Physical device on LAN
+npm -w mobile run env:tunnel     # ngrok HTTPS (default for sharing) — dev builds
+npm -w mobile run env:internal   # production API + feature flags — internal builds
 ```
 
 After switching, restart Metro with `--clear`.
+
+> **Always run the matching env script immediately before a manual build.** The scripts copy
+> `.env.<profile>` over `.env`, and the build bakes in whatever `.env` holds at that moment:
+>
+> - Before building **Vexflare (Dev)**: `npm -w mobile run env:tunnel` (ngrok API URL, feature flags
+>   such as `EXPO_PUBLIC_FEATURE_STORE_THEMES`, etc.).
+> - Before building **Vexflare (Internal)**: `npm -w mobile run env:internal` (production API URL
+>   `api.vexflare.com` and the correct feature flags).
+>
+> Skipping this step produces builds pointing at the wrong backend (e.g. a stale ngrok URL) or
+> missing feature flags.
 
 ---
 
@@ -243,13 +255,26 @@ The three application IDs differ, so all three apps install side-by-side on one 
 ## Build or refresh the custom dev client
 
 The dev client is the `development` variant (`com.ahmedmonib.eshop.dev`, scheme `vexflare-dev`).
-Build and install it with Expo — no Gradle commands:
 
 ```bash
-# Pick the JS env (tunnel is the daily default), then build + install the dev client in one step.
+# 1) Set the JS env FIRST (tunnel is the daily default for dev builds).
 npm -w mobile run env:tunnel
+
+# 2) Uninstall old conflicting apps before installing a new build.
+adb uninstall com.ahmedmonib.eshop.dev || true
+adb uninstall com.ahmedmonib.eshop.internal || true
+adb uninstall com.ahmedmonib.eshop || true
+
+# 3) When switching between variants (dev ↔ internal ↔ production), ALWAYS run a clean prebuild
+#    so the previous variant's applicationId/scheme/resources don't leak into this build:
 cd mobile
+APP_VARIANT=development npx expo prebuild --platform android --clean
+
+# 4) Build + install in one step:
 APP_VARIANT=development npx expo run:android
+#    …or with Gradle directly:
+cd android && ./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 `expo run:android` regenerates `android/` if needed, compiles the debug dev client, and installs it.
@@ -817,6 +842,27 @@ eas build --platform android --profile internal   # com.ahmedmonib.eshop.interna
 # then download the APK from the EAS dashboard and:
 adb uninstall com.ahmedmonib.eshop.internal || true
 adb install -r ~/Downloads/<downloaded>.apk
+```
+
+To build the internal APK **locally** instead of on EAS (keystore env vars required — see
+`mobile/docs/build-and-install.md`):
+
+```bash
+# 1) Set the internal env FIRST (production API URL + correct feature flags):
+npm -w mobile run env:internal
+
+# 2) Uninstall old conflicting apps:
+adb uninstall com.ahmedmonib.eshop.dev || true
+adb uninstall com.ahmedmonib.eshop.internal || true
+adb uninstall com.ahmedmonib.eshop || true
+
+# 3) Clean prebuild (mandatory when switching between variants):
+cd mobile
+APP_VARIANT=internal npx expo prebuild --platform android --clean
+
+# 4) Build and install:
+cd android && ./gradlew assembleRelease
+adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
 ## Fix a stuck dev-client install

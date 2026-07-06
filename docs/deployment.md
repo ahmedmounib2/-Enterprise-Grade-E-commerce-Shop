@@ -211,11 +211,28 @@ export ESHOP_ANDROID_KEYSTORE_PASSWORD='<from Bitwarden>'
 export ESHOP_ANDROID_KEY_ALIAS='<from Bitwarden>'
 export ESHOP_ANDROID_KEY_PASSWORD='<from Bitwarden>'
 
+# Local builds bake in mobile/.env — set the right profile FIRST:
+npm -w mobile run env:internal   # internal build: production API + correct feature flags
+# (dev build instead: npm -w mobile run env:tunnel)
+
+# Uninstall old conflicting apps before installing a new build:
+adb uninstall com.ahmedmonib.eshop.dev || true
+adb uninstall com.ahmedmonib.eshop.internal || true
+adb uninstall com.ahmedmonib.eshop || true
+
 cd mobile
-APP_VARIANT=internal npx expo prebuild --platform android      # regenerate android/ for the internal variant
-cd android && ./gradlew clean assembleRelease                  # → app/build/outputs/apk/release/app-release.apk
-# Play AAB: APP_VARIANT=production prebuild, then ./gradlew clean bundleRelease
-# Dev client (debug, no keystore): APP_VARIANT=development npx expo run:android
+
+# Wipe Metro's cache
+npx expo start --clear &
+sleep 5 && kill %1   # Start Metro to clear its cache, then stop it
+
+
+APP_VARIANT=internal npx expo prebuild --platform android --clean   # clean prebuild when switching variants
+cd android && ./gradlew assembleRelease                             # → app/build/outputs/apk/release/app-release.apk
+adb install -r app/build/outputs/apk/release/app-release.apk
+# Play AAB: APP_VARIANT=production prebuild --clean, then ./gradlew bundleRelease
+# Dev client (debug, no keystore): env:tunnel, then APP_VARIANT=development npx expo run:android
+#   (or ./gradlew assembleDebug && adb install -r app/build/outputs/apk/debug/app-debug.apk)
 ```
 
 > Note: `expo prebuild` overwrites `android/`. There are no product flavors — each build's

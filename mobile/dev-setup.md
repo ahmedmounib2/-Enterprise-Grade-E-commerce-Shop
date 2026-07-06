@@ -123,10 +123,17 @@ npm -w mobile run env:lan
 
 # tunnel profile (API exposed via HTTPS tunnel)
 npm -w mobile run env:tunnel
+
+# internal profile (production API + correct feature flags)
+npm -w mobile run env:internal
 ```
 
 These scripts simply copy `mobile/.env.<profile>` to `mobile/.env`. See [`mobile/env.md`](./env.md)
 for the full matrix of available variables.
+
+> Manual builds bake in whatever `.env` currently holds — run `env:tunnel` before building the
+> **Vexflare (Dev)** app and `env:internal` before building the **Vexflare (Internal)** app (see
+> `mobile/docs/build-and-install.md` for the full pre-build checklist).
 
 ---
 
