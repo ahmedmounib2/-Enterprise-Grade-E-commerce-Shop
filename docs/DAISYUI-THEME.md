@@ -45,7 +45,10 @@ campaign-specific themes.
 5. At runtime, `frontend/src/contexts/ThemeContext.jsx` sets `data-theme="<id>-light|dark"` on the
    `<html>` element (and mirrors the choice in local storage) so DaisyUI swaps palettes without
    touching the native token selection. The same context also writes CSS variables for legacy
-   components while keeping `color-scheme` up to date.
+   components while keeping `color-scheme` up to date. The _active_ theme is chosen by a shared
+   precedence — saved preference → environment default → the **Native Storefront** fallback — that
+   is identical on mobile (which persists the same choice to Expo SecureStore). See
+   [`docs/THEME.md`](./THEME.md) for the default and precedence reference.
 6. On mobile, `mobile/src/theme/ThemeContext.js` exposes the converted palettes through
    `useThemePreference()` so NativeWind-powered components and bespoke views can read the active
    DaisyUI colours.

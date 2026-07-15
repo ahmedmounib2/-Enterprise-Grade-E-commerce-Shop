@@ -201,6 +201,21 @@ npm -w mobile run env:production
 > Whenever you edit a profile, restart Metro with `-c` (`npx expo start --tunnel -c`) to bust the
 > cache.
 
+#### First-launch theme defaults
+
+| Variable                    | Default  | Purpose                                                                     |
+| --------------------------- | -------- | --------------------------------------------------------------------------- |
+| `EXPO_PUBLIC_DEFAULT_THEME` | `native` | First-launch style theme (`native` = Native Storefront) when nothing saved. |
+| `EXPO_PUBLIC_DEFAULT_MODE`  | `light`  | First-launch appearance when nothing saved.                                 |
+
+These mirror the web `VITE_DEFAULT_THEME` / `VITE_DEFAULT_MODE` so both clients default to the
+Native Storefront theme in Light mode. They apply **only** when the user has no stored preference
+(mobile persists to Expo SecureStore), never override a saved choice, and are never auto-persisted.
+Because release bundles only expose variables declared in `app.config.js` `extra`, both keys are
+listed there and set per build profile in `eas.json` (`development` / `internal` / `production`).
+Precedence and the shared resolver (`src/config/env.js`, `src/theme/themePreferences.js`) are
+documented in [`docs/THEME.md`](../docs/THEME.md).
+
 #### Google Maps key (mobile checkout map)
 
 The mobile app holds **no** Google Maps key. There is intentionally no

@@ -373,6 +373,7 @@ Some screenshots and historical references may still contain the previous domain
     - [Mobile](#mobile)
   - [Demo credentials (web \& mobile)](#demo-credentials-web--mobile)
   - [Commercial Availability](#commercial-availability)
+  - [https://vexflare.com/licensing](#httpsvexflarecomlicensing)
   - [Additional documentation](#additional-documentation)
   - [Contact / commercial enquiries](#contact--commercial-enquiries)
 
@@ -1033,10 +1034,24 @@ split into seller UI behavior, backend review gating, and storefront policy rend
 #### Seller settings: editable fields & review gates
 
 Seller settings live in the seller dashboard’s **Store profile** page and are backed by the store
-profile API. The page (`SellerStoreSettings.jsx`) is organized into **five collapsible sections**,
+profile API. The page (`SellerStoreSettings.jsx`) is organized into **six collapsible sections**,
 built on a shared `CollapsibleSection` component:
 
 - **Store profile** — name, description, logo/banner, support contact, SEO tagline.
+- **Storefront theme** — template (classic / hero / minimal / showcase / boutique / startup / market
+  / editorial / mono / modern / sidebar), accent color, product layout (grid / list / masonry —
+  masonry staggers card heights deterministically per product), page width, sidebar position,
+  tagline, and hero/logo image uploads, with a **live in-dashboard preview** that renders the draft
+  settings (including not-yet-uploaded images via object URLs and the store's real products) before
+  anything is saved; a small "Open storefront" link opens the public page in a new tab
+  (`StorefrontThemeSection.jsx`, saved via `PUT /api/stores/:id/theme` into `Store.theme`; image
+  files upload on Save through the existing image pipeline; the preview and the public page share
+  `StorefrontHeader.jsx`, so both render the same templates, and the storefront defaults to the
+  classic design when unset). Behind the `FEATURE_STORE_THEMES` flag, sellers can also pick a
+  **DaisyUI theme + light/dark mode** for their public storefront (e.g. "Abyss (dark)") from the
+  same section — the live preview retints instantly, visitors see the seller's theme applied to the
+  whole storefront page (and can still flip light/dark with the navbar toggle), and their own site
+  theme is restored when they navigate away.
 - **Store categories** — up to 5 profile categories with optional descriptions.
 - **Store policies** — shipping and return/refund policy text.
 - **Shipping** — ship-from address, default rate, regional tiers, carrier configuration, and
@@ -1068,6 +1083,10 @@ approved content. Sellers see these fields **locked** while review is pending.
 - **Support email + support phone** (customer contact info).
 - **Profile categories** (up to 5 category tags + optional category descriptions).
 - **Branding object overrides** (theme/branding metadata stored under `branding`).
+- **Storefront theme settings** (template, accent color, layout, page width, sidebar, tagline —
+  presentation config stored under `Store.theme`, editable even while a policy review is pending;
+  the hero/logo image uploads inside the theme section still go through the reviewed logo/banner
+  fields above).
 
 These updates save immediately and do **not** require admin approval, unless a store review is
 already pending, in which case the same fields are temporarily locked to avoid conflicting edits.
@@ -1951,6 +1970,18 @@ Each catalogue ships with the full set of official DaisyUI themes (35 as of v5.3
 native palette. Every entry exposes both a light and dark variant so the navbar theme picker can
 switch between **36** options without fighting the existing appearance toggle.
 
+**Default theme & cross-platform consistency.** The out-of-the-box default on both web and mobile is
+the **Native Storefront** theme (id `native`) in **Light** mode, resolved through one shared
+precedence: _saved user preference → environment default → built-in fallback_. The default is set
+purely through environment variables — `VITE_DEFAULT_THEME` / `VITE_DEFAULT_MODE` on web and
+`EXPO_PUBLIC_DEFAULT_THEME` / `EXPO_PUBLIC_DEFAULT_MODE` on mobile (also declared in `eas.json` per
+build profile) — and only ever applies on a first launch with no saved preference; it never
+overrides an existing choice and is never auto-persisted. Web persists the base preference to
+`localStorage`, mobile to Expo SecureStore. A seller storefront can additionally override its own
+theme/mode while browsed (behind `FEATURE_STORE_THEMES`) without touching the visitor's saved
+preference. See [`docs/THEME.md`](docs/THEME.md) for the full precedence and configuration
+reference.
+
 **Adding a new DaisyUI theme**
 
 1. Duplicate an entry in `frontend/theme/daisyThemes.js` (or the mobile counterpart) within the
@@ -2393,16 +2424,42 @@ shared/auth/deepLinkValidator.js             extractResetParamsFromUrl() (scheme
 - **StorefrontScreen:** `mobile/src/screens/StorefrontScreen.js` (deep-link route `stores/:slug`)
   shows the store banner, logo, name, description, rating aggregate, top-level category cards with
   breadcrumb drill-down, store-scoped search bar, a 2-column product grid (FlatList), About section,
-  and a Policies modal. Registered in `AppNavigator.js`.
+  and a Policies modal. Registered in `AppNavigator.js`. Entering a store is a seller-owned moment:
+  because a storefront's layout is seller-configurable and cannot be meaningfully seeded, it holds
+  behind an intentional seller-branded loading state (`ScreenGate`) until the above-the-fold is
+  coherent, then reveals the complete store — never a half-assembled page (see below).
 - **Storefront link on ProductScreen:** `ProductScreen.js` shows the store logo and name below the
-  product title as a touchable that navigates to `StorefrontScreen` with the store slug.
+  product title as a touchable that navigates to `StorefrontScreen` with the store slug, prewarming
+  the store's data cache so the entrance is usually instant.
+- **Navigation UX & intelligent loading:** The app applies a single navigation language — _never
+  expose an unfinished interface_ — where each screen's loading strategy is chosen by its
+  **seedability** (how much of the first frame is derivable from data already in hand) rather than a
+  one-size-fits-all spinner or skeleton:
+  - **Strategy A — seeded-immediate** (Product, Wishlist, warm Home): the tapped card already
+    carries the hero image/title/price, so the screen paints complete on the first frame with no
+    loader.
+  - **Strategy B — branded gate** (Storefront): un-seedable, so it holds behind a seller-branded
+    cover and reveals atomically once coherent (data + above-the-fold images decoded).
+  - **Strategy B' — prepare-then-navigate** (Category): keeps the current grid on screen, prefetches
+    the next category, then pushes it already-complete — the smoothest browse, no placeholder.
+  - **Strategy C — continuous** (Search): never gates; keeps previous results and swaps in complete
+    result sets with inline activity.
+  - **B-lite region gates** cover the narrow cold paths (cold Home / cold deep-link).
+
+  Shared primitives live in `mobile/src/components/screen/` (`ScreenGate`, `useDestinationGate` with
+  an adaptive show-delay so fast/cached loads never flash a loader). **Intelligent caching**
+  underpins it: `storeApi`, `categoryApi` first-page cache, and the shared `statusesApi` snapshot
+  let revisits skip loaders entirely.
+
 - **Radial gradient background:** `ThemeRadialBackground` is applied as a full-screen overlay in
   `AppNavigator.js`, providing the emerald gradient that matches the web frontend across all
   screens.
-- **Theme cold-start safety:** `ThemeContext` defaults to `'light'` when `useColorScheme()` returns
-  `null` during cold start (common on deep-link launches) and adopts the real system scheme once
-  resolved. This prevents wrong theme colors from flashing before the system preference is
-  available.
+- **First-launch theme:** On launch the app resolves the saved theme preference (Expo SecureStore)
+  or, if none, the environment default — the **Native Storefront** theme in **Light** mode
+  (`EXPO_PUBLIC_DEFAULT_THEME` / `EXPO_PUBLIC_DEFAULT_MODE`) — _before_ mounting the theme provider,
+  so the correct palette is present on the first frame with no flash. The OS colour scheme is
+  followed only when neither a saved preference nor an environment default is set. This mirrors the
+  web precedence exactly (see [`docs/THEME.md`](docs/THEME.md)).
 - **Deep-link aware navigation:** Any email CTA (reset password, mailing confirmation, OAuth
   completion) can launch straight into the appropriate native screen thanks to the linking config
   described above.
@@ -9338,17 +9395,17 @@ client). Update or rotate as needed before sharing broadly.
 
 The Vexflare Marketplace Platform is commercially available through Vexflare Technologies.
 
-The platform is delivered as a professionally implemented marketplace solution under a perpetual commercial license.
+The platform is delivered as a professionally implemented marketplace solution under a perpetual
+commercial license.
 
-Implementation, licensing, ownership, and Managed Platform Support are described on the Vexflare website.
+Implementation, licensing, ownership, and Managed Platform Support are described on the Vexflare
+website.
 
 For commercial enquiries:
 
 <https://vexflare.com/services>
 
-<https://vexflare.com/licensing>
-
----
+## <https://vexflare.com/licensing>
 
 ## Additional documentation
 

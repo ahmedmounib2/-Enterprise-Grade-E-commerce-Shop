@@ -33,6 +33,41 @@ Both files share the same structure (`NATIVE_LIGHT_THEME`, `NATIVE_DARK_THEME`,
 `DEFAULT_STYLE_THEME_ID`, etc.). Copy the entire file from one platform to the other whenever you
 want the website and mobile app to use identical colors and fonts.
 
+## Default theme, mode & selection precedence
+
+Web and mobile resolve the active theme through the **same three-step precedence**, so both clients
+behave identically:
+
+1. **Saved user preference** — always wins. Web persists it to `localStorage`; mobile persists it to
+   Expo SecureStore (`mobile/src/theme/themePreferences.js`).
+2. **Environment default** — used only on a first launch when nothing is stored.
+3. **System / built-in fallback** — `DEFAULT_STYLE_THEME_ID` for the theme (which is the **Native
+   Storefront** palette, id `native`) and the OS colour scheme for the mode.
+
+The out-of-the-box default on both platforms is the **Native Storefront** theme in **Light** mode.
+This is set through environment variables — the only place the default is configured:
+
+| Concern | Web (`frontend/.env`)       | Mobile (`mobile/.env*` + `eas.json` per profile) |
+| ------- | --------------------------- | ------------------------------------------------ |
+| Theme   | `VITE_DEFAULT_THEME=native` | `EXPO_PUBLIC_DEFAULT_THEME=native`               |
+| Mode    | `VITE_DEFAULT_MODE=light`   | `EXPO_PUBLIC_DEFAULT_MODE=light`                 |
+
+Mobile also declares both keys in `mobile/app.config.js` `extra` so release bundles expose them
+(`Constants.expoConfig.extra`), read through the shared `mobile/src/config/env.js` helper.
+
+Two invariants hold on both platforms: the environment default **never overrides an existing saved
+preference**, and it is **never auto-persisted** — it is re-evaluated on every launch until the user
+makes an explicit choice, which is what gets stored. Changing the default is therefore a pure
+configuration change (edit the env value); it affects only fresh installs with no saved preference.
+
+### Seller storefront theme override
+
+Behind the `FEATURE_STORE_THEMES` flag, a seller can force their storefront's own DaisyUI theme +
+mode while a visitor browses that store. This is a temporary **override layer** on top of the base
+preference: the visitor's saved theme is untouched and is restored when they leave the storefront.
+Screens must never use `setTheme`/`setStyleTheme` for this — those mutate (and persist) the base
+preference; the override APIs (`setThemeOverride`/`clearThemeOverride`) exist for it instead.
+
 ## Editing the palette
 
 1. Open the platform-specific `themeTokens.js` file.

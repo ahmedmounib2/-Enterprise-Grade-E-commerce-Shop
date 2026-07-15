@@ -130,7 +130,17 @@ repo root
 - **HTTP:** Same `@eshop/api-client` as frontend; base URL from `EXPO_PUBLIC_API_BASE_URL`.
 - **Theme:** Palette generated from `shared/theme/daisyThemes.js` via
   `mobile/scripts/build-mobile-theme.mjs` (output: `mobile/src/theme/generated/`). Run
-  `npm run prepare:theme` after any theme change. Never edit generated files directly.
+  `npm run prepare:theme` after any theme change. Never edit generated files directly. First-launch
+  default (both platforms): the **Native Storefront** theme (`native`) in Light mode, via
+  `EXPO_PUBLIC_DEFAULT_THEME` / `EXPO_PUBLIC_DEFAULT_MODE`. Precedence: saved preference (Expo
+  SecureStore, `src/theme/themePreferences.js`) → env default → `DEFAULT_STYLE_THEME_ID`. Env is
+  read through `src/config/env.js`. Full reference: `docs/THEME.md`.
+- **Navigation UX language:** Loading strategy is chosen per screen by seedability — Strategy A
+  (seeded-immediate: Product/Wishlist/warm Home), B (branded gate: Storefront), B' (prepare-then-
+  navigate: Category), C (continuous: Search) — goal is "never expose an unfinished interface."
+  Shared primitives in `src/components/screen/` (`ScreenGate`, `useDestinationGate`); caching via
+  `storeApi`, `categoryApi`, `statusesApi`. Do NOT reintroduce skeleton overlays (the retired
+  `PreparedScreen`).
 - **i18n:** Same `@eshop/locales` package as frontend, same 4 locales.
 - **Env files:** Multiple env profiles (`emu`, `lan`, `tunnel`, `production`). Switch with
   `npm run env:<profile>` before starting.
