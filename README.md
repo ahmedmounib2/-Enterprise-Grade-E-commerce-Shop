@@ -4596,8 +4596,15 @@ The platform uses a **signed double-entry ledger** where `amountCents > 0` is a 
 merchant-scoped row and a platform/operator-scoped mirror — so both sides of each transaction are
 always on record.
 
-- A JournalEntry model (feature-flagged via `JOURNAL_LEDGER_ENABLED`) groups each transaction's
-  postings into a single balanced document for audit and review.
+- A JournalEntry shadow ledger (feature-flagged via `JOURNAL_LEDGER_ENABLED`) dual-writes each
+  financial **event** — not each order — as a single balanced double-entry document over a chart of
+  accounts (Cash, Seller_Payable, Reserve, Platform_Revenue, …), posted post-commit with
+  `journal:`-prefixed idempotency keys so a lost write self-heals on replay. A typical prepaid order
+  is touched by ~6 entries across its lifecycle (fee estimate + recovery + sale, then the shared
+  settlement withhold, reserve release, and payout events). The admin **Journal Entries** tab
+  renders one row per event with order/batch/seller scope badges, an order-lifecycle timeline, and a
+  per-account mini trial balance; a daily invariant monitor sweeps the same postings for
+  account-level corruption. Full design reference: `docs/settlements-runbook.md` §16.
 
 **Entry type reference**
 
@@ -5418,6 +5425,15 @@ Core files:
 - `reserve_release` (positive): funds released back to payout flow
 - `reserve_used` (negative): reserve consumed to offset refund/debt
 
+**Release semantics (terminal flip + operation-identity keys).** When the scheduled release job
+returns a month's reserve, the withheld `reserve` rows are flipped to the terminal
+`payoutStatus: 'released'` (with `releasedAt`) so they can never be counted or re-released again,
+and the release's idempotency key identifies the operation — seller, currency, month, and a hash of
+the exact rows released — never the amount. This closed a compounding re-release defect found in the
+July 2026 finance audit; a companion sweep in the payout-retry job also expires payouts stuck in
+`scheduled` beyond `SETTLEMENT_PAYOUT_EXPIRE_SCHEDULED_HOURS` (default 72 h) by executing them or
+escalating to `manual_required`.
+
 Reserve tracking fields:
 
 - `reserveMonth` (`YYYY-MM`)
@@ -5864,6 +5880,14 @@ Supported workflows:
 - `reserve_discrepancy`: gross mismatch explained by reserve withholding math while net payout
   remains consistent.
 - `hard_mismatch`: material state/amount mismatch requiring operator investigation. and Stripe.
+
+**Companion monitors.** Two daily crons complement reconciliation: the **financial invariant
+monitor** sweeps the JournalEntry shadow ledger for account-level corruption that per-entry balance
+checks cannot see (positive per-seller Reserve balances, Seller*Payable drift vs the flat ledger,
+Cash mismatches vs a cross-source reconstruction, duplicate journal idempotency keys), and the **job
+heartbeat watchdog** alerts when any finance cron has not completed successfully within its expected
+interval (`HEARTBEAT*\*\_INTERVAL_MINUTES`). Both log with `alert:
+true`and email the reconciliation ops recipients; see`docs/settlements-runbook.md` §15.
 
 #### 1) Reconciliation Architecture (Backend)
 
