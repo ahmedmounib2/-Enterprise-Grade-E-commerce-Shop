@@ -107,9 +107,9 @@ flag and all financial rows are always consistent.
      `SETTLEMENT_PERIOD_DAYS`/`SETTLEMENT_HOLD_DAYS` change could otherwise create a second batch
      over an already-settled calendar range. Before creating a batch, the scheduler checks for ANY
      existing batch (same currency, configHash ignored) whose period overlaps the computed one and
-     skips the cycle with `created: false, reason: 'overlapping_period'` plus a warning log. After
-     a config change, wait until the new config's next computed window clears the last settled
-     period (or reverse the conflicting batches) before expecting a new batch.
+     skips the cycle with `created: false, reason: 'overlapping_period'` plus a warning log. After a
+     config change, wait until the new config's next computed window clears the last settled period
+     (or reverse the conflicting batches) before expecting a new batch.
 
 ---
 
@@ -952,13 +952,14 @@ manufacturing seller credit. Checks, per seller/currency where applicable:
   ledger's outstanding payout-eligible rows (`pending` + `scheduled`), beyond
   `INVARIANT_SELLER_PAYABLE_TOLERANCE_CENTS` (default 100).
 - **`cash_position_mismatch` (high):** journal `Cash` per currency vs a reconstruction from
-  independent sources: delivered prepaid order totals − refunds − processor fees − paid payouts −
-  tax remittances − shipping label costs. v1 limitations: COD cash flows and payout reversals are
-  outside the reconstruction (COD sale journals post no Cash, so prepaid-only keeps the comparison
-  symmetric; an unre-executed payout reversal will surface here). NOTE: until the processor-fee
-  recovery journal mapping (audit finding M-1) is fixed and historical data cleaned, this check is
-  EXPECTED to alert with a delta of ~1,016 cents per prepaid order — that is the M-1 misstatement
-  being detected, not a false positive.
+  independent sources: delivered prepaid order totals (full `order.totalAmount`, i.e.
+  merch+tax+shipping) − refunds − processor fees − paid payouts − tax remittances − shipping label
+  costs. v1 limitations: COD cash flows and payout reversals are outside the reconstruction (COD
+  sale journals post no Cash, so prepaid-only keeps the comparison symmetric; an unre-executed
+  payout reversal will surface here). The processor-fee recovery journal mapping (audit finding
+  M-1), `buildSaleJournal`'s Cash debit, and `buildRefundJournal`'s Cash credit (both previously
+  excluding tax and platform-retained shipping from Cash) have all been fixed — this check should
+  report zero findings for correctly posted orders, including after a full refund.
 - **`duplicate_idempotency_key` (critical):** duplicate JournalEntry idempotency keys — the guard
   against unique-index drift.
 

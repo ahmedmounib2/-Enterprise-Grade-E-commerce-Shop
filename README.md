@@ -2449,7 +2449,18 @@ shared/auth/deepLinkValidator.js             extractResetParamsFromUrl() (scheme
   Shared primitives live in `mobile/src/components/screen/` (`ScreenGate`, `useDestinationGate` with
   an adaptive show-delay so fast/cached loads never flash a loader). **Intelligent caching**
   underpins it: `storeApi`, `categoryApi` first-page cache, and the shared `statusesApi` snapshot
-  let revisits skip loaders entirely.
+  let revisits skip loaders entirely. `statusesApi.js`'s cache backs every consumer of the Best
+  Seller/New Release/Today's Deal buckets — Home, Category, Storefront, Product's related carousels,
+  the dedicated Best/New/Deals screens, and `ProductsScreen.js`'s status-filtered list — so none of
+  them re-hit `/products/statuses` within the same 5-minute window. Every one of these screens seeds
+  its bucket state from the cache in a `useState` lazy initializer (not a plain `[]`/`true`
+  default), so a warm cache renders the carousel on the very first frame —
+  `loadFeatured`/`loadBuckets`/ `loadStatuses` only flip their own loading flag when there's
+  genuinely nothing cached yet, never unconditionally, which is what makes a revisit skip the
+  skeleton entirely instead of flashing it before the (identical) cached data reappears. Cart's own
+  recommendation row — `PeopleAlsoBought.js` + `peopleAlsoBoughtCache.js`, same same-seller →
+  same-category → marketplace-random hierarchy and cache shape as web's `peopleAlsoBoughtCache.js` —
+  follows the same rule.
 
 - **Radial gradient background:** `ThemeRadialBackground` is applied as a full-screen overlay in
   `AppNavigator.js`, providing the emerald gradient that matches the web frontend across all
@@ -3421,9 +3432,13 @@ endpoints.
   (`POST /api/admin/orders/:id/refund/approve` with `items[]`). **Seller scoping:** a seller may
   refund only the items they sold; a multi-seller COD return must be approved by an admin (one COD
   payout goes to the customer). Sellers cannot initiate refunds — only approve customer requests.
-- **Shipping:** not refunded on partials by default. It is included only when the return reason is
-  eligible (`refundShippingEligible`, e.g. defective/wrong item) or an admin passes
-  `refundShipping=true`; **never for COD partials**.
+- **Shipping:** shipping is never refunded on partial returns — not for any return reason, not for
+  any order state; the return reason's `refundShippingEligible` policy flag only matters for a full
+  order return, never a partial one. The only exception is an explicit admin override
+  (`refundShipping=true` on the admin approval endpoint); this override does not exist on the seller
+  or customer paths. Full order returns still refund shipping automatically (matches
+  Amazon/eBay/Walmart practice — the carrier cost was already incurred). **Never for COD partials**,
+  even with the admin override.
 - **Stripe vs COD:** Stripe issues a partial Refund for the computed amount; COD pays the customer
   via the payout workflow and debits each seller through the ledger (`cod_refund_reimbursement`).
   Concurrency/idempotency: per-order refund lock + unique `idempotencyKey` + remaining-quantity
@@ -4605,6 +4620,9 @@ always on record.
   renders one row per event with order/batch/seller scope badges, an order-lifecycle timeline, and a
   per-account mini trial balance; a daily invariant monitor sweeps the same postings for
   account-level corruption. Full design reference: `docs/settlements-runbook.md` §16.
+- The sale and refund journals debit/credit `Cash` for the full amount the customer actually paid or
+  was refunded — merchandise, tax, and platform-retained shipping alike — so `Cash` always matches
+  real-world money movement rather than the merchandise subtotal alone.
 
 **Entry type reference**
 
@@ -6456,6 +6474,45 @@ the frontend.
   that routes directly to leaf categories and expands non-leaf nodes on row click (flag off keeps
   the legacy
   menu).【F:frontend/src/components/Navbar.jsx†L1-L130】【F:frontend/src/components/nav/NavAllMenuV2.jsx†L1-L138】
+- **Recommendation datasets are cached, product details never are.** Every browsing surface that
+  shows a _recommendation list_ (Featured, Best Sellers, New Releases, Today's Deals, Storefront's
+  own carousels, Cart's "People Also Bought") reads from a short-TTL (5 minutes — recommendation
+  flags change rarely, and mutations invalidate proactively, so the TTL is a fallback bound, not the
+  primary freshness mechanism) in-memory cache and refreshes silently on expiry/context-change
+  instead of blinking a spinner on every visit — a single `/product/:slug` page load itself always
+  hits the network fresh (price, stock, ratings, availability must never be served stale). Every
+  cache-consuming component seeds its initial render state synchronously from the cache (lazy
+  `useState` initializer, or a `useLayoutEffect` synchronous check on `ProductPage.jsx` where the
+  seller isn't known until the always-fresh product fetch resolves) so a warm cache never shows a
+  loading frame — only a genuine cache miss shows one. Web caches live in `useProductStore.js`
+  (`fetchFeaturedProducts`/`isFeaturedFresh` for Featured; `fetchStatusLists`/`isStatusListsFresh`
+  for the combined Best-Seller/New-Release/Today's-Deal buckets via `GET /products/statuses` — one
+  shared cached call used by both `HomePage.jsx` and `CategoryPage.jsx`, replacing Home's previous 3
+  separate uncached requests), `storefrontCache.js` (a storefront's own product list + seller-scoped
+  status carousels shown on `StorefrontPage.jsx`/`ProductPage.jsx`, keyed by store slug), and
+  `peopleAlsoBoughtCache.js` (Cart's same-seller → same-category → marketplace-random hierarchy,
+  keyed by seller + category + cart contents, so reopening the cart in the same session doesn't
+  refetch). Mobile mirrors this exactly: `statusesApi.js` and `featuredApi.js` back Home, Category,
+  Storefront, Product, and the dedicated Best/New/Deals screens (including `ProductsScreen.js`'s
+  status-filtered list); `storeApi.js` backs Storefront/Product's seller-scoped carousels; and
+  mobile's own `peopleAlsoBoughtCache.js` + `PeopleAlsoBought.js` back the Cart tab with the
+  identical hierarchy — Web and Mobile intentionally never diverge on which datasets are cached, for
+  how long, or on the same-seller → same-category → marketplace-random fallback order. Full
+  reference (cache-by-cache TTLs, invalidation rules, seeding pattern):
+  `docs/CACHE_ARCHITECTURE.md`.
+- **GET endpoints never invalidate caches — only mutations do.** Cache invalidation
+  (`safeClearFeaturedCache()`, exported from `backend/src/lib/cache/featuredCache.js` and shared
+  across `product.controller.js`, `seller.products.controller.js`,
+  `admin.moderation.products.controller.js`, and `store.controller.js`) is wired exclusively into
+  mutations that can change the featured/best-seller/new-release/todays-deal lists: product
+  create/edit/field-update/delete (`POST`/`PUT`/`PATCH`/`DELETE`), admin product
+  approve/reject/request-changes, the seller's own field-update endpoint, and a store-wide
+  visibility flip (`updateStoreStatus`, which bulk-hides/unhides every one of that store's
+  products). Read-only endpoints like `getRecommendedProducts` and `refreshProductStocks` must not
+  clear the `featured_products` cache as a side effect of being called, and a mutation invalidates
+  only when it actually touches a field that affects the featured query (`isFeatured`/`hidden`/
+  `stock`/`status`) — price and deal changes, and a store's policy-review status (`reviewStore`,
+  which never gates product visibility), correctly do not invalidate anything.
 
 ---
 
@@ -9473,6 +9530,10 @@ Extra reference material that complements this README:
 - [`docs/DAISYUI-THEME.md`](docs/DAISYUI-THEME.md) — shared DaisyUI theming internals for web and
   mobile.
 - [`docs/THEME.md`](docs/THEME.md) — native token architecture for both platforms.
+- [`docs/CACHE_ARCHITECTURE.md`](docs/CACHE_ARCHITECTURE.md) — recommendation-dataset caching
+  reference for web and mobile: cache-by-cache TTLs, the seeding pattern that keeps a warm cache
+  from ever showing a loading frame, the mutation-invalidation rules (and what's deliberately
+  excluded from them), and exactly which datasets are intentionally never cached.
 - [`docs/deployment.md`](docs/deployment.md) — release runbook covering frontend, backend, and
   mobile rollouts for coordinated multi-person deploys.
 - [`docs/security/access-controls.md`](docs/security/access-controls.md) — account provisioning and

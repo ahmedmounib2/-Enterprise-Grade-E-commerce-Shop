@@ -118,8 +118,15 @@ cd mobile
 npx expo start --clear &
 sleep 5 && kill %1   # Start Metro to clear its cache, then stop it
 
+cd android
+./gradlew --stop                     # stop any lingering Gradle daemon
+./gradlew cleanBuildCache            # wipe the project-level build cache
+cd ..
+rm -rf android/.gradle android/build # remove leftover build outputs
+
+# Re-run prebuild and build
 APP_VARIANT=production npx expo prebuild --platform android --clean
-cd android && ./gradlew clean bundleRelease
+cd android && ./gradlew bundleRelease
 # output: app/build/outputs/bundle/release/app-release.aab
 ```
 
@@ -188,7 +195,11 @@ eas update --channel production --message "fix: <describe the fix>"
 ```
 
 Verify the update appears in the Expo dashboard, then relaunch the app on a device on that channel —
-it downloads and applies on the next launch (the launch-time hook in `src/hooks/useOTAUpdates.js`).
+the launch-time hook (`src/hooks/useOtaUpdates.js` → `src/ota/otaService.js`) checks on cold launch
+and either applies it seamlessly during the launch gate or surfaces an "Update ready" banner. On
+dev/internal builds, open the `ota-debug` deep link (e.g. `vexflare-internal://ota-debug`) to
+inspect the running channel / runtimeVersion / updateId and the stage log if an update never
+applies. See `docs/deployment.md` for the full OTA flow and diagnostic runbook.
 
 **Rollback:**
 
@@ -217,11 +228,16 @@ When you need a rollback:
 > the version in `app.config.js`, you must do a fresh store build before OTA updates resume. OTAs
 > cannot change native code — for native changes, use `eas build`.
 
-> **First build per channel must be on EAS.** The very first build for a given channel (e.g.,
-> `internal` or `production`) must run on EAS (`eas build`) to create the update branch on Expo's
-> servers. After that first EAS build, the branch exists permanently. Subsequent builds — whether on
-> EAS or built locally with `expo prebuild` + `./gradlew` — will receive OTA updates automatically
-> on that channel.
+> **First build per channel must be on EAS; after that, local builds work too.** The
+> `expo-channel-name` request header is what maps a binary to its update branch. `app.config.js` now
+> injects it at prebuild time via `updates.requestHeaders`, keyed off `APP_VARIANT` (`production` →
+> `production`, `internal` → `internal`, `development` → none), so a local `APP_VARIANT=production`
+> / `APP_VARIANT=internal` build carries its channel and receives OTAs — not EAS-only. But the
+> **first** build for a brand-new channel must still run on EAS (`eas build`) — or the channel be
+> created via the EAS CLI — to create the channel↔branch mapping on Expo's servers, since a purely
+> local build never contacts them. Once the channel exists (as `production` and `internal` do),
+> subsequent local builds on it receive updates automatically. (Before this fix, local builds
+> omitted the channel entirely and silently received no OTAs — the 2026-07 incident.)
 
 ---
 

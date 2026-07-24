@@ -107,7 +107,19 @@ your local `.env` (`npm -w mobile run env:tunnel`).
 OTA matching is governed by `runtimeVersion` (policy `appVersion`), so an OTA only reaches builds
 sharing the same `version` string. Bumping `version` requires a fresh store build before OTA resumes
 — intentional, prevents a JS bundle running against incompatible native code. The launch-time
-check/fetch/reload is owned by `mobile/src/hooks/useOTAUpdates.js` (native auto-check is `NEVER`).
+check/fetch/reload is owned by `mobile/src/hooks/useOtaUpdates.js` (native auto-check is `NEVER`;
+the imperative engine lives in `mobile/src/ota/otaService.js`).
+
+**Launch flow.** On cold launch the hook runs while `App.js` is still showing its pre-mount
+placeholder: it checks for an update (time-boxed to ~2.5 s, and the whole launch OTA phase is
+hard-capped at ~4 s so a slow network never wedges startup). If an update downloads inside that
+window it is applied seamlessly with `reloadAsync()` before the first frame. If the window has
+already passed, the update downloads in the background and a themed **"A new version is ready"**
+banner (`OtaUpdateBanner`) invites the user to apply it. A user-triggered reload is suppressed while
+the user is in a reload-unsafe screen (checkout, payment, auth, disputes, profile edit — see
+`CRITICAL_ROUTES` in `mobile/src/stores/useOtaStore.js`), so unsaved work is never destroyed. A
+best-effort rollback marker (Expo SecureStore) lets the next launch log whether an applied update
+actually stuck.
 
 ### SSL certificate pinning
 
@@ -191,11 +203,60 @@ When you need a rollback:
 > the version in `app.config.js`, you must do a fresh store build before OTA updates resume. OTAs
 > cannot change native code — for native changes, use `eas build`.
 
-> **First build per channel must be on EAS.** The very first build for a given channel (e.g.,
-> `internal` or `production`) must run on EAS (`eas build`) to create the update branch on Expo's
-> servers. After that first EAS build, the branch exists permanently. Subsequent builds — whether on
-> EAS or built locally with `expo prebuild` + `./gradlew` — will receive OTA updates automatically
-> on that channel.
+> **Local internal/production builds now receive OTAs — but the first build on a channel must still
+> be EAS.** The channel (`expo-channel-name` request header) is what maps a binary to its update
+> branch. EAS Build injects it automatically; a plain local `expo prebuild` + `./gradlew` build used
+> to omit it, so locally-built binaries had `Updates.channel = null` and never received
+> channel-scoped OTAs (the confirmed root cause of the 2026-07 "OTA never applies" incident —
+> v1.51.0 on the Play Store was built locally with no `production` channel). This is now fixed:
+> `mobile/app.config.js` declares `updates.requestHeaders: { 'expo-channel-name': <channel> }` keyed
+> off `APP_VARIANT` (`production` → `production`, `internal` → `internal`, `development` → none), so
+> `expo prebuild` bakes the channel into local builds too. A local `APP_VARIANT=production` /
+> `APP_VARIANT=internal` build therefore receives OTAs on its channel.
+>
+> The **first** build for a brand-new channel must still run on EAS (`eas build`) — or the channel/
+> branch must be created via the EAS CLI (`eas channel:create` / `eas update`) — because a purely
+> local build never contacts Expo's servers and so cannot create the channel↔branch mapping. Once
+> that mapping exists (as it does for `production` and `internal`), subsequent local builds on that
+> channel receive updates. Development builds stay channel-less and never attempt OTA.
+
+### OTA diagnostics — "an update was published but never applies"
+
+`eas update:list --branch <name>` showing an update proves it exists on the **branch**, but the app
+requests updates by **channel** and `runtimeVersion`. Work the pipeline outside-in — the most common
+causes are server-side (channel↔branch mapping) or a build-identity mismatch, not the client code.
+
+Step 1 — zero-code checks (no build needed):
+
+```bash
+eas update:list --branch production --json   # latest update's runtimeVersion == the build's (1.51.0)? platforms include yours? isRollBackToEmbedded false?
+eas channel:view production                    # is channel `production` linked to the branch that holds the update?  <-- most common cause
+eas branch:view production                     # updates actually present on this branch?
+eas build:list --platform android --limit 5    # did the installed build come from `--profile production` (channel production, runtimeVersion 1.51.0)? not a local `expo export`?
+adb logcat | grep -iE 'expo-updates|EXUpdates' # cold-launch the app; the native module logs its fetch/skip decision
+```
+
+A missing/wrong channel→branch mapping, a runtimeVersion/platform mismatch, or an update that was
+only ever produced by a local `expo export` (never `eas update`-published) will each make the client
+correctly find "no update available."
+
+Step 2 — reproduce on an internal build (the client is instrumented there):
+
+The OTA Debug surface is compiled only into dev/internal builds (`isOtaDebugEnabled` =
+`__DEV__ || Updates.channel !== 'production'`); production stays silent. To inspect the exact client
+code path, publish the same update to `internal` and open the debug screen:
+
+```bash
+eas update --channel internal --message "ota diag"
+# install the internal build, then open the deep link:
+#   vexflare-internal://ota-debug
+```
+
+The screen shows the running `channel`, `runtimeVersion`, `updateId`, `isEmbeddedLaunch`,
+`isEnabled`, and a live stage log
+(`checking → available/none/checkError → downloading → downloaded → reloading → rollbackDetected/updateApplied`).
+The manual **Check / Download / Reload** buttons surface the real `checkError`/`downloadError` that
+the old flow used to swallow. Whatever fails here fails identically on production.
 
 ### Manual build (local fallback)
 
@@ -239,6 +300,12 @@ adb install -r app/build/outputs/apk/release/app-release.apk
 > application ID comes from `APP_VARIANT`. Missing `ESHOP_ANDROID_*` on a release build fails fast
 > with a clear error (never an unsigned build). See `mobile/docs/android-release-play-store.md` and
 > `mobile/docs/build-and-install.md` for device install and signing details.
+
+> **OTA on local builds:** because `app.config.js` now injects `updates.requestHeaders`
+> (`expo-channel-name`) keyed off `APP_VARIANT`, a local `APP_VARIANT=production` or
+> `APP_VARIANT=internal` build carries its channel and **does** receive OTA updates — no longer
+> EAS-only (as long as that channel already exists on Expo's servers; see the note in the OTA
+> section above). `APP_VARIANT=development` builds carry no channel and never attempt OTA.
 
 ---
 
