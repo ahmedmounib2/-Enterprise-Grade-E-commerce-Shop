@@ -450,12 +450,103 @@ Troubleshooting stuck pending refunds:
 2. Run/inspect reconciliation output for stale `in_progress` records.
 3. If unresolved, keep payout hold active and route to manual review before any new payout attempt.
 
+### Responding to a webhook failure alert
+
+Handlers answer `500` when a failure is transient, infrastructural, or a bug, so Stripe redelivers
+with backoff for up to three days. A `500` is therefore a request for another attempt, not
+necessarily an incident — but a _sustained_ one is, because Stripe can disable an endpoint that
+keeps failing.
+
+Triage order:
+
+1. **Check the Stripe dashboard delivery history** for the event type (Developers → Webhooks →
+   endpoint → event). It shows every attempt and our response body, and is the durable record of
+   what was delivered — the Redis idempotency keys expire (24 h for refunds, 7 days for account and
+   dispute events) and are not an audit trail.
+2. **Find the matching Sentry event.** Handler catches forward the `Error` itself, so the stack is
+   attached; search on the event id, which every webhook log line carries.
+3. **Decide whether it will self-heal.** If the cause was transient (a cache or database blip), the
+   next retry succeeds and no action is needed — confirm by re-checking the delivery history. If it
+   is deterministic, it will keep failing until a fix is deployed; ship the fix and Stripe
+   redelivers within the retry window.
+4. **If the window has expired**, resend manually from the dashboard. Every handler is replay-safe,
+   so a manual resend of an already-processed event is a no-op.
+
+A `200` accompanied by an error log with `alert: true` means the opposite: the event will **not** be
+retried because retrying cannot help. The usual case is `checkout.session.completed` arriving for an
+order the cancel or expiry handler already deleted. That indicates a real inconsistency and needs
+investigating by hand — Stripe will not deliver it again.
+
+### Durable webhook event store
+
+Every delivery is persisted to the `WebhookEvent` collection before processing, so the platform —
+not just the Stripe dashboard — is a system of record for delivery outcomes.
+
+Operators triage from **Admin → System → Webhook Events** (beside Job Health). The panel shows the
+health counters, filtering by status, type, date and entity search, paged sortable history,
+per-event lifecycle and error detail, and single or bulk replay behind a confirmation.
+
+The same data is available directly from the admin API (all routes admin-only):
+
+```
+GET  /api/admin/webhook-events/stats                  counts, stuck, recent + permanent failures
+GET  /api/admin/webhook-events?status=permanent_failure   what needs a human decision
+GET  /api/admin/webhook-events?status=failed          currently retrying
+GET  /api/admin/webhook-events/:stripeEventId         full record incl. stored payload
+POST /api/admin/webhook-events/:stripeEventId/replay  reopen and re-dispatch
+POST /api/admin/webhook-events/replay-bulk            replay up to 25 (sequential)
+```
+
+Status meanings:
+
+| Status              | Meaning                                 | Action                            |
+| ------------------- | --------------------------------------- | --------------------------------- |
+| `processing`        | In flight                               | None, unless stuck (below)        |
+| `processed`         | Settled                                 | None                              |
+| `failed`            | Retryable; Stripe will redeliver        | Watch; self-heals if transient    |
+| `permanent_failure` | Terminal; Stripe will **not** redeliver | Investigate, then replay if fixed |
+
+**Stuck events.** A record left `processing` past `WEBHOOK_STALE_PROCESSING_MS` (default 5 min)
+means a worker died holding it. These are re-claimable automatically — the next delivery or replay
+picks them up — so the alert is a signal that handlers are crashing, not a repair task. Repeated
+stuck events warrant a look at Sentry for the underlying crash.
+
+**Replaying.** Replay re-dispatches the stored payload through the same path a live delivery takes,
+so it is safe against an already-processed event. It is refused with `409 payload_discarded` once
+retention has dropped the payload (30 days by default) — after that, resend from the Stripe
+dashboard instead, if the event is still inside Stripe's own retention.
+
+**Alert thresholds** (`webhook_event_maintenance`, hourly): any stuck event, any
+`permanent_failure`, or `WEBHOOK_FAILURE_ALERT_THRESHOLD` (default 10) failures in the last hour.
+The job reports through `JobHealth`, so the heartbeat monitor notices if it stops running.
+
+### Webhook store environment variables
+
+| Variable                                | Default      | Purpose                                         |
+| --------------------------------------- | ------------ | ----------------------------------------------- |
+| `WEBHOOK_EVENT_MAINTENANCE_ENABLED`     | `true`       | Master switch for the hourly maintenance job    |
+| `WEBHOOK_EVENT_MAINTENANCE_CRON`        | `17 * * * *` | Schedule                                        |
+| `WEBHOOK_EVENT_MAINTENANCE_RUN_ON_BOOT` | `false`      | Run one cycle at startup (lock-guarded)         |
+| `WEBHOOK_STALE_PROCESSING_MS`           | `300000`     | When a `processing` record becomes re-claimable |
+| `WEBHOOK_PROCESSED_RETENTION_DAYS`      | `30`         | Delete settled records after                    |
+| `WEBHOOK_FAILURE_RETENTION_DAYS`        | `180`        | Delete failure records after                    |
+| `WEBHOOK_PAYLOAD_RETENTION_DAYS`        | `30`         | Discard stored payloads after (record kept)     |
+| `WEBHOOK_STUCK_ALERT_THRESHOLD`         | `1`          | Stuck events before alerting                    |
+| `WEBHOOK_FAILURE_ALERT_THRESHOLD`       | `10`         | Hourly failures before alerting                 |
+| `WEBHOOK_PERMANENT_ALERT_THRESHOLD`     | `1`          | Permanent failures before alerting              |
+
+**Resolved — the stale idempotency claim.** Earlier versions kept idempotency in per-handler Redis
+keys whose release was best-effort, so a Redis flap between claim and release could strand an event
+permanently. The durable `WebhookEvent` record replaced that: re-claimability is explicit state, and
+a record left `processing` becomes re-claimable on a bounded timer rather than depending on a cache
+delete succeeding.
+
 ### Stripe refund lifecycle
 
 Stripe `refund.updated` events are processed by a dedicated webhook handler:
 
-- **Idempotency key:** `processed_refund_updated_event:{event.id}` stored in Redis. Duplicate event
-  deliveries are discarded without re-processing.
+- **Idempotency:** the durable `WebhookEvent` claim taken before dispatch. Duplicate deliveries find
+  a terminal record and are acknowledged without re-processing.
 - **On `succeeded`:**
   - Marks the refund record `completed`.
   - Updates the order status.

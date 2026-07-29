@@ -175,7 +175,12 @@ Some screenshots and historical references may still contain the previous domain
   - [New environment variables (shipping, tax, address \& resilience)](#new-environment-variables-shipping-tax-address--resilience)
   - [Payment \& order flow (detailed)](#payment--order-flow-detailed)
     - [Checkout (Stripe) flow — `createCheckoutSession`](#checkout-stripe-flow--createcheckoutsession)
+    - [Cart consumption after payment](#cart-consumption-after-payment)
     - [Stripe webhooks \& async handling — `stripeWebhook`](#stripe-webhooks--async-handling--stripewebhook)
+    - [Webhook failure semantics](#webhook-failure-semantics)
+    - [Durable webhook event store](#durable-webhook-event-store)
+      - [Admin API](#admin-api)
+      - [Admin interface](#admin-interface)
     - [COD flow (Cash-on-Delivery) — `createCODOrder` \& `codCheckoutSuccess`](#cod-flow-cash-on-delivery--createcodorder--codcheckoutsuccess)
     - [COD eligibility policy, seller financial summary, and recovery path](#cod-eligibility-policy-seller-financial-summary-and-recovery-path)
     - [Return request + COD refund workflow](#return-request--cod-refund-workflow)
@@ -526,6 +531,14 @@ npm -w frontend run build       # production build for Vercel
 npm -w mobile run android       # rebuild/install the custom dev client (native changes)
 npm -w mobile run start:local   # Metro bound to localhost (Android emulator)
 npm -w mobile run start:lan     # Metro on LAN (update HOSTNAME env in package.json first)
+```
+
+Architecture-page maintenance (repo root):
+
+```bash
+npm run test:architecture       # full integrity suite: diagrams, TOC, cross-refs, metrics
+npm run architecture:diagrams   # Mermaid parsing only (fast)
+npm run architecture:metrics    # re-measure the test/coverage figures the page advertises (slow)
 ```
 
 ### Environment references
@@ -3121,11 +3134,14 @@ This section explains the exact runtime flow implemented by the backend payment 
    - Rejects carts that span more than one store with HTTP 400. Multi-store checkout is
      intentionally blocked; customers must complete a separate checkout per store.
 
-2. **Cart backup & fallback**
-   - Saves a `cart_backup:<userId>` key in Redis (TTL) so the server can recover cart if the client
-     drops off.
-   - Creates an `order_fallback:<orderId>` Redis key after creating the order — used as a fallback
-     to restore reservations if Stripe session expires.
+2. **The cart is left alone**
+   - `createCheckoutSession` never touches `User.cartItems`. The cart survives an abandoned checkout
+     by construction, so there is no snapshot to take and no restore step: a customer who leaves the
+     Stripe page and comes back simply re-reads the same server-side cart through `GET /api/cart`.
+   - The cart is only ever reduced after payment is confirmed, and then line by line rather than
+     wholesale — see "Cart consumption after payment" below.
+   - What does need unwinding is the reserved stock and the pending order — both keyed by order id,
+     not by cart. See the expiry and cancel handlers below.
 
 3. **Order creation (DB transaction)**
    - Loads product metadata (name, price, deal, images, variants) from MongoDB.
@@ -3135,21 +3151,26 @@ This section explains the exact runtime flow implemented by the backend payment 
 
 4. **Stock reservation**
    - For each order item, calls `reserveStock(productId, quantity, orderId, variantAttributes)`.
-   - Reservation logic:
-     - Writes a Redis reservation key `stock_reservation:<productId>:<orderId>:<variantKey>` with
-       TTL (e.g., 30 minutes).
-     - Starts a MongoDB session + transaction and decrements the product or matched variant stock
-       atomically.
-     - Commits transaction only if decrement succeeds; otherwise aborts and errors bubble back to
-       the checkout flow.
+   - Reservation logic, in this order:
+     - Starts a MongoDB session + transaction and decrements the product or matched variant stock,
+       committing only if the decrement succeeds. **This is what prevents overselling** — the
+       transaction is the authority, not Redis.
+     - Only after that commit, writes a Redis reservation key
+       `stock_reservation:<productId>:<orderId>:<variantKey>` with `RESERVATION_TTL_SECONDS` (45
+       minutes), recording what was taken so it can be given back.
+     - If the Redis write fails, the Mongo decrement is reverted in a compensating transaction and
+       the error bubbles back to the checkout flow — except for COD, which tolerates the cache
+       failure and keeps the decrement (see "Cache-failure resilience").
 
 5. **Stripe session creation**
    - Builds `line_items` with per-item unit amounts (variant pricing applied if present), plus tax
      and shipping line items.
    - Creates Stripe Checkout session with `metadata` containing `orderId` and `userId`, `expires_at`
-     equals reservation TTL, and required `success_url` & `cancel_url`.
-   - Updates the `Order` with `stripeSessionId` and `paymentIntentId` from Stripe, and stores order
-     fallback info in Redis `order_fallback:<orderId>`.
+     at 30 minutes, and required `success_url` & `cancel_url`. Note the session expiry is
+     deliberately **shorter** than the 45-minute reservation TTL: `checkout.session.expired` arrives
+     at or after the session expires, and the handler needs the reservation keys to still exist to
+     know what to give back.
+   - Updates the `Order` with `stripeSessionId` and `paymentIntentId` from Stripe.
 
 6. **Commit & response**
    - If all steps succeed, commits the DB transaction and returns the Stripe session ID to the
@@ -3157,6 +3178,34 @@ This section explains the exact runtime flow implemented by the backend payment 
 
 **Result:** stock is reserved server-side, order exists in DB in `order_placed` (or
 `cod_order_placed` for COD), and the frontend redirects the user to Stripe Checkout.
+
+### Cart consumption after payment
+
+Cart clearing is owned by the server, not the browser, and removes only what was bought.
+
+- **What runs it.** `consumeOrderLinesFromCart(order)`
+  (`services/orders/cartConsumption.service.js`) is called from three places: the
+  `checkout.session.completed` webhook (authoritative — it always fires, even if the customer closes
+  the tab on Stripe's receipt page), `checkoutSuccess` (fast path, so the UI updates without waiting
+  for the webhook), and `codCheckoutSuccess`.
+- **Line-scoped, not a wipe.** Each order line is matched to a cart line by `productId` plus
+  `buildVariantKey(variantAttributes)` (`@eshop/locales/utils/orderItemKey.js`, which sorts its
+  entries — do not substitute `cart.controller`'s unsorted `formatVariantDescriptor`). The cart
+  quantity is decremented by the purchased quantity; the line is removed when it reaches zero and
+  never goes negative.
+- **Why not `cartItems: []`.** `createCheckoutSession` does not lock the cart and the Stripe session
+  lives 30 minutes, so a customer can add items while a checkout is in flight. A blanket wipe would
+  delete items that were never bought, and a webhook delayed by an outage would wipe a cart the
+  customer had since rebuilt.
+- **Idempotency.** Decrementing is not idempotent on its own, so every caller claims
+  `Order.cartConsumed` with a compare-and-set before mutating — the same guard `restockApplied`
+  provides for stock restores. Whichever of the redirect and the webhook arrives first does the
+  work; the other no-ops. The claim is released if the mutation fails so a Stripe retry can complete
+  it.
+- **Never fatal.** The service is total: it logs and returns a result rather than throwing, so a
+  cart-tidying failure can never abort processor-fee resolution or the confirmation email.
+- **Clients re-read, they do not clear.** Both success screens call `GET /api/cart` after the order
+  resolves instead of `DELETE /api/cart/clear`, so items added mid-checkout survive.
 
 ---
 
@@ -3193,15 +3242,21 @@ The webhook handler validates Stripe signatures and supports multiple events:
   - Actions:
     - Acquire a Redis lock `lock:expire:<orderId>` to avoid race conditions.
     - Restore reserved stock for order by scanning `stock_reservation:*:<orderId>:*` and
-      incrementing product/variant stock (via `restoreStockReservation`).
-    - Delete the order (`Order.findByIdAndDelete(orderId)`) and clear safety keys (`cart_backup`,
-      `order_fallback`).
+      incrementing product/variant stock (via `restoreStockReservationByOrderId`). If no reservation
+      keys survive, fall back to the order document itself (`restoreStockFromOrderItems`).
+    - Delete the order (`Order.findByIdAndDelete(orderId)`) and release the reservation keys
+      (`releaseOrderReservations`).
 
-  - This guarantees reserved inventory returns to stock if the checkout is abandoned.
+  - This guarantees reserved inventory returns to stock if the checkout is abandoned. The customer's
+    cart is deliberately left untouched.
 
 - **`checkout.session.completed`**
-  - Reads `session.metadata.orderId` and `userId`.
-  - Clears backup safety keys.
+  - Idempotent via the durable `WebhookEvent` claim taken before dispatch (see "Durable webhook
+    event store"). The claim fails open — a store outage must not block payment finalisation, and
+    the downstream guards (`cartConsumed`, `confirmationSent`, ledger idempotency keys) make this
+    handler replay-safe regardless.
+  - Reads `session.metadata.orderId`.
+  - Releases the order's reservation keys.
   - Optionally fetches Stripe PaymentIntent to determine authoritative payment status (handles 3DS
     and other async flows).
   - If payment succeeded (`succeeded` / `paid`):
@@ -3216,16 +3271,15 @@ The webhook handler validates Stripe signatures and supports multiple events:
 - **`charge.refunded`**
   - If a full refund is detected for a payment intent related to an order:
     - Sets `order.status = 'refunded'`, persists `refundId`, updates timestamps.
-    - Restores inventory via `restoreStockReservation(order._id)`.
+    - Restores inventory via `restoreStockReservationByOrderId(order._id)`.
 
 - **`account.updated`**
-  - Idempotent: uses Redis key `processed_account_updated:{event.id}` with a **7-day TTL** to handle
-    Stripe's retry window. Duplicate deliveries within the TTL window are discarded without
-    re-processing.
+  - Idempotent via the durable `WebhookEvent` claim: a terminal record means the delivery is already
+    settled and is acknowledged without re-processing.
 
 - **`refund.updated`**
-  - Idempotent: uses Redis key `processed_refund_updated_event:{event.id}`. Duplicate deliveries of
-    the same event are discarded without re-processing.
+  - Idempotent via the durable `WebhookEvent` claim; duplicate deliveries are acknowledged without
+    re-processing.
   - On `succeeded`:
     - Marks the refund record `completed`.
     - Updates order status.
@@ -3237,20 +3291,124 @@ The webhook handler validates Stripe signatures and supports multiple events:
 
 - **`charge.dispute.created`**
   - Fired by Stripe when a cardholder raises a chargeback on a charge.
-  - Looks up the order by `charge.metadata.orderId` (or by payment intent).
-  - If a platform dispute already exists for that order, attaches `chargeback.provider: 'stripe'`
-    and stores the Stripe dispute ID and amount.
-  - If no platform dispute exists, creates one automatically with `issueType: 'other'` and status
-    `open`, linking it to the order, customer, seller, and store.
+  - Idempotent via the durable `WebhookEvent` claim, taken once before dispatch: the first delivery
+    claims the record and is processed; a redelivery finds a terminal record and is acknowledged
+    without re-processing.
+  - Looks up the order by `paymentIntentId`, falling back to `payment.stripeSessionId` matched
+    against the charge.
+  - If a chargeback dispute already exists for that order (same `chargeback.providerCaseId`),
+    ensures its status is `under_review` and stops.
+  - If an open customer dispute exists for the order, attaches `chargeback.provider: 'stripe'` with
+    the Stripe dispute ID, reason and amount, and moves it to `under_review`.
+  - Otherwise creates one with `issueType: 'unauthorized_charge'` and status `under_review`, linking
+    it to the order, customer, seller, and store, and emails the configured admin address.
 
 - **`charge.dispute.closed`**
-  - Fired by Stripe when a chargeback is resolved.
-  - Maps Stripe outcome to platform resolution: `won` → `no_refund`; `lost` → `refund_full`.
-  - Updates `dispute.chargeback.outcome` and transitions dispute status to `resolved` (if not
-    already closed by admin).
+  - Fired by Stripe when a chargeback is resolved. Same idempotency-key semantics as above.
+  - Maps Stripe outcome to platform resolution: `won` → status `resolved_no_refund` / decision
+    `no_refund`; `lost` → status `resolved_refund` / decision `refund_full`. Any other outcome
+    leaves the dispute `under_review`.
+  - A `lost` chargeback also runs `settleLostChargeback`, which posts the refund reversal and
+    dispute fee — the money already left the Stripe balance, so the books have to record it.
 
-> All webhook processing logs heavily and attempts safe recovery. Non-critical failures (e.g.,
-> email) are logged but don't crash the handler.
+### Webhook failure semantics
+
+The HTTP status is the only lever for asking Stripe to redeliver: it retries any non-2xx with
+exponential backoff for up to three days. Handlers therefore classify their failures rather than
+acknowledging everything.
+
+| Failure class       | Example                                                      | Response      |
+| ------------------- | ------------------------------------------------------------ | ------------- |
+| Transient           | Mongo pool timeout, Redis op timeout, Stripe API 5xx         | `500` — retry |
+| Infrastructure      | Database or cache unreachable mid-handler                    | `500` — retry |
+| Programming bug     | `TypeError`, contract mismatch                               | `500` — retry |
+| Permanent           | Order was deleted by the cancel/expiry handler               | `200` + alert |
+| Business validation | Post-payment stock check failed; handler already compensated | `200`         |
+| Bad signature       | No configured secret verifies the payload                    | `400`         |
+
+A handler asking for a retry must also give back its idempotency claim — otherwise the retry is
+deduped away and the `500` achieves nothing. `releaseWebhookClaim` deletes the event key before
+returning `500`; a permanent failure keeps the key, because reprocessing would not help.
+
+Retrying is safe on every handler: each is guarded by a deterministic ledger key (unique index on
+`idempotencyKey`), a compare-and-set (`restockApplied`, `cartConsumed`,
+`resolution.resolutionEmailSentAt`), or a state re-read, so replay converges rather than
+double-applying. Nothing assumes event ordering — every handler re-reads current order state.
+
+`checkout.session.expired` is awaited rather than dispatched in the background: it is the only path
+that returns an expired order's stock and deletes the order, and nothing else reconciles it, so
+acknowledging before knowing the outcome made a failure there a silent inventory leak.
+
+> Non-critical side effects (confirmation and notification emails) are fire-and-forget and never
+> fail the handler. Each is claimed before sending so a redelivery cannot email a customer twice.
+
+### Durable webhook event store
+
+Every delivery is persisted before it is processed. The `WebhookEvent` collection is the idempotency
+authority — it replaced six per-handler Redis `SET..NX` keys, which had no audit trail once they
+expired, used two different TTLs across five namespaces, and could strand an event permanently if a
+claim release failed.
+
+```
+received ──claim──► processing ──success──► processed          (terminal)
+                         ├──retryable──► failed ──claim──► processing …
+                         └──permanent──► permanent_failure     (terminal, operator-replayable)
+```
+
+- **Claim.** One atomic `findOneAndUpdate` with `upsert`, filtered on a re-claimable status. The
+  unique index on `stripeEventId` is the concurrency guarantee: concurrent deliveries race to insert
+  and the loser's duplicate-key error is the "someone else owns this" signal.
+- **Stale recovery.** A record left in `processing` past `WEBHOOK_STALE_PROCESSING_MS` (default 5
+  min) becomes re-claimable, so a worker that dies mid-handler cannot strand an event.
+- **Fail open.** If the store itself is unavailable the event is processed without a record.
+  Dropping a live Stripe event because our bookkeeping is down is worse than processing it without
+  one, and every handler is independently replay-safe.
+- **Recorded per event:** type, attempt count, receipt/processing/completion/failure timestamps, the
+  last error with its classification and HTTP status, and the raw payload for replay.
+- **Retention.** Processed records are deleted after `WEBHOOK_PROCESSED_RETENTION_DAYS` (30);
+  failures are kept for `WEBHOOK_FAILURE_RETENTION_DAYS` (180) but have their payload dropped after
+  `WEBHOOK_PAYLOAD_RETENTION_DAYS` (30). The payload is what costs storage; the metadata is what
+  forensics needs. Once discarded, replay refuses with `409 payload_discarded`.
+- **Maintenance.** `webhook_event_maintenance` runs hourly, alerts on stuck, repeatedly failing and
+  permanently failed events, applies retention, and reports through `JobHealth` so the heartbeat
+  monitor notices if it stops.
+
+#### Admin API
+
+All routes require an authenticated admin. Replay re-runs real financial handlers.
+
+| Method | Path                                              | Purpose                                                |
+| ------ | ------------------------------------------------- | ------------------------------------------------------ |
+| `GET`  | `/api/admin/webhook-events`                       | Paged triage list; payload omitted                     |
+| `GET`  | `/api/admin/webhook-events/stats`                 | Counts by status, stuck, recent and permanent failures |
+| `GET`  | `/api/admin/webhook-events/types`                 | Distinct event types, for the filter dropdown          |
+| `GET`  | `/api/admin/webhook-events/:stripeEventId`        | Full record including the stored payload               |
+| `POST` | `/api/admin/webhook-events/:stripeEventId/replay` | Reopen and re-dispatch one event                       |
+| `POST` | `/api/admin/webhook-events/replay-bulk`           | Replay up to 25 events sequentially                    |
+
+List query parameters: `status`, `type`, `search`, `from`, `to`, `page`, `limit` (max 200), `sortBy`
+(`receivedAt`, `processedAt`, `lastFailedAt`, `attempts`, `type`) and `sortDir`. `search` matches
+the Stripe event id, the event type, and identifiers nested in the payload — order, payment intent,
+charge, customer, subscription and seller. The response carries `total` and `totalPages` so large
+histories can be paged without over-fetching.
+
+Bulk replay is capped at 25 per request and runs sequentially rather than in parallel: handlers take
+per-order locks, so a concurrent batch would mostly produce contention. Each event's result is
+reported individually, so a partial failure stays legible.
+
+#### Admin interface
+
+Operators work from **Admin → System → Webhook Events**, beside Job Health — the webhook maintenance
+job already reports through `JobHealth`, so this panel is the drill-down from it rather than a
+separate destination. It surfaces the health counters, filtering by status, type, date and entity
+search, sortable paged history, full lifecycle and error detail per event, and single or bulk
+replay. Replay is always behind a confirmation stating what it does, why it is safe, and when not to
+use it. Events whose payload retention has discarded remain visible but cannot be replayed, and the
+interface says why.
+
+Replay re-dispatches the stored payload through the same claim → dispatch → record path a live
+delivery takes, rather than calling handlers directly, so it cannot drift from real processing. It
+is safe against an already-processed event: every handler is replay-safe.
 
 ---
 
@@ -3280,12 +3438,12 @@ sequenceDiagram
 sequenceDiagram
     participant Stripe as Stripe
     participant WH as Webhook handler
-    participant Cache as Redis NX
+    participant Store as WebhookEvent store
     Stripe->>WH: event (event.id)
-    WH->>Cache: cacheSetNXJSON(key=event.id, ttl)
-    alt key already set
-        Cache-->>WH: duplicate -> res.json({received:true})
-    else acquired
+    WH->>Store: claim (upsert on unique stripeEventId)
+    alt terminal record exists
+        Store-->>WH: duplicate -> res.json({received:true})
+    else claimed
         WH->>WH: process (mutate state, post ledger)
     end
 ```
@@ -3295,8 +3453,9 @@ sequenceDiagram
 - `createCODOrder` follows almost the same path as Stripe checkout: validate payload, compute
   totals, create an `Order` (status `cod_order_placed`), reserve stock (variant-aware), and return
   order id and totals to the client.
-- `codCheckoutSuccess` accepts `orderId`, verifies user ownership, clears cart and safety keys,
-  sends confirmation email (if not sent), and returns order summary to the client.
+- `codCheckoutSuccess` accepts `orderId`, verifies user ownership, releases the order's reservation
+  keys, consumes the order's lines out of the cart (see "Cart consumption after payment"), sends
+  confirmation email (if not sent), and returns order summary to the client.
 
 **Cache-failure resilience**
 
@@ -3576,13 +3735,13 @@ graph TD
 sequenceDiagram
     participant Stripe as Stripe
     participant WH as payment.controller webhook
-    participant Cache as Redis NX
+    participant Store as WebhookEvent store
     participant Lock as withRefundLock(orderId)
     participant Ledger as recordRefundLedger
     Stripe->>WH: charge.refunded (event.id)
-    WH->>Cache: setNX processed_refund_event:{id} (24h)
+    WH->>Store: claim WebhookEvent (unique stripeEventId)
     alt duplicate
-        Cache-->>WH: exists -> ack & ignore
+        Store-->>WH: terminal record -> ack & ignore
     else first delivery
         WH->>Lock: acquire order refund lock
         Lock->>WH: update refundRecord status
@@ -4335,11 +4494,12 @@ Validation errors (API):
   break matching).
 
 - `reserveStock`:
-  - Saves Redis reservation (TTL \~ 30 min).
-  - Opens Mongo transaction and decrements either `product.stock` or `variants.$.stock` for the
-    matched variant.
+  - Opens a Mongo transaction and decrements either `product.stock` or `variants.$.stock` for the
+    matched variant, committing before touching Redis.
+  - Saves the Redis reservation marker (TTL 45 min, `RESERVATION_TTL_SECONDS`) recording the
+    quantity taken. The marker is a record of the decrement, not the decrement itself.
 
-- `restoreStockReservation`:
+- `restoreStockReservationByOrderId`:
   - `KEYS stock_reservation:*:<orderId>:*` (production should use `SCAN` for large keyspaces) to
     find reservations.
   - Builds `bulkWrite` ops to increment product or variant stock back by reservation quantity, and
@@ -7978,6 +8138,17 @@ All paths above are relative to `backend/src/tests/` unless prefixed `frontend/`
   npm run test
   ```
 
+- **Architecture page integrity** (Mermaid parsing, TOC/section sync, cross-reference resolution,
+  and repository metrics):
+
+  ```bash
+  # From the repo root
+  npm run test:architecture
+  ```
+
+  See [`docs/architecture-page.md`](docs/architecture-page.md) for what is checked and how to
+  re-measure the test/coverage figures the page advertises.
+
 - **E2E (configured Jest e2e runner)**:
 
   ```bash
@@ -8072,10 +8243,12 @@ npm run -w frontend test -- --coverage --coverageReporters=text-summary
 
 ### CI/CD pipeline
 
-The repository ships two GitHub Actions workflows:
+The repository ships three GitHub Actions workflows:
 
-- **`ci.yml`** — lint, backend tests (with Redis service container), frontend tests, and Vite
-  production build. Runs on every push to `main` and every PR targeting `main`.
+- **`ci.yml`** — lint, backend tests (with Redis service container), frontend tests, Architecture
+  page integrity, and a Vite production build. Runs on every push to `main` and every PR targeting
+  `main`.
+- **`frontend-sentry.yml`** — uploads frontend source maps to Sentry on release builds.
 - **`security.yml`** — Gitleaks secret scanning (full git history) and `npm audit` across all
   workspaces. Runs on every push.
 
@@ -9209,9 +9382,6 @@ GET refresh_token:<userId>:<jti>
 
 # Reservation keys
 KEYS stock_reservation:_:<orderId>:_
-
-# Cart backup
-GET cart_backup:<userId>
 ```
 
 Then set in `backend/.env`:
@@ -9492,6 +9662,8 @@ For commercial enquiries:
 
 Extra reference material that complements this README:
 
+- [`docs/architecture-page.md`](docs/architecture-page.md) — how to maintain the Architecture page,
+  what its integrity suite checks, and how to re-measure the metrics it displays.
 - [`frontend/README.md`](frontend/README.md) — frontend-specific architecture, scripts, and tooling.
 - [`mobile/dev-setup.md`](mobile/dev-setup.md) — Expo environment setup and troubleshooting.
 - [`mobile/custom-dev-setup.md`](mobile/custom-dev-setup.md) — deeper dive into native module

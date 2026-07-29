@@ -236,6 +236,20 @@ For Avalara, `meta` holds the AvaTax `taxSummary`, the list of `jurisdictions`, 
 code, and a timestamp. For the internal provider `meta` is `null`. The field is `Mixed`, so swapping
 or adding a provider needs no schema migration.
 
+### COD orders: tax liability stays with the seller
+
+COD orders compute and persist `order.tax` exactly like prepaid orders (the customer is quoted and
+pays the same tax), but the platform ledger intentionally records **no tax rows** for them: the
+seller collected the full amount — including tax — in cash, so the platform never holds the money
+and books no `Tax_Liability`. Sellers are responsible for remitting tax on their COD sales
+themselves; the platform's tax remittance flow covers prepaid orders only.
+
+This is a deliberate policy decision, not a gap (finance audit finding #8, July 2026). **Revisit it
+before operating in any jurisdiction with marketplace-facilitator rules**, where the platform must
+collect and remit tax on behalf of sellers regardless of payment method — that would require
+COD-specific tax clawback rows (mirroring the `cod_refund_reimbursement` pattern) and inclusion of
+COD orders in the remittance flow.
+
 ---
 
 ## 8. Quick admin recipes
