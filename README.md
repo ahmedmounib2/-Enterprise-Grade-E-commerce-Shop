@@ -8,8 +8,8 @@
 >   cancel/expire
 > - Stripe Checkout integration with robust webhook handling (PaymentIntent verification, refunds,
 >   expired sessions)
-> - Order export (PDF) & fulfilment tooling, GDPR data export, Sentry observability, and 90.02%
->   backend test line coverage across 3,333 automated tests.
+> - Order export (PDF) & fulfilment tooling, GDPR data export, Sentry observability, and 89.3%
+>   backend test line coverage across 4,373 automated tests.
 
 ---
 
@@ -77,6 +77,7 @@ Some screenshots and historical references may still contain the previous domain
       - [Storefront policy rendering (public store page + checkout)](#storefront-policy-rendering-public-store-page--checkout)
       - [Pause store (Hide All) behavior](#pause-store-hide-all-behavior)
     - [Seller store closure lifecycle](#seller-store-closure-lifecycle)
+      - [Closure conditions](#closure-conditions)
       - [Phase 1 — Eligibility check \& closure request](#phase-1--eligibility-check--closure-request)
       - [Phase 2 — Immediate deactivation (soft close)](#phase-2--immediate-deactivation-soft-close)
       - [Phase 3 — Waiting period \& permanent deletion (finalizer job)](#phase-3--waiting-period--permanent-deletion-finalizer-job)
@@ -394,7 +395,7 @@ Documentation in [`docs/`](docs/) is not scaffolding — it covers actively used
 security rotation procedures, settlement and payout operations, and CI/CD setup that are referenced
 during day-to-day development and deployment. The codebase is production-grade in both scope and
 discipline: distributed Redis locks, field-level PII encryption, HMAC-signed OAuth bridge codes,
-multi-stage Docker builds, and a full 235-suite / 3,333-test backend test suite with CI enforcement
+multi-stage Docker builds, and a full 261-suite / 3,722-test backend test suite with CI enforcement
 on every PR.
 
 ---
@@ -578,13 +579,13 @@ until you are ready to launch in production, then flip it to `true` in `.env.pro
   is enabled. The authenticated store route (`store.route.js`) exposes `GET /:id` and requires a
   MongoDB ObjectId, not a slug.
 - Multi-store tenant flags:
-  - `FEATURE_MULTI_SELLER=true`
+  - `FEATURE_MULTI_SELLER=true` — also gates the seller-initiated store closure flow (eligibility
+    check, closure request, pending-closure UI), which is mounted inside this block and has no flag
+    of its own. Note that `/api/admin/sellers/:id/close-store` is registered on the admin router
+    unconditionally, so admin force-close remains available even when the seller-facing routes are
+    unmounted. The finalizer cron is gated separately by `SELLER_CLOSURE_FINALIZER_ENABLED`.
   - `FEATURE_SELLER_KYC=true`
   - `FEATURE_SELLER_ORDERS=true`
-  - `FEATURE_SELLER_CLOSURE_V1=true` — enables the seller-initiated store closure flow (eligibility
-    check, closure request, pending-closure UI, and the finalizer cron job). When unset or `false`,
-    all `/api/seller/close-store/*` and `/api/admin/sellers/:id/close-store` routes are inaccessible
-    and the dashboard panel is hidden.
   - `FEATURE_DISPUTES_V1=true` — enables the full dispute-resolution surface: all `/api/disputes/*`,
     `/api/seller/disputes/*`, and `/api/admin/disputes/*` routes, the SLA escalation cron, and all
     dispute-related panels on web and mobile. When unset or `false`, dispute routes are inaccessible
@@ -699,8 +700,11 @@ flowchart TD
   - `kyc.status` (`draft`, `pending`, `verified`, `rejected`, `action_required`)
   - `closure` — nested object tracking the store closure lifecycle; includes `status` (`active` /
     `pending_closure` / `closed_archived`), `initiatedAt`, `scheduledFor`, `actor` (`self` /
-    `admin`), `actorUserId`, `reason`, `closedAt`, `adminOverride`, and `notificationEmail`.
-    Compound index on `{ 'closure.status': 1, 'closure.scheduledFor': 1 }`.
+    `admin`), `actorUserId`, `reason`, `closedAt`, `adminOverride`, `notificationEmail`,
+    `bypassedConditions` (condition codes an admin force-close waived), the deferral counters
+    `deferralCount` / `lastDeferredAt` / `lastDeferralReasons`, and `priorState` (the seller
+    `status` and payout-hold fields captured at initiation so cancellation restores them rather than
+    assuming `active`). Compound index on `{ 'closure.status': 1, 'closure.scheduledFor': 1 }`.
   - `application` (normalized KYC + business data payload)
   - `application.banking` (encrypted with `SELLER_DATA_SECRET` to minimize exposure at rest)
 - **Store** represents the customer-facing storefront and is **created only after approval**. Store
@@ -851,8 +855,8 @@ control the window (default `2555`, equivalent to 7 years).
 of every admin decision in the seller lifecycle. Covered actions include: KYC
 verify/reject/action_required, bank-update approve/reject, store review, payout-hold toggle,
 reserve-tier change, store-status change, and store closure lifecycle events (`closure_initiated`,
-`closure_cancelled`, `closure_finalized`). Each record captures actor, action, `fromStatus`,
-`toStatus`, notes, a data snapshot, and the actor's IP address.
+`closure_cancelled`, `closure_deferred`, `closure_finalized`). Each record captures actor, action,
+`fromStatus`, `toStatus`, notes, a data snapshot, and the actor's IP address.
 
 **`SellerProfileAccessAudit`** (`backend/src/models/sellerProfileAccessAudit.model.js`) —
 append-only record of admin access to tier-1 seller PII (govIdNumber, birthDate, addresses, banking
@@ -1232,15 +1236,57 @@ shopping. Store closure is distinct from user account deletion: deletion removes
 linked seller data in one transaction; store closure closes only the seller/store while the user
 account continues to function. See also [GDPR & user data export](#gdpr--user-data-export).
 
-The feature is gated by `FEATURE_SELLER_CLOSURE_V1`.
+The seller-facing routes are mounted inside the `FEATURE_MULTI_SELLER` block; the admin force-close
+routes are not gated.
+
+#### Closure conditions
+
+`evaluateClosureConditions` (`backend/src/services/seller/closure/closureConditions.service.js`) is
+the single source of truth for what stands in the way of a closure. Each condition carries three
+independent flags rather than one severity, because "may this seller start winding down?" and "may
+we erase them?" have different answers:
+
+- `blocksInitiation` — refuses `active → pending_closure`.
+- `blocksFinalization` — defers `pending_closure → closed_archived`. Deferral never abandons the
+  closure; the finalizer reschedules and tries again.
+- `overridable` — an admin force-close may waive it. Operational conditions are overridable so abuse
+  can be shut down immediately. Conditions representing money or unresolved liability are not,
+  because finalization is irreversible and there is no way to un-anonymize a seller whose chargeback
+  lands later.
+
+| Condition                                                                                               | Initiation    | Finalization  | Overridable |
+| ------------------------------------------------------------------------------------------------------- | ------------- | ------------- | ----------- |
+| `active_listings`                                                                                       | blocks        | —             | yes         |
+| `recent_orders` (inside `SELLER_CLOSURE_WAITING_DAYS`)                                                  | blocks        | —             | yes         |
+| `in_flight_orders` (unfulfilled/unsettled, any age)                                                     | blocks        | defers        | yes         |
+| `open_shipments` (in transit or exception)                                                              | blocks        | defers        | yes         |
+| `bank_update_under_review`                                                                              | blocks        | —             | yes         |
+| `subscription_dues` (unpaid invoices)                                                                   | blocks        | defers        | yes         |
+| `pending_payouts` (`scheduled`, `processing`, `failed`, `retryable`, `manual_required`, `under_review`) | blocks        | defers        | **no**      |
+| `open_refunds` (`pending_refund` orders)                                                                | blocks        | defers        | **no**      |
+| `in_flight_refund_records` (provider still processing)                                                  | blocks        | defers        | **no**      |
+| `pending_cod_refund`                                                                                    | blocks        | defers        | **no**      |
+| `open_disputes`                                                                                         | blocks        | defers        | **no**      |
+| `open_chargebacks`                                                                                      | blocks        | defers        | **no**      |
+| `negative_balance` (seller owes the platform)                                                           | blocks        | defers        | **no**      |
+| `unsettled_balance` (platform owes the seller)                                                          | —             | defers        | **no**      |
+| `withheld_reserve` (reserve not yet released)                                                           | —             | defers        | **no**      |
+| `payout_destination_incomplete` (only when a balance is owed)                                           | —             | defers        | yes         |
+| `active_subscription`                                                                                   | advisory only | advisory only | —           |
+
+Ledger balances are evaluated per currency; netting them together would let a positive EUR balance
+mask a negative USD one. `in_flight_orders` is deliberately status-based rather than age-based — the
+waiting window is a date filter, so an order left unfulfilled for longer than the window used to
+fall straight through it.
 
 #### Phase 1 — Eligibility check & closure request
 
-- `GET /api/seller/close-store/eligibility` — evaluates whether the seller can initiate closure.
-  Checks: active product listings, recent orders within the waiting period, pending payouts, open
-  refund requests, and open disputes. Returns `{ eligible, reasons, earliestClosureAt }`.
+- `GET /api/seller/close-store/eligibility` — projects the `blocksInitiation` conditions above into
+  `{ eligible, reasons, earliestClosureAt, waitingDays, conditions }`. `earliestClosureAt` is
+  returned only when the waiting window is the sole blocker, so the answer to "why not yet" is a
+  date rather than a refusal.
 - `POST /api/seller/close-store` — validates the store slug confirmation and acknowledgement, then
-  calls the closure service. Requires `FEATURE_SELLER_CLOSURE_V1` to be enabled.
+  calls the closure service.
 - `GET /api/seller/close-store/status` — returns the current closure state for the seller's store.
 - **Seller dashboard UI:** "Close Store" panel in the Account Management section, containing an
   eligibility checklist, a typed-slug confirmation input, and an optional reason field. A
@@ -1254,33 +1300,81 @@ The feature is gated by `FEATURE_SELLER_CLOSURE_V1`.
 On `POST /api/seller/close-store`, the `initiateStoreClosure` service executes a single MongoDB
 transaction that:
 
-1. Sets `closure.status = 'pending_closure'` and `seller.status = 'suspended'`.
-2. Hides all storefronts and products (`pausedByStore: true`).
-3. Enables a payout hold (`payoutHoldReason: 'store_closure_pending'`).
-4. Triggers a final settlement reconciliation pass.
+1. Captures `closure.priorState` — the seller's `status` and payout-hold fields _before_ closure
+   overwrites them.
+2. Sets `closure.status = 'pending_closure'` and `seller.status = 'suspended'`.
+3. Hides all storefronts (`pausedByClosure: true`) and products (`pausedByStore: true`).
+4. Enables a payout hold (`payoutHoldReason: 'store_closure_pending'`).
 5. Writes a `SellerLifecycleAudit` row with action `closure_initiated`.
+
+A final-balance settlement batch is then scheduled post-commit. It is awaited rather than
+fire-and-forget, so the `finalPayoutTriggered` result reflects what actually happened; a failure is
+logged and picked up by the next settlement scheduler cycle rather than rolling back the closure.
 
 **`blockIfPendingClosure` middleware** (`backend/src/middleware/seller.middleware.js`) returns
 `423 Locked` on all mutating seller routes (products, orders, subscriptions, store settings, payment
 methods) while closure is pending. Read-only `GET` requests remain allowed.
 
-**Cancel closure:** `POST /api/seller/close-store/cancel` reverses all Phase 2 effects. Self-serve
-cancel is allowed only outside a 24-hour pre-deletion lockout window; admin can cancel at any time
-via `POST /api/admin/sellers/:id/closure/cancel`.
+**Dispute access during closure.** Suspending the seller would otherwise lock them out of
+`/api/seller/disputes/*`, which is guarded by `requireVerifiedSeller` (it requires
+`status === 'active'`). Since open disputes block finalization, that would trap a seller in a state
+only they can clear while the SLA escalation job keeps running against them. Those four routes use
+`requireVerifiedSellerAllowingClosure` instead, which admits a seller suspended specifically by a
+pending closure.
+
+**Cancel closure:** `POST /api/seller/close-store/cancel` reverses all Phase 2 effects via the
+shared `cancelStoreClosure` service
+(`backend/src/services/seller/closure/cancelClosure.service.js`), used by both the seller and admin
+routes. It **restores `closure.priorState`** rather than assuming the seller was healthy: a seller
+suspended for an unrelated reason stays suspended, and a payout hold placed for a negative balance
+survives the cancellation. Stores are un-hidden only where `pausedByClosure` is set, so a store
+hidden for a KYC re-review is not revived. Closures opened before `priorState` existed fall back to
+the original behaviour, keyed off `priorState.captured`. Self-serve cancel is allowed only outside a
+24-hour pre-deletion lockout window; admin can cancel at any time via
+`POST /api/admin/sellers/:id/closure/cancel`.
 
 #### Phase 3 — Waiting period & permanent deletion (finalizer job)
 
 After `closure.scheduledFor` has passed, the daily `sellerClosureFinalizer` cron job
 (`backend/src/jobs/sellerClosureFinalizer.job.js`) processes each qualifying seller:
 
-1. **Safety re-check** — re-verifies no new orders or disputes arrived during the waiting period.
+0. **Asset purge drain** — retries any Cloudinary assets whose deletion failed on a previous cycle
+   (see below).
+1. **Blocker re-check** — re-evaluates every `blocksFinalization` condition **inside the
+   finalization transaction**. Non-overridable conditions defer even when `closure.adminOverride` is
+   set. This narrows but does not close the race: MongoDB takes no range locks, so a dispute
+   committed microseconds before this transaction commits is still not seen. Deferral, not the
+   re-check, is what makes that survivable — anonymization leaves orders, ledger rows and disputes
+   intact and resolvable.
 2. **PII anonymization** — scrubs seller application fields, Store name, logo, and banner.
 3. **Product handling** — hard-deletes products that appear in no orders; tombstones products that
-   appear in any Order so order history remains resolvable against the anonymized Store record.
+   appear in any Order (in **all four locales**, not just `en`) so order history remains resolvable
+   against the anonymized Store record.
 4. **Referential integrity** — Orders retain their `sellerId` / `storeId` references and resolve to
    the anonymized Store; financial and order records are preserved as required by law.
 5. **Audit** — writes a `SellerLifecycleAudit` row with action `closure_finalized`.
 6. **Email** — sends `sendStoreClosureCompletedEmail` to the pre-anonymization `notificationEmail`.
+
+**Deferral.** When a blocker is found the job does not fail the closure: it pushes `scheduledFor`
+forward by `SELLER_CLOSURE_RETRY_DAYS` (default 7), increments `closure.deferralCount`, records
+`closure.lastDeferralReasons`, and writes a `closure_deferred` audit row. Rescheduling by a short
+retry interval rather than another full waiting period matters — a single late refund used to add 90
+days, keeping the seller suspended far longer than the blocker took to clear. Past
+`SELLER_CLOSURE_MAX_DEFERRALS` (default 8) the job logs an error so a permanently stuck closure
+surfaces to operators instead of retrying silently forever.
+
+**Durable asset purge.** `SellerDocument` rows are deleted inside the transaction, so purging their
+Cloudinary assets as post-commit fire-and-forget meant a crash in between left KYC identity scans in
+Cloudinary with nothing in the database pointing at them — unrecoverable, and exactly the data the
+closure was meant to erase. Purge intents are now written to `PendingAssetPurge`
+(`backend/src/models/pendingAssetPurge.model.js`) inside the same transaction and drained with
+retries. Rows exceeding the retry budget stop being retried but are **not** deleted, because an
+unpurged asset is an unmet obligation that must stay visible.
+
+**Single-writer guarantee.** The job holds the Redis lock `seller:closure-finalizer:lock` for the
+duration of a cycle (`cacheAcquireLock` / `cacheReleaseLock`, the same primitive the settlement
+scheduler and payout retry jobs use). Unlike those jobs there is no `run_unlocked` fallback: because
+finalization is irreversible, skipping a night is strictly better than two replicas racing.
 
 **Cron schedule:** runs at `02:00 UTC` by default. Override with `SELLER_CLOSURE_FINALIZER_CRON`.
 Disable with `SELLER_CLOSURE_FINALIZER_ENABLED=false`. Job health is tracked via
@@ -1290,20 +1384,28 @@ Disable with `SELLER_CLOSURE_FINALIZER_ENABLED=false`. Job health is tracked via
 
 ```
 SELLER_CLOSURE_WAITING_DAYS          # waiting period before Phase 3 (default: 90 days)
+SELLER_CLOSURE_RETRY_DAYS            # reschedule interval when finalization defers (default: 7 days)
+SELLER_CLOSURE_MAX_DEFERRALS         # deferrals before an operator alert is logged (default: 8)
 SELLER_CLOSURE_FINALIZER_CRON        # cron expression for the finalizer job (default: "0 2 * * *")
 SELLER_CLOSURE_FINALIZER_ENABLED     # set to "false" to disable automatic finalizer (default: true)
 ```
 
 #### Admin override
 
-- `POST /api/admin/sellers/:id/close-store` — force-close a seller store. Accepts an optional
-  `skipEligibility: true` flag to bypass all eligibility checks. Sends the same
+- `POST /api/admin/sellers/:id/close-store` — force-close a seller store. `skipEligibility: true`
+  waives the **overridable** conditions only (see the conditions table); money and unresolved
+  liability still block, and the request returns `409 ineligible_for_closure` listing them. A
+  non-empty `reason` is required whenever `skipEligibility` is set, and the waived condition codes
+  are recorded on `closure.bypassedConditions` and in the `closure_initiated` audit snapshot, so a
+  force-close is reviewable rather than inferred from an absence. Sends the same
   `sendStoreClosureInitiatedEmail` as self-serve closure.
 - `POST /api/admin/sellers/:id/closure/cancel` — cancel a pending closure without the 24-hour
   self-serve lockout restriction.
 - `GET /api/admin/sellers/:id/closure` — retrieve full closure state for admin review.
 - **Admin UI:** "Close store" button in the admin Approved Sellers list, with a reason text input
-  and a force-close toggle that sets `skipEligibility`.
+  and a force-close toggle that sets `skipEligibility`. Sellers already in `pending_closure` show a
+  "Cancel closure" action, plus a deferral badge (count and last blocking reason codes) once the
+  finalizer has deferred them at least once.
 
 #### Closure email notifications
 
@@ -1318,9 +1420,10 @@ Three transactional emails are sent during the closure lifecycle (all implemente
 
 #### i18n
 
-24 new translation keys under the `seller.closure.*` namespace were added across all 4 locales
-(`en`, `es`, `fr`, `ar`) in `shared/locales/`. Key groups include eligibility messages, dashboard
-panel labels, confirmation dialog text, and pending-closure banner copy.
+34 translation keys under the `seller.closure.*` namespace exist across all 4 locales (`en`, `es`,
+`fr`, `ar`) in `shared/locales/`. Key groups include one message per condition code, dashboard panel
+labels, confirmation dialog text, and pending-closure banner copy. Admin-facing closure strings live
+under `admin.sellerClosure.*`.
 
 ### Seller product creation & admin moderation (end-to-end)
 
@@ -2620,8 +2723,9 @@ Representative UI captures (see [`docs/screenshots`](./docs/screenshots)):
   - Rate limiting, input sanitization, NoSQL injection protection.
 
 - Testing
-  - Extensive unit/integration/E2E tests: 3,333 backend tests across 235 suites with 90.02% line
-    coverage, plus 340 frontend tests across 47 suites. See [Testing & CI](#testing--ci).
+  - Extensive unit/integration/E2E tests: 3,722 backend tests across 261 suites with 89.3% line
+    coverage, plus 487 frontend tests across 70 suites and 164 mobile tests across 29 suites — 4,373
+    automated tests in total. See [Testing & CI](#testing--ci).
 
 ---
 
@@ -7536,12 +7640,13 @@ Gated by `FEATURE_IN_APP_NOTIFICATIONS=true`.
 ```
 Fields
   userId      — recipient (indexed)
-  type        — one of 22 enum values (order_shipped, order_delivered, refund_approved,
-                 refund_rejected, payout_completed, payout_failed, product_approved,
-                 product_rejected, product_action_required, kyc_approved, kyc_rejected,
-                 store_closed, store_closure_cancelled, store_closure_completed,
-                 new_review, dispute_opened, dispute_message, dispute_resolved,
-                 dispute_escalated, order_cancelled, new_order, new_dispute)
+  type        — one of 23 enum values (order_placed, order_shipped, order_delivered,
+                 order_cancelled, refund_requested, refund_approved, refund_rejected,
+                 product_approved, product_rejected, product_action_required,
+                 kyc_submitted, kyc_approved, kyc_rejected, payout_completed,
+                 payout_failed, store_closure_initiated, store_closure_cancelled,
+                 store_closure_finalized, review_received, dispute_opened,
+                 dispute_message, dispute_resolved, system)
   titleKey    — i18n key resolved client-side (e.g. "notifications.order_shipped.title")
   bodyKey     — i18n key resolved client-side
   variables   — interpolation map (orderId, amount, productName, carrier, trackingUrl, etc.)
@@ -8041,8 +8146,8 @@ Remaining work for future iterations:
 - Tests: Jest unit & integration tests with mocks for Redis / email / cloudinary, database-backed
   tests using **mongodb-memory-server** (in-memory MongoDB) for model/service/integration specs,
   **Supertest** for API/route-level tests, and **Cypress** for frontend E2E flows.
-- Scale: **3,333 automated tests across 235 suites** (backend, all passing), plus 340 frontend tests
-  across 47 suites — see [Test status](#test-status).
+- Scale: **3,722 automated tests across 261 suites** (backend), plus 487 frontend tests across 70
+  suites and 164 mobile tests across 29 suites — 4,373 in total. See [Test status](#test-status).
 - Coverage: see [Coverage](#coverage) below.
 - CI: the full suite runs on every pull request and push to `main` (GitHub Actions); a failing suite
   blocks merge — see [CI/CD pipeline](#cicd-pipeline).
@@ -8053,14 +8158,14 @@ Backend coverage (unit + integration, `npm run test:coverage`):
 
 | Metric     | Coverage |
 | ---------- | -------: |
-| Statements |   88.36% |
-| Branches   |   74.10% |
-| Functions  |   89.08% |
-| Lines      |   90.02% |
+| Statements |   87.73% |
+| Branches   |   73.84% |
+| Functions  |   88.21% |
+| Lines      |    89.3% |
 
 ### Critical workflows covered
 
-The 3,333 backend tests provide unit, integration, and E2E coverage for the platform's core business
+The 3,722 backend tests provide unit, integration, and E2E coverage for the platform's core business
 workflows:
 
 - **Auth & session lifecycle** — login, registration, OAuth bridge codes, refresh-token rotation,
@@ -8217,10 +8322,15 @@ You can test both the **pure purge function** and the **scheduled cron execution
 
 ### Test status
 
-- **Backend:** 235 suites, 3,333 tests — all passing.
-- **Frontend:** 47 suites, 340 tests — all passing.
-- **Coverage:** see [Coverage](#coverage) above (90.02% lines / 88.36% statements / 89.08% functions
-  / 74.10% branches; unit + integration). Full test suite includes authorization flows, stock
+- **Backend:** 261 suites, 3,722 tests — all passing. One suite (`notification.controller.spec.js`)
+  skips itself unless `FEATURE_IN_APP_NOTIFICATIONS=true`, accounting for the single reported skip.
+- **Frontend:** 70 suites, 487 tests — all passing.
+- **Mobile:** 29 suites, 164 tests — 160 passing, 3 failing, 1 todo. The failures are in
+  `StorefrontScreen.test.js` and are an environment limitation rather than a product defect:
+  `ExpandableText` renders a hidden measurement copy that unmounts on the first `onTextLayout`
+  event, which jsdom never fires, so the duplicate text persists and `getByText` matches twice.
+- **Coverage:** see [Coverage](#coverage) above (89.3% lines / 87.73% statements / 88.21% functions
+  / 73.84% branches; unit + integration). Full test suite includes authorization flows, stock
   reservation, Stripe webhooks, and end-to-end checkout scenarios — see
   [Critical workflows covered](#critical-workflows-covered).
 - **CI enforcement:** Tests run on every pull request and push to `main` with no

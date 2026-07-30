@@ -1147,3 +1147,98 @@ Accounts are defined in `services/ledger/chartOfAccounts.js`; builders in
 | Shipping_Liability    | carrier shipping collected (Cr), shipping_label_cost (Dr)      |
 | Processor_Fee_Expense | processor fees not passed through (Dr), recoveries (Cr)        |
 | Refunds_Payable       | COD refund obligations                                         |
+
+---
+
+## 17) Seller closure wind-down
+
+Closure is a financial settlement operation, not a profile change: it ends with permanent,
+irreversible anonymisation of the seller. This section covers the operator-facing parts.
+
+### Which conditions block, and which an admin may waive
+
+`evaluateClosureConditions` (`backend/src/services/seller/closure/closureConditions.service.js`) is
+the single source of truth. Each condition carries `blocksInitiation`, `blocksFinalization` and
+`overridable`. The full table lives in the README ("Closure conditions"); what matters operationally
+is the split:
+
+| Waivable by force-close                                                                                                                                    | Never waivable                                                                                                                                                                        |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `active_listings`, `recent_orders`, `in_flight_orders`, `open_shipments`, `bank_update_under_review`, `subscription_dues`, `payout_destination_incomplete` | `pending_payouts`, `open_refunds`, `in_flight_refund_records`, `pending_cod_refund`, `open_disputes`, `open_chargebacks`, `negative_balance`, `unsettled_balance`, `withheld_reserve` |
+
+`POST /api/admin/sellers/:id/close-store` with `skipEligibility: true` waives only the left column
+and **requires a non-empty `reason`**. Waived codes are written to `closure.bypassedConditions` and
+to the `closure_initiated` audit snapshot. If a right-column condition is present the call returns
+`409 ineligible_for_closure` with the offending reasons — that is working as intended, not a bug to
+route around.
+
+`active_subscription` appears in neither column: it is advisory and never blocks. It flags a live
+Stripe subscription that will keep billing after the store closes — closure does not cancel it, so
+cancel it separately.
+
+### Triaging a deferred closure
+
+The finalizer defers instead of archiving whenever a `blocksFinalization` condition survives. Signs:
+
+- Admin → Approved Sellers: a pending-closure seller shows a deferral badge with the count and the
+  last blocking reason codes.
+- `GET /api/admin/sellers/:id/closure` returns `closure.deferralCount`, `closure.lastDeferredAt`,
+  `closure.lastDeferralReasons`, plus a live eligibility `summary`.
+- Job logs: `[sellerClosureFinalizer] seller deferred` with `blockers` and `rescheduledFor`.
+- Past `SELLER_CLOSURE_MAX_DEFERRALS` (default 8):
+  `[finalizeClosure] closure stuck — exceeded deferral budget` at error level.
+
+Resolution by blocking code:
+
+| Code                                                             | What to do                                                                                                                          |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `open_disputes`, `open_chargebacks`                              | Resolve the dispute (§13). The seller retains dispute access while pending closure and can still respond.                           |
+| `pending_payouts`                                                | Work the payout to a terminal state (§5, §7). `failed`/`retryable`/`manual_required`/`under_review` all still count as in flight.   |
+| `open_refunds`, `in_flight_refund_records`, `pending_cod_refund` | Complete or reject the refund (§5).                                                                                                 |
+| `negative_balance`                                               | Post a ledger adjustment to clear the debt (§14), or recover it.                                                                    |
+| `unsettled_balance`                                              | Run a settlement batch so the seller is paid out before their bank details are erased.                                              |
+| `withheld_reserve`                                               | Wait for the release schedule, or release early (§8).                                                                               |
+| `subscription_dues`                                              | Collect or write off the invoice; waivable via force-close if writing off.                                                          |
+| `payout_destination_incomplete`                                  | Only raised when a balance is owed. Get complete bank details on file, or settle the balance another way. Waivable via force-close. |
+| `in_flight_orders`, `open_shipments`                             | Fulfil or cancel the order; wait for the carrier to deliver or the shipment to be cancelled. Waivable via force-close.              |
+
+The seller stays suspended and read-only throughout, so a stuck closure is not an outage — but it is
+also not self-clearing. Cancel the closure (`POST /api/admin/sellers/:id/closure/cancel`) if the
+seller should resume trading; cancellation restores the enforcement state captured at initiation, so
+a seller who was suspended or payout-held for an unrelated reason stays that way.
+
+### Asset purge backlog
+
+Cloudinary deletions for closed sellers are queued in `PendingAssetPurge` inside the finalisation
+transaction. The queue is drained twice: immediately after a successful finalisation commit, and
+again at the top of each finalizer cycle so anything that failed is retried. Check for a backlog:
+
+```js
+// rows still retrying
+db.pendingassetpurges.countDocuments({ attempts: { $lt: 5 } });
+// rows that exhausted the retry budget — these need manual removal in Cloudinary
+db.pendingassetpurges.find({ attempts: { $gte: 5 } }, { publicId: 1, source: 1, lastError: 1 });
+```
+
+Exhausted rows are deliberately retained: each one is an identity document or store asset that
+should have been erased and has not been. Delete the asset in Cloudinary manually, then remove the
+row. `[assetPurge] assets exceeded retry budget and need manual removal` is logged each cycle while
+any remain.
+
+### Job locking
+
+`runSellerClosureFinalizerJob` holds `seller:closure-finalizer:lock` (TTL 15 min). Unlike the
+settlement scheduler there is **no `run_unlocked` fallback** — if Redis is unavailable the cycle is
+skipped with `lock_backend_unavailable`. Finalisation is irreversible, so skipping a night is
+strictly better than two replicas racing. A skipped cycle is not an incident; sellers whose date has
+passed are simply picked up the next run.
+
+### Env vars
+
+```
+SELLER_CLOSURE_WAITING_DAYS       # waiting period before finalisation (default: 90)
+SELLER_CLOSURE_RETRY_DAYS         # reschedule interval on deferral (default: 7)
+SELLER_CLOSURE_MAX_DEFERRALS      # deferrals before the stuck-closure alert (default: 8)
+SELLER_CLOSURE_FINALIZER_CRON     # default "0 2 * * *"
+SELLER_CLOSURE_FINALIZER_ENABLED  # "false" pauses the job without redeploying
+```

@@ -37,17 +37,18 @@ strings. Switching UI language instantly updates all notification copy without a
 
 ### Notification type catalogue
 
+The 23 values of `NOTIFICATION_TYPES` in `backend/src/models/notification.model.js`:
+
 ```
-order_shipped              order_delivered
-refund_approved            refund_rejected
-payout_completed           payout_failed
+order_placed               order_shipped              order_delivered           order_cancelled
+refund_requested           refund_approved            refund_rejected
 product_approved           product_rejected           product_action_required
-kyc_approved               kyc_rejected
-store_closed               store_closure_cancelled    store_closure_completed
-new_review
-dispute_opened             dispute_message            dispute_resolved          dispute_escalated
-order_cancelled
-new_order                  new_dispute
+kyc_submitted              kyc_approved               kyc_rejected
+payout_completed           payout_failed
+store_closure_initiated    store_closure_cancelled    store_closure_finalized
+review_received
+dispute_opened             dispute_message            dispute_resolved
+system
 ```
 
 ---

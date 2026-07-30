@@ -25,7 +25,9 @@ uploaded to the Expo dashboard; follow the steps in order.
 
 - Node 20.x and npm (matching the repo).
 - Java 17 (required by the React Native Gradle plugin).
-- Android SDK + Android 14 (API level 34) platform tools.
+- Android SDK with the Android 16 platform installed — the app compiles against and targets API 36
+  (Google Play requires this for uploads from 2026-08-31). For manual `./gradlew` builds:
+  `sdkmanager "platforms;android-36" "build-tools;36.0.0"`. EAS Build images already include them.
 - Expo CLI installed globally (`npm install -g expo-cli`) or runnable via `npx`.
 - Access to the Google Play Console project with permission to create internal testing releases.
 - A secure place to store long-lived signing credentials (e.g. 1Password, Bitwarden, HashiCorp

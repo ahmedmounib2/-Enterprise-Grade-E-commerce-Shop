@@ -1,54 +1,134 @@
 # Android build configuration notes
 
-This project relies on several custom Gradle settings that Expo's prebuild step generated. They are
-required to build the Android application bundle that is shipped to Google Play.
+The Android project is **generated**, not committed. `mobile/android/` and `mobile/ios/` are
+git-ignored; `expo prebuild` (locally) and EAS Build (in the cloud) recreate them from
+`mobile/app.config.js` on every build. Anything you edit inside `mobile/android/` is discarded on
+the next prebuild.
 
-## `mobile/android/app/build.gradle`
+So the rule is: **change `app.config.js` or a config plugin, never the generated Gradle files.** If
+you need something Expo does not expose as a config field, write a config plugin in
+`mobile/plugins/` — that is what the existing four do.
 
-### Custom `buildTypes`
+## Where the SDK levels come from
 
-The `debug` block that adds `applicationIdSuffix ".dev"`, overrides the app name with `Eshop Dev`,
-and uses the debug keystore lets you install the debug build alongside the release build and avoid
-accidentally shipping a debug-signed bundle. Removing it does not break release builds, but it makes
-local debugging harder because the debug build would share the same application id and label as
-production.
+Three layers, each overriding the one above:
 
-If you already have the `Eshop Dev` build installed on a device, updating the Gradle files does not
-force you to reinstall it. The next time you run `npx expo run:android --variant debug` or
-`./gradlew installDebug`, the package with the `.dev` suffix is updated in place. You only need to
-reinstall manually if you previously removed the `applicationIdSuffix` and installed a build that
-shares the production id, because Android treats those as different apps.
+1. **React Native's Gradle version catalog** —
+   `node_modules/react-native/gradle/libs.versions.toml`. For React Native 0.81 / Expo SDK 54 this
+   declares `compileSdk = 36`, `targetSdk = 36`, `buildTools = "36.0.0"`, `minSdk = 24`,
+   `ndkVersion = "27.1.12297006"`, AGP `8.11.0`, Kotlin `2.1.20`.
+2. **Expo's root-project plugin** reads that catalog and publishes the values as
+   `rootProject.ext.compileSdkVersion` etc., which the generated `app/build.gradle` consumes. It
+   prints them at configuration time under `[ExpoRootProject] Using the following versions:` — the
+   quickest way to confirm what a build actually used.
+3. **`expo-build-properties`** in `app.config.js` writes `android.compileSdkVersion` /
+   `android.targetSdkVersion` / `android.minSdkVersion` into `gradle.properties`, which override the
+   catalog.
 
-### Dependency resolution strategy
+We pin layer 3 explicitly so that an Expo SDK upgrade shows up as a deliberate edit here rather than
+a silent shift underneath the app. The pin must therefore be **kept in step with the Expo defaults**
+— it once sat at 35 while SDK 54 had already moved to 36, which quietly held the app a level behind.
 
-The `configurations.all { resolutionStrategy { ... } }` section pins
-`com.google.android.material:material:1.12.0` and `androidx.core` 1.13.1. Without the forced
-versions Gradle may pull transitive versions that are too old for `compileSdkVersion 35`, causing
-resource merge errors or runtime crashes. Keep the block in place for consistent release builds.
+Current values (Android 16):
 
-## `mobile/android/build.gradle`
+```
+compileSdkVersion  36
+targetSdkVersion   36   # Google Play requires this for uploads from 2026-08-31
+minSdkVersion      24
+buildToolsVersion  (omitted — AGP resolves 36.0.0 from the catalog)
+```
 
-The `ext { ... }` block sets `compileSdkVersion`, `targetSdkVersion`, `minSdkVersion`,
-`buildToolsVersion`, and `ndkVersion`. These values are read in `app/build.gradle` via
-`rootProject.ext.*`. If you remove the block the build fails because those properties become
-undefined, and even if it compiles you risk targeting an SDK level that Play Console rejects.
-Restore the block before creating a release bundle.
+Building locally against API 36 needs the platform installed:
 
-## `mobile/android/gradle.properties`
+```bash
+sdkmanager "platforms;android-36" "build-tools;36.0.0"
+```
 
-- `newArchEnabled=false` keeps the app on the stable React Native architecture. Expo SDK 54 still
-  ships the new architecture behind a flag, so disabling it avoids unexpected native crashes in
-  release builds.
-- `reactNativeArchitectures=arm64-v8a` (optionally with `armeabi-v7a`) controls which ABIs Gradle
-  packages. Play requires 64-bit binaries, so make sure this includes `arm64-v8a` before uploading
-  an AAB.
-- `android.ndkVersion=27.1.12297006` must match the value in the `ext` block so that the native
-  dependencies compile with a known-good NDK. Leaving it undefined can cause build failures on CI
-  where a different NDK is installed.
+EAS Build images already ship them, so this only affects manual `./gradlew` builds.
 
-## What to restore before shipping
+## New Architecture
 
-Before you run `./gradlew clean bundleRelease` or upload to Play, restore the `ext { ... }` block
-and the dependency resolution overrides. Keeping the debug `buildTypes` block and the
-`gradle.properties` entries is strongly recommended so you can reproduce the builds that have
-already been tested.
+`newArchEnabled=false` in the generated `gradle.properties` comes from `app.config.js`. It stays off
+for one specific reason: **`react-native-ssl-pinning@1.6.0` is the only dependency without New
+Architecture support.** It is a legacy bridge module (`ReactContextBaseJavaModule`, no
+`codegenConfig`) reached through the legacy `NativeModules.RNSslPinning` proxy in
+`packages/api-client/sslPinningAdapter.native.js`, so under bridgeless it would rely entirely on the
+TurboModule interop layer. That module sits on the certificate-pinned path for every authenticated
+API call and the adapter **fails closed** in production — an interop failure would take the app
+offline rather than degrade it. Every other native dependency (gesture-handler, safe-area-context,
+screens, svg, webview, all `expo-*`) already ships a `codegenConfig`.
+
+This is a deadline, not a preference: **Expo SDK 55 removes the legacy architecture entirely** and
+`newArchEnabled` disappears from the config. Replacing or forking `react-native-ssl-pinning` is a
+hard prerequisite for that upgrade and needs its own device-verified pinning test.
+
+## Config plugins (`mobile/plugins/`)
+
+| Plugin                  | What it does                                                                                                                                                                                                                           | Removable when                                                  |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `withSslPinningCerts`   | Copies `mobile/certs/*.cer` into the generated `android/app/src/main/assets` so `react-native-ssl-pinning` can load them at runtime. Managed-workflow replacement for the old `copyPinnedCerts` Gradle task.                           | Never — required for pinning.                                   |
+| `withReleaseSigning`    | Injects `signingConfigs.release` into the generated `app/build.gradle` (reads `ESHOP_ANDROID_*`, defers to EAS's injected keystore on EAS Build, throws on a local release build with no credentials).                                 | Never — required for manual release builds.                     |
+| `withSSLPinningFix`     | Disables `verifyReleaseResources` across subprojects. `react-native-ssl-pinning@1.6.0` references `android:attr/lStar` in its compiled resource table, which AGP's static check rejects on local release builds (EAS skips the check). | `react-native-ssl-pinning` ships a fixed build, or is replaced. |
+| `withLargeScreenCompat` | Adds `android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` to `<application>`. **Temporary.**                                                                                                                                 | See below.                                                      |
+
+## Large screens and the compatibility opt-out
+
+Apps targeting API 36 have `android:screenOrientation`, `android:resizableActivity` and the
+aspect-ratio attributes **ignored** on displays whose smallest width is ≥600dp — tablets, foldables,
+desktop windowing. Our `MainActivity` declares `screenOrientation="portrait"`, so without an opt-out
+the app would silently become rotatable and resizable there.
+
+`withLargeScreenCompat` restores the pre-Android-16 behaviour. Google honours the property only
+until apps target API 37, so it buys roughly one release cycle.
+
+Note it does **not** make the app phone-only: a tablet in portrait still hands us an ~800dp window,
+and `src/hooks/useResponsiveColumns.js` correctly renders that as a 3-column grid. The property
+blocks rotation and resizing, not large windows.
+
+Before deleting the plugin, all of these must hold. The first two are already done:
+
+1. ~~No module-scope `Dimensions.get()` — layout constants must come from `useWindowDimensions()`~~
+   so they survive rotation, fold and split-screen resize.
+2. ~~Grids derive their column count from window width~~ (`useResponsiveColumns`, applied across all
+   ten product/category grids; breakpoints pinned by
+   `src/tests/hooks/useResponsiveColumns.test.js`).
+3. `Navbar`, `Footer` and the modal sheets verified in landscape at ≥600dp.
+4. Arabic / RTL verified in landscape — RTL plus a wide layout is the least-tested combination.
+5. Manual pass on a tablet emulator **and** a foldable emulator: portrait, landscape, and 50/50
+   split-screen.
+
+Then delete `plugins/withLargeScreenCompat.js`, drop it from `plugins` in `app.config.js`, and bump
+`versionCode`.
+
+## Other API 36 behaviour changes, and why they are already handled
+
+- **Edge-to-edge is enforced with no opt-out.** Already enabled (`edgeToEdgeEnabled: true`), and
+  insets come from `react-native-safe-area-context` throughout. No change.
+- **Predictive back is on by default**, which stops dispatching `onBackPressed` / `KEYCODE_BACK`.
+  Expo generates `android:enableOnBackInvokedCallback="false"`, so we are explicitly opted out, and
+  React Native's `ReactActivity` already routes through `OnBackPressedDispatcher` regardless.
+- **16 KB page sizes.** React Native 0.81 / Expo SDK 54 native libraries are already aligned, and
+  `react-native-ssl-pinning` ships no `.so` (it is pure Java over OkHttp).
+
+## Versioning
+
+`version` and `android.versionCode` in `app.config.js` are the single source of truth — `eas.json`
+sets `appVersionSource: "local"` and `autoIncrement: false`, so nothing bumps them for you. The
+generated `app/build.gradle` merely mirrors them.
+
+`runtimeVersion.policy` is `appVersion`, so bumping `version` fences a new native binary off from
+OTA updates published for the previous one. That is deliberate — a targetSdk change is native and
+cannot ship over EAS Update, so it _must_ come with a version bump and a fresh store build.
+
+## Verifying a config change
+
+```bash
+cd mobile
+npx expo config --type prebuild          # resolved config, before any native files are written
+npx expo prebuild --platform android --clean --no-install
+
+grep -E 'android\.(compile|target|min)SdkVersion' android/gradle.properties
+grep -E 'versionCode|versionName' android/app/build.gradle
+grep -o '<property[^/]*/>' android/app/src/main/AndroidManifest.xml
+npx expo-doctor
+```
