@@ -100,8 +100,8 @@ export JAVA_HOME="/usr/lib/jvm/java-17-openjdk-amd64"
 yes | sdkmanager --licenses
 yes | sdkmanager \
   "platform-tools" \
-  "platforms;android-35" \
-  "build-tools;35.0.0" \
+  "platforms;android-36" \
+  "build-tools;36.0.0" \
   "ndk;27.1.12297006"
 ```
 
@@ -226,10 +226,10 @@ APP_VARIANT=development npx expo prebuild --platform android   # regenerate andr
 ```
 
 Because `android/` is regenerated from `app.config.js` (plus the config plugins), there is **no
-recovery procedure** after prebuild — everything custom (deep-link scheme, SSL-pinning cert copy,
-SDK versions) is reapplied automatically by `app.config.js`,
-`mobile/plugins/withSslPinningCerts.js`, and `expo-build-properties`. There is nothing to restore
-from git.
+recovery procedure** after prebuild — everything custom (deep-link scheme, release signing, SDK
+versions) is reapplied automatically by `app.config.js`, the plugins under `mobile/plugins/`, and
+`expo-build-properties`. There is nothing to restore from git. SSL pinning needs no native step at
+all: the pins are environment values baked into the JS bundle.
 
 ---
 
@@ -800,7 +800,7 @@ export PATH="$SDK/platform-tools:$SDK/emulator:$SDK/cmdline-tools/latest/bin:$PA
 export JAVA_HOME="/usr/lib/jvm/java-17-openjdk-amd64"
 
 yes | sdkmanager --licenses
-yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.1.12297006"
+yes | sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.1.12297006"
 
 sed -i '/ANDROID_SDK_ROOT/d;/ANDROID_HOME/d;/cmdline-tools/d;/platform-tools/d;/JAVA_HOME/d' ~/.zshrc
 cat >> ~/.zshrc <<'ZRC'

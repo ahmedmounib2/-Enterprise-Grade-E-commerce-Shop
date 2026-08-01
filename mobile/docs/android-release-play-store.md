@@ -11,13 +11,14 @@ uploaded to the Expo dashboard; follow the steps in order.
 > release bundle by running these commands from the repo root:
 >
 > ```bash
-> npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api
+> npm -w mobile run cert:pins          # re-derive the pins from the live chain
+> # update EXPO_PUBLIC_SSL_PINNING_HASHES in mobile/eas.json if the issuer changed
 > eas build --platform android --profile production
 > ```
 >
-> Download the freshly built `.aab` from the EAS dashboard and ship it to testers. EAS prebuilds
-> `android/` from `app.config.js` on each build, so the SSL-pinning config plugin re-copies the
-> certificate automatically — there's nothing to re-sync after a prebuild.
+> Download the freshly built `.aab` from the EAS dashboard and ship it to testers. The pins cover
+> the CA layer rather than the leaf, so a routine Let's Encrypt renewal does **not** invalidate
+> them — only an issuer change does.
 
 ---
 
@@ -368,29 +369,27 @@ only file accepted by Google Play.
 ```bash
 # from repo root
 npm install
-npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api   # refresh the pinned cert
+npm -w mobile run cert:pins   # confirm the configured pins still appear in the live chain
 ```
 
-EAS prebuilds `android/` and copies the cert (via the SSL-pinning config plugin) on every build, so
-there is no native folder to refresh or clean by hand.
+EAS prebuilds `android/` on every build, so there is no native folder to refresh or clean by hand,
+and no certificate file to place — the pins are plain values in the profile's `env` block.
 
 > ℹ️ `EXPO_PUBLIC_API_BASE_URL` in `.env.production` should be the bare origin
 > (`https://api.vexflare.com`). The shared `packages/api-client` module automatically appends the
 > `/api` suffix, so do **not** include it in the environment variable.
 
-Run the EAS build commands from section A after refreshing the cert so the build uses the current
-certificate.
+Run the EAS build commands from section A once the pins are confirmed.
 
 > ✅ Remember: when building the AAB/APK, ensure `mobile/.env` points to production. Do **not**
 > reuse a dev/tunnel `.env`.
 
-If the bundle fails API calls with a `Network request failed` error, it usually means the pinned
-certificate under `mobile/certs/` doesn't match the live Railway host anymore (for example, Let’s
-Encrypt rotated it). Re-run
-`npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api` to capture the current
-certificate, then rebuild — the SSL-pinning config plugin copies the refreshed `.cer` into the
-generated assets at prebuild, so login, checkout (stock/restock mutations), and payment flows all
-resume once the updated bundle is installed.
+If the bundle fails API calls with a `Network request failed` error, run
+`npm -w mobile run cert:pins` and compare its output with `EXPO_PUBLIC_SSL_PINNING_HASHES` in
+`mobile/eas.json`. If none of the configured pins appears in the live chain, the issuer has changed;
+update the value and rebuild, and login, checkout (stock/restock mutations) and payment flows all
+resume once the updated bundle is installed. `adb logcat` shows
+`SSL pinning validation failed for <host>` when a pin is rejected.
 
 ```bash
      npx uri-scheme open "eshop://reset-password?token=TEST123&email=user%40example.com" --android
@@ -453,8 +452,9 @@ Perform these checks **before** uploading anything to Play. Use the sideloaded
 
      Confirm you land on the reset screen and the token/email propagate correctly.
 
-4. If SSL pinning is enabled, double-check that the pinned certificate alias (`eshop_api`) matches
-   the bundled certificate and the live backend TLS chain.
+4. If SSL pinning is enabled, confirm with `npm -w mobile run cert:pins` that at least one
+   configured pin still appears in the live backend TLS chain, and route the device through a MITM
+   proxy once to prove pinning is actually enforced.
 5. Fix any issues before uploading to Google Play.
 
 ---
@@ -550,7 +550,7 @@ monitor Play Console vitals, and update documentation or changelogs as needed.
 1. Pull the latest `main` and merge your feature branch.
 2. Bump `version`/`versionCode` in `mobile/app.config.js`.
 3. Run `npm install`. (EAS prebuilds the native project from `app.config.js` automatically — no
-   manual prebuild needed; refresh the pinned cert with `cert:pull` if it rotated.)
+   manual prebuild needed; re-check the SSL pins with `cert:pins` if the issuer rotated.)
 4. Build on EAS (`eas build --platform android --profile production` for the AAB,
    `--profile internal` for an optional APK).
 5. Smoke-test using the downloaded APK and deep-link command above.

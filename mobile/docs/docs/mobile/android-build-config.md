@@ -48,28 +48,51 @@ EAS Build images already ship them, so this only affects manual `./gradlew` buil
 
 ## New Architecture
 
-`newArchEnabled=false` in the generated `gradle.properties` comes from `app.config.js`. It stays off
-for one specific reason: **`react-native-ssl-pinning@1.6.0` is the only dependency without New
-Architecture support.** It is a legacy bridge module (`ReactContextBaseJavaModule`, no
-`codegenConfig`) reached through the legacy `NativeModules.RNSslPinning` proxy in
-`packages/api-client/sslPinningAdapter.native.js`, so under bridgeless it would rely entirely on the
-TurboModule interop layer. That module sits on the certificate-pinned path for every authenticated
-API call and the adapter **fails closed** in production — an interop failure would take the app
-offline rather than degrade it. Every other native dependency (gesture-handler, safe-area-context,
-screens, svg, webview, all `expo-*`) already ships a `codegenConfig`.
+`newArchEnabled=false` in the generated `gradle.properties` comes from `app.config.js`.
 
-This is a deadline, not a preference: **Expo SDK 55 removes the legacy architecture entirely** and
-`newArchEnabled` disappears from the config. Replacing or forking `react-native-ssl-pinning` is a
-hard prerequisite for that upgrade and needs its own device-verified pinning test.
+**The dependency that blocked it is gone.** `react-native-ssl-pinning@1.6.0` was a legacy bridge
+module (`ReactContextBaseJavaModule`, no `codegenConfig`) reached through the legacy
+`NativeModules.RNSslPinning` proxy, sitting on the certificate-pinned path of every authenticated
+API call. It has been replaced by `react-native-ssl-public-key-pinning`, which ships a TurboModule
+spec (`codegenConfig: { name: RNSslPublicKeyPinningSpec, type: modules }`) and resolves through
+`TurboModuleRegistry.get` when `global.__turboModuleProxy` is present, falling back to
+`NativeModules` otherwise — so it works under both architectures.
+
+Readiness of every remaining native dependency, verified at the pinned versions:
+
+| Dependency                                                                       | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `expo` 54 and all `expo-*` modules                                               | Ready — SDK 54 defaults New Arch on for new projects.                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `@react-navigation/*` v7                                                         | JS only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `react-native-screens`, `safe-area-context`, `gesture-handler`, `svg`, `webview` | Ready — all ship a `codegenConfig`.                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `react-native-ssl-public-key-pinning`                                            | Ready — TurboModule spec.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `react-native-keyboard-aware-scroll-view` 0.9.5                                  | Compatible. Unmaintained since ~2020, so it was audited by source: `UIManager.viewIsDescendantOf` is implemented for bridgeless in `BridgelessUIManager.js` (via `FabricUIManager.compareDocumentPosition`), `UIManager.measureInWindow` dispatches Fabric tags in `UIManager.js`, and `scrollResponderScrollNativeHandleToKeyboard` plus `TextInput.State.currentlyFocusedInput` both still exist in RN 0.81.5. It is also currently unimported anywhere in `mobile/src`. |
+| Custom native modules                                                            | None.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+
+So there is **no remaining blocker** — only cost. Enabling Fabric re-renders every screen and needs
+a full-app device pass (RTL, modals, lists, keyboard handling), which is unrelated to any pinning
+work. It therefore stays off until it can be done as its own change, so that any regression is
+attributable to a single architectural switch.
+
+Still a deadline, not a preference: **Expo SDK 55 removes the legacy architecture entirely** and
+`newArchEnabled` disappears from the config. The follow-up task is to flip `newArchEnabled`, upgrade
+to SDK 55, re-run the device matrix, and verify keyboard-aware scrolling behaviourally — replacing
+it with `react-native-keyboard-controller` only if it actually misbehaves.
 
 ## Config plugins (`mobile/plugins/`)
 
-| Plugin                  | What it does                                                                                                                                                                                                                           | Removable when                                                  |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `withSslPinningCerts`   | Copies `mobile/certs/*.cer` into the generated `android/app/src/main/assets` so `react-native-ssl-pinning` can load them at runtime. Managed-workflow replacement for the old `copyPinnedCerts` Gradle task.                           | Never — required for pinning.                                   |
-| `withReleaseSigning`    | Injects `signingConfigs.release` into the generated `app/build.gradle` (reads `ESHOP_ANDROID_*`, defers to EAS's injected keystore on EAS Build, throws on a local release build with no credentials).                                 | Never — required for manual release builds.                     |
-| `withSSLPinningFix`     | Disables `verifyReleaseResources` across subprojects. `react-native-ssl-pinning@1.6.0` references `android:attr/lStar` in its compiled resource table, which AGP's static check rejects on local release builds (EAS skips the check). | `react-native-ssl-pinning` ships a fixed build, or is replaced. |
-| `withLargeScreenCompat` | Adds `android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` to `<application>`. **Temporary.**                                                                                                                                 | See below.                                                      |
+| Plugin                  | What it does                                                                                                                                                                                           | Removable when                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------- |
+| `withReleaseSigning`    | Injects `signingConfigs.release` into the generated `app/build.gradle` (reads `ESHOP_ANDROID_*`, defers to EAS's injected keystore on EAS Build, throws on a local release build with no credentials). | Never — required for manual release builds. |
+| `withLargeScreenCompat` | Adds `android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` to `<application>`. **Temporary.**                                                                                                 | See below.                                  |
+
+Two pinning-related plugins were deleted alongside the `react-native-ssl-public-key-pinning`
+migration. `withSslPinningCerts` copied `mobile/certs/*.cer` into the generated Android assets; pins
+are now base64 SPKI hashes in `EXPO_PUBLIC_SSL_PINNING_HASHES`, so there is no file to copy — and no
+Android-only asymmetry (the old plugin never ran for iOS, which therefore was never pinned).
+`withSSLPinningFix` disabled `verifyReleaseResources` across subprojects because
+`react-native-ssl-pinning@1.6.0` referenced `android:attr/lStar` in its compiled resource table;
+with that dependency gone, AGP's static check passes on its own.
 
 ## Large screens and the compatibility opt-out
 
@@ -108,7 +131,7 @@ Then delete `plugins/withLargeScreenCompat.js`, drop it from `plugins` in `app.c
   Expo generates `android:enableOnBackInvokedCallback="false"`, so we are explicitly opted out, and
   React Native's `ReactActivity` already routes through `OnBackPressedDispatcher` regardless.
 - **16 KB page sizes.** React Native 0.81 / Expo SDK 54 native libraries are already aligned, and
-  `react-native-ssl-pinning` ships no `.so` (it is pure Java over OkHttp).
+  `react-native-ssl-public-key-pinning` ships no `.so` (it is pure Kotlin/Java over OkHttp).
 
 ## Versioning
 

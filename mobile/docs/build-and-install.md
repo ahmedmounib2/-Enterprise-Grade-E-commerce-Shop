@@ -52,8 +52,9 @@ adb install -r "$APK_ABS"
 adb install -r "/mnt/c/Users/Admin/Downloads/<downloaded>.apk"
 ```
 
-> Internal builds run with SSL pinning **OFF** (`EXPO_PUBLIC_SSL_PINNING_CERTS` empty), so no
-> certificate is needed. See `docs/deployment.md` → "SSL certificate pinning".
+> Internal builds run with SSL pinning **ON**, resolved from `mobile/ssl-pins.json` — the same
+> canonical source production uses, so the two are byte-identical apart from the application id.
+> That holds for local Gradle builds too. Full reference: [`ssl-pinning.md`](./ssl-pinning.md).
 >
 > The `internal` and `production` profiles also inject the public runtime env in `eas.json`
 > (`EXPO_PUBLIC_API_BASE_URL`, `EXPO_PUBLIC_WEB_ASSET_ORIGIN`, and the `EXPO_PUBLIC_FEATURE_*`
@@ -91,7 +92,8 @@ automatically, so a **release** build needs the keystore exported first.
    bakes in whatever `mobile/.env` currently holds:
    - Vexflare (Dev): `npm -w mobile run env:tunnel` (ngrok API URL, feature flags, etc.)
    - Vexflare (Internal): `npm -w mobile run env:internal` (production API URL + correct feature
-     flags)
+     flags). SSL pins are **not** in `.env` — `app.config.js` supplies them from `ssl-pins.json`, so
+     a local internal release build is pinned exactly like an EAS one.
 2. **Clean prebuild when switching variants** — always regenerate `android/` with `--clean`:
    `APP_VARIANT=development npx expo prebuild --platform android --clean` or
    `APP_VARIANT=internal npx expo prebuild --platform android --clean`.
@@ -112,6 +114,9 @@ export ESHOP_ANDROID_KEYSTORE_PASSWORD='<from Bitwarden>'
 export ESHOP_ANDROID_KEY_ALIAS='<from Bitwarden>'
 export ESHOP_ANDROID_KEY_PASSWORD='<from Bitwarden>'
 
+# Generate production env
+
+npm -w mobile run env:production
 
 cd mobile
 # Wipe Metro's cache
@@ -153,6 +158,153 @@ cd android && ./gradlew assembleRelease
 adb uninstall com.ahmedmonib.eshop.internal || true
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
+
+### Pin-enforcement regression APK (`internal-pinfail`)
+
+A build whose SSL pins are **deliberately wrong**, used to prove that pinning is actually enforced
+rather than silently inert. Run it after any certificate rotation, any change to the pin set, and
+any upgrade of `react-native-ssl-public-key-pinning`.
+
+Why this and not a MITM proxy: apps targeting API 24+ do not trust user-installed CA certificates,
+and this app targets API 36 with no `network_security_config.xml`. Installing a mitmproxy/Charles CA
+through Settings therefore makes **every** build reject the intercepted connection — pinned or not,
+with `ERR_CERT_AUTHORITY_INVALID` from Android's own chain validation, several layers below the
+pinning check. A "blocked" result there proves nothing. This test changes only the pin values, so
+pinning is the sole variable.
+
+`npm -w mobile run env:internal-pinfail` writes `mobile/.env` **from the `internal-pinfail` profile
+in `eas.json`** rather than from a `.env.internal-pinfail` file. `mobile/.env.*` is git-ignored, so
+a committed per-profile file is impossible; generating from `eas.json` keeps one copy of the values
+and guarantees the local APK and `npm -w mobile run eas:build:pinfail` are identical.
+
+```bash
+export ESHOP_ANDROID_KEYSTORE=~/Dev/secrets/eshop-upload-keystore.jks
+export ESHOP_ANDROID_KEYSTORE_PASSWORD='<from Bitwarden>'
+export ESHOP_ANDROID_KEY_ALIAS='<from Bitwarden>'
+export ESHOP_ANDROID_KEY_PASSWORD='<from Bitwarden>'
+
+# Generate .env from the internal-pinfail eas.json profile (intentionally invalid pins).
+npm -w mobile run env:internal-pinfail
+
+cd mobile
+APP_VARIANT=internal npx expo prebuild --platform android --clean
+
+# Wipe Metro's cache — a stale bundle would still carry the CORRECT pins and the test
+# would pass for the wrong reason.
+npx expo start --clear &
+sleep 5 && kill %1
+
+cd android && ./gradlew assembleRelease
+# output: app/build/outputs/apk/release/app-release.apk
+
+adb uninstall com.ahmedmonib.eshop.internal || true
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+
+**Expected result — failure is the pass condition:**
+
+| Observation                                                    | Verdict                                     |
+| -------------------------------------------------------------- | ------------------------------------------- |
+| Every API call fails; login/browse never load                  | ✅ pinning is enforced                      |
+| `SSL pinning validation failed for api.vexflare.com` in logcat | ✅ the pin comparison ran and rejected      |
+| The app works normally                                         | ❌ **pinning is not being enforced — stop** |
+
+```bash
+adb logcat -c && adb logcat | grep -iE "SSL pinning|CertificatePinner|SSLPeerUnverified"
+```
+
+Note `chromium … net_error` lines come from the WebView stack, not the OkHttp client the API uses —
+an OkHttp pin rejection surfaces as `SSLPeerUnverifiedException: Certificate pinning failure!` plus
+the JS listener line above.
+
+**Restore the normal environment afterwards** — the generated `.env` carries a warning banner, but a
+forgotten one is otherwise invisible until a later build behaves strangely:
+
+```bash
+npm -w mobile run env:internal
+cd mobile && APP_VARIANT=internal npx expo prebuild --platform android --clean
+cd android && ./gradlew assembleRelease
+adb uninstall com.ahmedmonib.eshop.internal || true
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+
+The restored build must work normally again — that half matters too, since it confirms the shipped
+pins still match the live chain and no lockout is waiting in production.
+
+> **Full runbook:** [`ssl-pinning.md`](./ssl-pinning.md) carries the complete step-by-step
+> procedures — environment prerequisites, Charles/mitmproxy setup, per-profile checklists,
+> production verification, certificate rotation and troubleshooting. The summaries below are a quick
+> reference; that document is authoritative.
+
+### MITM interception test (`internal-mitm` / `internal-mitm-nopin`)
+
+The `internal-pinfail` test above proves the pin comparison runs. This one proves the stronger
+property: that pinning rejects a certificate **the device otherwise accepts** — the actual MITM
+threat model.
+
+**Why a plain Charles/Proxyman test cannot show this.** Installing the proxy CA through Android
+Settings adds it to the _user_ store, and apps targeting API 24+ trust only the _system_ store. The
+chain fails ordinary validation with
+`SSLHandshakeException: Trust anchor for certification path not found`, and OkHttp evaluates
+`CertificatePinner` **only after** the platform TrustManager accepts a chain — so the pinner never
+runs. Every build fails identically, pinned or not. The tell that you are hitting this rather than
+pinning: unrelated components fail the same way in logcat (`dev.expo.updates`, and Android's own
+`NetworkMonitor PROBE_HTTPS`), and the proxy shows **no** flows at all rather than a failed
+handshake for the API host.
+
+The `internal-mitm*` profiles set `ANDROID_TRUST_USER_CAS=1`, which activates
+`plugins/withUserCaTrust.js` — it emits a `network_security_config.xml` trusting user CAs and wires
+it into the manifest. That removes the confound, so the proxy CA becomes genuinely valid and pinning
+is the only remaining defence.
+
+> These builds are **deliberately interceptable**. Never distribute one. The plugin throws if
+> `ANDROID_TRUST_USER_CAS=1` is combined with `APP_VARIANT=production`, and it is completely inert
+> without the flag (no XML, no manifest attribute), so normal builds are unaffected.
+
+Run both halves, changing only the profile:
+
+```bash
+# Harness check — unpinned, interceptable. Charles MUST see the traffic.
+npm -w mobile run env:internal-mitm-nopin
+# …or on EAS: npm -w mobile run eas:build:mitm-nopin
+
+# Pinning check — same build, real pins. Charles must see NOTHING.
+npm -w mobile run env:internal-mitm
+# …or on EAS: npm -w mobile run eas:build:mitm
+
+# then, for either:
+cd mobile && APP_VARIANT=internal npx expo prebuild --platform android --clean
+npx expo start --clear & sleep 5 && kill %1      # stale bundle would carry the wrong config
+cd android && ./gradlew assembleRelease
+adb uninstall com.ahmedmonib.eshop.internal || true
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+
+## Verification checklist
+
+Run with the device proxied through Charles and its CA installed via Settings. Steps 1 and 2 are the
+differential pair — **step 1 failing to show traffic invalidates step 2**, because it means the
+harness itself is not intercepting.
+
+| #   | Build                 | Proxy | Expected                                                                                                                                                                                  |
+| --- | --------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | `internal-mitm-nopin` | on    | Charles **shows** decrypted API traffic to `api.vexflare.com`. App works. Proves the harness intercepts.                                                                                  |
+| 2   | `internal-mitm`       | on    | Charles shows **no** API flows. App shows network errors. Logcat: `SSLPeerUnverifiedException` / `Certificate pinning failure!` and `SSL pinning validation failed for api.vexflare.com`. |
+| 3   | `internal`            | on    | Blocked (by CA distrust, before pinning). Confirms the shipped build is not interceptable in the field.                                                                                   |
+| 4   | `internal`            | off   | App works normally end to end — login, browse, checkout. Confirms the real backend is unaffected.                                                                                         |
+| 5   | `production` AAB      | off   | App works normally. Run before any Play upload.                                                                                                                                           |
+| 6   | `production` AAB      | on    | Blocked. Same CA-distrust reason as step 3; it is a smoke check, not a pinning proof.                                                                                                     |
+
+```bash
+adb logcat -c && adb logcat | grep -iE "SSL pinning|CertificatePinner|SSLPeerUnverified|Trust anchor"
+```
+
+Reading the log lines: `Trust anchor for certification path not found` means **Android** rejected
+the chain (steps 3 and 6). `Certificate pinning failure!` / `SSLPeerUnverifiedException` means
+**pinning** rejected it (step 2). Only the second proves pinning works.
+
+Afterwards, restore with `npm -w mobile run env:internal` and rebuild — the `internal-mitm*` `.env`
+carries a warning banner, but a forgotten one leaves you building interceptable APKs.
 
 Local development client (debug build, no keystore needed):
 
@@ -290,7 +442,9 @@ adb uninstall com.ahmedmonib.eshop          || true
 
 ### 2) “Network error” on the internal APK
 
-Internal builds ship with pinning **OFF**. Clear app data and check runtime logs:
+Internal builds ship with pinning **ON**, so first confirm the configured pins still appear in the
+live chain (`npm -w mobile run cert:pins`) and match `eas.json`. Then clear app data and check
+runtime logs — a pin failure logs `SSL pinning validation failed for <host>`:
 
 ```bash
 adb shell pm clear com.ahmedmonib.eshop.internal
@@ -328,7 +482,7 @@ adb kill-server && adb start-server && adb devices -l
 
 ## Mental model
 
-- **Internal APK** = quick sideload via `eas build --profile internal`, pinning **OFF**, id
+- **Internal APK** = quick sideload via `eas build --profile internal`, pinning **ON**, id
   `com.ahmedmonib.eshop.internal`. Its distinct id means it coexists with prod.
 - **Play AAB** = `eas build --profile production`, signed by the Expo-dashboard keystore, uploaded
   to the Console. Bump `versionCode` for every upload.

@@ -144,7 +144,11 @@ repo root
 - **i18n:** Same `@eshop/locales` package as frontend, same 4 locales.
 - **Env files:** Multiple env profiles (`emu`, `lan`, `tunnel`, `production`). Switch with
   `npm run env:<profile>` before starting.
-- **SSL pinning:** `react-native-ssl-pinning` via `packages/api-client/sslPinningAdapter.native.js`.
+- **SSL pinning:** `react-native-ssl-public-key-pinning` via
+  `packages/api-client/sslPinningAdapter.native.js`. Pins are base64 SHA-256 SPKI hashes whose
+  single canonical source is `mobile/ssl-pins.json`; `app.config.js` injects them into `extra`.
+  Rotate with `npm -w mobile run cert:pins -- --write`. Full reference:
+  `mobile/docs/ssl-pinning.md`.
 
 ### Shared (`shared/`)
 
@@ -160,7 +164,9 @@ Published as `@eshop/locales`. Exports:
 ### `packages/api-client` (`@eshop/api-client`)
 
 Thin axios wrapper. Call `setBaseURL(url)` once at app startup. Platform-specific SSL pinning
-adapter loaded automatically in React Native via Metro resolver (`.native.js` suffix).
+adapter loaded automatically in React Native via Metro resolver (`.native.js` suffix). The native
+adapter installs pinning globally (OkHttp `CertificatePinner` / TrustKit) and then delegates to
+axios' stock adapter; it fails closed and cannot be disabled at runtime.
 
 ---
 

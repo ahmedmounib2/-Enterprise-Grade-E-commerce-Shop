@@ -9,7 +9,7 @@
 > - Stripe Checkout integration with robust webhook handling (PaymentIntent verification, refunds,
 >   expired sessions)
 > - Order export (PDF) & fulfilment tooling, GDPR data export, Sentry observability, and 89.3%
->   backend test line coverage across 4,373 automated tests.
+>   backend test line coverage across 4,390 automated tests.
 
 ---
 
@@ -2614,8 +2614,6 @@ All mobile-specific runbooks live alongside the app code:
   readiness checklist for generating an Android App Bundle and submitting to Play Console.
 - [`mobile/docs/docs/mobile/android-build-config.md`](mobile/docs/docs/mobile/android-build-config.md)
   — Native build configuration (gradle.properties, signing files, `eas.json` notes).
-- [`mobile/certs/README.md`](mobile/certs/README.md) — How signing certificates are stored and
-  rotated during release.
 - Expo CLI metadata (`mobile/.expo/`) is ephemeral and Git-ignored; regenerate locally via
   `expo start` when needed.
 
@@ -7918,9 +7916,12 @@ history remains consistent.
   Datadog-friendly `datadog.metric` log events are still emitted alongside the scrape endpoint. For
   the token rotation strategy and future multi-scraper support, see
   [`docs/security/monitoring-metrics-access.md`](docs/security/monitoring-metrics-access.md).
-- **Mobile SSL pinning:** `react-native-ssl-pinning` is fail-closed in production — if the native
-  module is missing and `EXPO_PUBLIC_SSL_PINNING_CERTS` is set, the app throws rather than falling
-  back to an unpinned connection.
+- **Mobile SSL pinning:** `react-native-ssl-public-key-pinning` is fail-closed in production — if
+  the native module is missing while `EXPO_PUBLIC_SSL_PINNING_HASHES` is set, the app throws rather
+  than falling back to an unpinned connection, and a failed initialization rejects every request.
+  Pinning cannot be disabled at runtime, so a network error can never downgrade the connection. Pins
+  are base64 SHA-256 SPKI hashes of the API's CA chain (`npm -w mobile run cert:pins`); they are not
+  secrets and live in `mobile/eas.json`.
 - **Job-health alerting:** settlement and payout cron job health alerts fan out via email (to the
   admin recipient list) and optionally to a Slack webhook (`OPS_SLACK_WEBHOOK`).
 
@@ -8325,10 +8326,11 @@ You can test both the **pure purge function** and the **scheduled cron execution
 - **Backend:** 261 suites, 3,722 tests — all passing. One suite (`notification.controller.spec.js`)
   skips itself unless `FEATURE_IN_APP_NOTIFICATIONS=true`, accounting for the single reported skip.
 - **Frontend:** 70 suites, 487 tests — all passing.
-- **Mobile:** 29 suites, 164 tests — 160 passing, 3 failing, 1 todo. The failures are in
-  `StorefrontScreen.test.js` and are an environment limitation rather than a product defect:
-  `ExpandableText` renders a hidden measurement copy that unmounts on the first `onTextLayout`
-  event, which jsdom never fires, so the duplicate text persists and `getByText` matches twice.
+- **Mobile:** 29 suites, 164 tests — all passing (1 `todo`). Screens using `ExpandableText` must
+  settle it before asserting on the clamped text: it renders a hidden copy to measure the real line
+  count and unmounts that copy on the first `onTextLayout`, an event the RN test renderer never
+  fires. `StorefrontScreen.test.js` dispatches `textLayout` explicitly (`settleExpandableText`) so
+  the component reaches the state it holds on device.
 - **Coverage:** see [Coverage](#coverage) above (89.3% lines / 87.73% statements / 88.21% functions
   / 73.84% branches; unit + integration). Full test suite includes authorization flows, stock
   reservation, Stripe webhooks, and end-to-end checkout scenarios — see
@@ -9788,8 +9790,6 @@ Extra reference material that complements this README:
   — AAB sideload/testing guide.
 - [`mobile/docs/mobile-checkout-flow.md`](mobile/docs/mobile-checkout-flow.md) — annotated mobile
   checkout sequence with deeplink notes.
-- [`mobile/certs/README.md`](mobile/certs/README.md) — explains the local HTTPS certificates and how
-  to rotate them.
 - [`cert/README.md`](cert/README.md) — mkcert regeneration instructions for the backend local
   development TLS certificate.
 - [`SECURITY.md`](SECURITY.md) — credential revocation log and `SESSION_SECRET` rotation notes.

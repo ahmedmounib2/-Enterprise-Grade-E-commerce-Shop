@@ -123,16 +123,60 @@ actually stuck.
 
 ### SSL certificate pinning
 
-`mobile/plugins/withSslPinningCerts.js` (a local config plugin) copies `mobile/certs/*.cer` into the
-generated `android/app/src/main/assets/` during prebuild — the managed-workflow replacement for the
-old `copyPinnedCerts` Gradle task. The `.cer` files are **git-ignored** (fetched on demand with
-`npm -w mobile run cert:pull`), so they are absent on EAS unless provided:
+Pinning uses `react-native-ssl-public-key-pinning` (OkHttp `CertificatePinner` on Android, TrustKit
+on iOS), installed through `packages/api-client/sslPinningAdapter.native.js`. It is configured with
+**base64 SHA-256 hashes of each certificate's SubjectPublicKeyInfo**, carried in
+`EXPO_PUBLIC_SSL_PINNING_HASHES` — there are no certificate files and no prebuild copy step.
 
-- **Internal / development** builds run with pinning **off** (`EXPO_PUBLIC_SSL_PINNING_CERTS`
-  empty), so no cert is needed — the plugin safely no-ops.
-- **Production** pinning needs the cert present at prebuild. Provide it on EAS via an
-  `eas-build-post-install` hook that runs `cert:pull`, or supply it as an EAS file secret. (The
-  plugin copies whatever `.cer` files exist and skips silently when none are present.)
+**`mobile/ssl-pins.json` is the single canonical source of the hashes.** `app.config.js` reads it
+and injects the values into `extra`, so EAS builds and local Gradle builds are fed from the same
+place and cannot drift. Nothing else in the repository holds them — a test enforces this.
+
+Those hashes are **not secrets**: they are hashes of public keys that anyone connecting to the API
+can compute. They belong committed in `ssl-pins.json`. Do not put them in EAS Secrets, Bitwarden,
+Railway variables, or GitHub Secrets — that would only make rotation harder.
+
+Full reference, including the verification suite and the rotation procedure:
+[`mobile/docs/ssl-pinning.md`](../mobile/docs/ssl-pinning.md).
+
+Regenerate them at any time with:
+
+```bash
+npm -w mobile run cert:pins            # print the live chain
+npm -w mobile run cert:pins -- --write # update mobile/ssl-pins.json in place
+```
+
+**Which certificates to pin.** `api.vexflare.com` is a CNAME to Railway, which auto-renews its Let's
+Encrypt certificate roughly every 60 days with a **new private key each time**. Pinning the leaf
+would therefore stop every installed app at the next renewal, recoverable only by a store release.
+Both OkHttp and TrustKit match on _any_ certificate in the verified chain, so we pin the
+**intermediates and the root** instead (the `cert:pins` script prints exactly this set and excludes
+the leaf on purpose). Three pins are shipped, expiring 2028 / 2032 / 2035, so leaf renewal, issuer
+rotation and an ISRG root transition each still leave a valid pin. TrustKit requires at least two.
+
+This means the app accepts any certificate Let's Encrypt issues for the hostname. That still defeats
+the real threat — a locally installed CA (Charles, Proxyman, corporate MITM) or any other CA in the
+device trust store — but not an attacker who could obtain an LE certificate for the domain. Leaf
+pinning is the only stronger option and is unavailable while Railway owns the key.
+
+**Safety valve.** `DEFAULT_PIN_EXPIRATION_DATE` in `sslPinningAdapter.native.js` (currently
+`2027-08-01`) disables pin validation in the field on that date. If the API's CA ever changes in a
+way no shipped pin covers, an installed binary would be unable to reach the API _and_ unable to
+download an OTA update to fix itself; this bounds that failure instead of leaving it open-ended.
+Review the date at each release.
+
+**Rollback.** Set `MOBILE_SSL_PINNING_DISABLED=1` in the affected profile's `env` in
+`mobile/eas.json` and rebuild — pinning goes off, nothing else changes. Note this requires a **new
+store build**: it cannot be shipped as an OTA, because a binary that cannot reach the API also
+cannot download an update. The expiration date above is the last-resort net for builds already in
+the field.
+
+- **Development** builds resolve the same pins, but pinning is skipped automatically whenever the
+  API host is `localhost`, a raw IPv4 address, or a known tunnel domain — so `env:emu` / `env:lan` /
+  `env:tunnel` need no special handling.
+- **Internal and production** are pinned and resolve byte-identical pinning configuration; they
+  differ only in application id and update channel. EAS needs no file secret and no
+  `eas-build-post-install` hook.
 
 ### Signing
 

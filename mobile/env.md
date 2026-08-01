@@ -235,34 +235,40 @@ the shared "Map unavailable — enter your address manually" fallback.
 
 For a **release build**, always run `npm -w mobile run env:production` (from the repo root) before
 invoking Gradle or EAS. The script copies `.env.production` into `mobile/.env`, embedding the public
-Railway hostname inside the bundle, and mirrors any `.cer` files under `mobile/certs/` into
-`android/app/src/main/assets/` so the `react-native-ssl-pinning` module can initialize. If pinning
-is enabled but the requested certificates are missing, the helper now aborts with a descriptive
-error so you never accidentally ship a build that will throw `Network request failed` on every API
-call. The mobile API client trims trailing slashes and automatically appends `/api`, so the
-production profile deliberately omits the suffix—this keeps the setting in sync with Railway's
-`SERVER_URL` value. Run `npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api` to
-snapshot the current production certificate before switching to the production profile.
+Railway hostname and the SSL pin hashes inside the bundle. There is no certificate-copying step: the
+pins are plain strings in the env file, so nothing has to be present on disk at prebuild time. The
+mobile API client trims trailing slashes and automatically appends `/api`, so the production profile
+deliberately omits the suffix—this keeps the setting in sync with Railway's `SERVER_URL` value.
 
 ### Transport security & pinning
 
-- `EXPO_PUBLIC_SSL_PINNING_CERTS` — comma-separated list of certificate basenames (without file
-  extension) stored under `mobile/certs/`. Example: `EXPO_PUBLIC_SSL_PINNING_CERTS=eshop_api`. The
-  certificates must match the public keys served by your production API host. Pinning defends
-  against malicious Wi-Fi access points and compromised certificate authorities by rejecting TLS
-  handshakes unless the presented public key matches the bundled cert.
+- `EXPO_PUBLIC_SSL_PINNING_HASHES` — comma-separated **base64 SHA-256 hashes of each certificate's
+  SubjectPublicKeyInfo** for the API host. **Do not set this in any `.env` file.** Its canonical
+  source is `mobile/ssl-pins.json`, which `app.config.js` injects into `extra`; setting it by hand
+  reintroduces exactly the drift that once left local builds unpinned. Rotate with
+  `npm -w mobile run cert:pins -- --write`. Pinning defends against malicious Wi-Fi access points
+  and compromised or locally installed certificate authorities by rejecting TLS handshakes unless a
+  certificate in the presented chain matches one of the pins. Full reference:
+  [`docs/ssl-pinning.md`](./docs/ssl-pinning.md).
+- **Pin the intermediates and root, not the leaf.** Railway auto-renews the Let's Encrypt
+  certificate roughly every 60 days with a new private key, so a leaf pin would break every
+  installed app at the next renewal. `cert:pins` excludes the leaf from its suggested value on
+  purpose. See `docs/deployment.md` for the full rationale and the expiration-date safety valve.
 - **Why dev builds usually skip pinning** – day-to-day development relies on localhost servers, LAN
   IPs (e.g., `http://192.168.1.50:5001`), or temporary HTTPS tunnels (ngrok, Cloudflare tunnels).
   Those endpoints rotate certificates frequently or present self-signed certs, so the app
   automatically disables pin enforcement whenever the API URL resolves to `localhost`, a raw IPv4
   address, or a known tunnelling domain suffix (e.g., `*.ngrok-free.app`). Leave
-  `EXPO_PUBLIC_SSL_PINNING_CERTS` empty for emulator-only work; populate it only when you need to
+  `EXPO_PUBLIC_SSL_PINNING_HASHES` empty for emulator-only work; populate it only when you need to
   exercise production-grade networking against the Railway API or another stable host.
-- **How to test the pin** – run a dev client with the variable set and point
-  `EXPO_PUBLIC_API_BASE_URL` at the production hostname. Any MITM attempt (Charles proxy, custom
-  VPN) should trigger a network error with a "pin validation failed" message in the JS console. For
-  debugging, you can temporarily comment the pin list, rebuild the dev client, and restore it once
-  testing is complete.
+- **Pinning cannot be turned off at runtime.** Once installed it stays installed for the process. A
+  failed initialization rejects every request rather than falling back to an unpinned connection.
+- **How to test the pin** – build a dev client with the variable set and point
+  `EXPO_PUBLIC_API_BASE_URL` at the production hostname, then route the device through Charles or
+  Proxyman with its CA installed. Every API call must fail, and a
+  `SSL pinning validation failed for <host>` line must appear in the device log. On iOS the
+  `networkInspector: false` build property is required for this to work — the dev network inspector
+  proxies URLSession and would defeat TrustKit.
 
 ---
 
@@ -436,15 +442,16 @@ Sanity checks:
 ### Release checklist
 
 - [ ] Verify Vercel (web) and Railway (API) deployments are healthy.
-- [ ] Refresh the pinned TLS certificate before each store submission:
+- [ ] Re-check the SSL pins against the live certificate chain before each store submission. The
+      pins cover the CA layer, so a routine renewal will not change them — this confirms the issuer
+      has not rotated:
 
   ```bash
-  npm -w mobile run cert:pull -- --host api.vexflare.com --name eshop_api
+  npm -w mobile run cert:pins
   ```
 
-- [ ] Switch the Expo env to production (this also mirrors the `.cer` files into
-      `android/app/src/main/assets/`). Run it **again** after any `expo prebuild --clean` because
-      Expo wipes the assets folder:
+- [ ] Switch the Expo env to production. No asset sync is involved any more, so it does **not** need
+      re-running after `expo prebuild --clean`:
 
   ```bash
   npm -w mobile run env:production
