@@ -871,11 +871,18 @@ Any unticked box → do not promote to Production. See [Promote, or roll back](#
 
 `api.vexflare.com` is served by **Railway**, which auto-renews its Let's Encrypt certificate roughly
 every 60 days with a **new private key each time**. Because we pin the CA layer and not the leaf, a
-routine renewal changes nothing and **no action is required**. Only an issuer or CA change does.
+routine renewal changes nothing and **no action is required**. Rotation is needed only when the
+public key behind a pinned certificate changes — a CA re-keying an intermediate under the same name
+counts, as does dropping a cross-signed path or moving to a different CA — or ahead of the pin set's
+own `expirationDate`. Only `mobile/ssl-pins.json` is edited; no environment variable changes.
 
 ### Procedure
 
 ```bash
+# 0. Is rotation needed at all? Exits non-zero when no configured pin still
+#    appears in the live chain. A routine leaf renewal will not trip it.
+npm -w mobile run cert:pins -- --check
+
 # 1. Regenerate the canonical file from the live chain.
 npm -w mobile run cert:pins -- --write
 
