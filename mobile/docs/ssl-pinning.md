@@ -11,6 +11,7 @@ called out explicitly rather than guessed.
 - [2. Build matrix](#2-build-matrix)
 - [3. Proxy setup (Charles / mitmproxy)](#3-proxy-setup-charles--mitmproxy)
 - [4. Test procedures](#4-test-procedures)
+  - [4.5 Cleanup — restore the device and the laptop](#45-cleanup--restore-the-device-and-the-laptop)
 - [5. Production release verification](#5-production-release-verification)
   - [Release verification checklist (< 5 min)](#release-verification-checklist--5-minutes-before-uploading)
   - [Post-upload verification checklist](#post-upload-verification-checklist)
@@ -19,6 +20,11 @@ called out explicitly rather than guessed.
 - [8. Verification command reference](#8-verification-command-reference)
 - [9. Troubleshooting](#9-troubleshooting)
 - [10. Final acceptance checklist](#10-final-acceptance-checklist)
+- [11. Reproducing verification on a new laptop](#11-reproducing-ssl-pinning-verification-on-a-new-laptop)
+
+**New machine, nothing set up?** Start at
+[section 11](#11-reproducing-ssl-pinning-verification-on-a-new-laptop) — it is the ordered
+end-to-end path through everything below.
 
 ---
 
@@ -306,6 +312,27 @@ Charles manually, and the certificate is installed on the **phone**, not on Wind
 > not matter for the manual-proxy flow described here. If Windows blocks the listening socket, an
 > elevated launch plus the firewall step in 3.3 resolves it.
 
+**Installing mitmproxy instead.** mitmproxy is the free alternative and is referenced throughout
+section 3 alongside Charles. It is **not** part of this repository's toolchain — nothing in
+`package.json` depends on it, and the original verification of this migration was performed with
+Charles on Windows, so the mitmproxy path below is the documented equivalent rather than a tested
+one. Install it from the official distribution for your platform:
+
+- **All platforms —** standalone binaries from **<https://mitmproxy.org/downloads/>**. Download,
+  extract, and run `mitmweb` from the extracted directory. This needs no Python and no package
+  manager, which makes it the most reproducible option on a fresh machine.
+- **Windows —** the `.msi` installer from the same page puts `mitmweb` on `PATH`.
+- **Linux / WSL —** the same standalone tarball. Distribution packages (`apt install mitmproxy`)
+  exist but are often several releases behind.
+
+Confirm it is on `PATH` before use:
+
+```bash
+mitmweb --version
+```
+
+Whichever proxy you install, it runs on the **laptop**. Section 3.6 points the phone at it.
+
 ### 3.3 Windows Defender Firewall
 
 The **most common reason the phone cannot reach the proxy at all.**
@@ -374,8 +401,16 @@ only; a stale Wi-Fi proxy left configured on the phone from a previous session; 
 
 > **mitmproxy equivalent.** `mitmweb --listen-port 8080`. The web UI port is printed at startup —
 > read it from mitmweb's own output rather than assuming, as it increments when a port is busy
-> (`8081` by default; `8082` was observed during this migration). The CA lives at
+> (`8081` by default; `8082` was observed during this migration). **Open that printed URL in the
+> laptop's browser**: it renders a live flow table that is used exactly like the Charles flow list —
+> the same three interception checks in 3.8 (flows appear, `api.vexflare.com` appears, request and
+> response bodies are readable) are performed there. The CA lives at
 > `~/.mitmproxy/mitmproxy-ca-cert.cer` and is also served from `mitm.it` while the proxy is active.
+>
+> **Stopping it:** press **Ctrl+C** in the terminal running `mitmweb`. It runs in the foreground, so
+> that is the whole procedure — the listener closes and the web UI stops responding. Leave the
+> terminal open until you are finished testing; closing it also terminates the proxy. No force-kill
+> was needed during this migration, so none is documented here.
 
 ### 3.6 Configure the Android device
 
@@ -389,6 +424,13 @@ Settings → Network & internet → Wi-Fi → long-press your network → **Modi
 
 ### 3.7 Install the proxy CA on the device
 
+> **The proxy CA is installed on the Android device only. Windows does not need it.** Charles and
+> mitmproxy both offer to add their root certificate to the Windows trust store; for every procedure
+> in this runbook, **decline**. The only TLS connection being inspected is the one between the phone
+> and the API, and the certificate that has to be trusted is the one the phone sees. Trusting the
+> proxy CA on Windows would let the laptop's own browsers be intercepted too — more exposure, no
+> benefit here. This is also why Charles is launched normally rather than elevated (3.2).
+
 1. With the proxy active, open Chrome on the phone and visit **`chls.pro/ssl`** (Charles) or
    **`mitm.it`** (mitmproxy), then download the certificate.
 2. Settings → Security & privacy → More security settings → **Encryption & credentials** → **Install
@@ -399,9 +441,10 @@ Settings → Network & internet → Wi-Fi → long-press your network → **Modi
 credentials → **Trusted credentials** → **USER** tab. The Charles/mitmproxy entry must appear there.
 If the USER tab is empty, the certificate did not install and the MITM procedures cannot work.
 
-**Remove it afterwards** (do this when you finish testing): same screen → **User credentials** or
-Trusted credentials → USER → tap the entry → **Remove** / **Disable**. Also set the Wi-Fi proxy back
-to **None**.
+**Remove it afterwards** when you finish testing — full procedure in
+[4.5 Cleanup](#45-cleanup--restore-the-device-and-the-laptop). Do not stop at closing Charles: the
+phone keeps its Wi-Fi proxy setting until you clear it, and with the proxy gone it has nothing to
+route through.
 
 ### 3.8 Verify Charles is actually intercepting — before testing pinning
 
@@ -431,6 +474,42 @@ checks apply (flows appear, the API host appears, bodies are readable).
 ## 4. Test procedures
 
 ### 4.0 Shared building blocks
+
+**[USB]** — the phone stays connected by USB with debugging enabled for the whole of section 4.
+Every procedure below drives the device over `adb` (`adb install`, `adb uninstall`, `adb logcat`,
+`adb shell`), and logcat is the primary evidence for pass/fail. Confirm before each session:
+
+```bash
+adb devices -l        # exactly one entry, state "device"
+```
+
+`unauthorized` means the RSA prompt on the phone was not accepted; `no devices` means the cable, the
+port, or USB debugging. Unplugging mid-procedure kills the logcat stream, which is where the
+`Certificate pinning failure!` lines appear — so a result gathered across a disconnect is not a
+result. Note that the phone's **Wi-Fi** is what carries API traffic through the proxy; USB carries
+only `adb`. Both are needed at once during 4.3 and 4.4.
+
+**[ONE APK]** — all four `internal*` profiles (`internal`, `internal-pinfail`, `internal-mitm`,
+`internal-mitm-nopin`) build the **same application id**, `com.ahmedmonib.eshop.internal`. Only one
+can be installed at a time, and installing another does not necessarily replace it cleanly —
+`adb install -r` over a differently signed build fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`,
+and a build that appears to install may leave the previous app's data behind. **Always uninstall
+first**, which is why every **[BUILD]** below begins with it:
+
+```bash
+adb uninstall com.ahmedmonib.eshop.internal || true
+```
+
+The `|| true` keeps the sequence working when nothing is installed. To check what is on the device:
+
+```bash
+adb shell pm list packages | grep ahmedmonib
+```
+
+Because the id is shared, the package name never tells you which profile is installed. Track that
+yourself — this is the single most common way a diagnostic test produces a confident wrong answer
+(see 9, "App works when it should fail"). The production app (`com.ahmedmonib.eshop`, no suffix) is
+a different id and can stay installed throughout.
 
 **[LOGCAT]** — run in a second terminal before launching the app:
 
@@ -553,6 +632,12 @@ Then **[SIGNING]** and **[BUILD]**, proxy **OFF**. Start **[LOGCAT]**, launch th
 
 Proves the proxy actually intercepts. **Must pass before 4.4 means anything.**
 
+> **Keep USB debugging connected for 4.3, 4.4 and 4.5** (**[USB]**). These two procedures are a
+> paired comparison: the builds are installed, wiped and reinstalled over `adb`, and the verdict in
+> 4.4 rests on logcat showing `Certificate pinning failure!` while the proxy shows nothing. Lose the
+> `adb` connection and you are left with "the app did not work", which — under a proxy — is also
+> what an untrusted CA, a stale bundle, or a dropped Wi-Fi association look like.
+
 ```bash
 npm -w mobile run env:internal-mitm-nopin
 ```
@@ -624,18 +709,115 @@ changed (pins present or absent), opposite outcomes.
 
 ---
 
-### 4.5 Restore
+### 4.5 Cleanup — restore the device and the laptop
 
-**Do not skip.** The diagnostic `.env` files leave you building interceptable or broken APKs.
+**Do not skip.** Diagnostic testing leaves three things in a non-default state: the phone routes all
+traffic through a proxy that is about to disappear, the phone trusts a CA that can decrypt its
+traffic, and the repository's `mobile/.env` builds interceptable or deliberately broken APKs. Work
+through all three.
+
+#### Android device
+
+1. **Wi-Fi proxy → None.** Settings → Network & internet → Wi-Fi → long-press your network →
+   **Modify network** → Advanced → **Proxy: None** → Save.
+
+   This is the step that actually breaks the phone if forgotten. The proxy setting persists across
+   reboots and has no dependency on Charles being alive: once you close the proxy, **every app on
+   the phone loses internet access** — browsers, email, the Play Store — because traffic is still
+   being sent to a laptop address where nothing is listening. It presents as "Wi-Fi connected, no
+   internet", which reads like a router problem, and people have chased it for a long time. If a
+   phone stops working after a testing session, check this first.
+
+2. **Remove the proxy CA.** **Settings** → **Security & privacy** → **More security settings** →
+   **Encryption & credentials** → **View security certificates** → locate the **mitmproxy** (or
+   Charles) certificate → tap it → **Remove**. On some Android versions the certificate appears
+   under **Trusted credentials** → **USER** or **User credentials** instead. Until you remove it,
+   any app that explicitly trusts user-installed CAs (such as the diagnostic `internal-mitm*` builds
+   used in this runbook) can have its HTTPS traffic intercepted by a trusted proxy.
+
+3. **Verify the USER store is empty.** Same screen: Trusted credentials → **USER**. The
+   Charles/mitmproxy entry must be gone. An empty USER tab is the expected end state — this app is
+   the only reason anything was there.
+
+**Verifying the proxy is off.** From the laptop:
 
 ```bash
-npm -w mobile run env:internal
+adb shell settings get global http_proxy
 ```
 
-Then **[BUILD]** again and confirm the app works normally (4.1). Also on the device:
+Expected: `null` (some builds print `:0`). Both mean no **global** proxy is configured.
 
-- Wi-Fi proxy → **None**.
-- Remove the proxy CA (section 3.7).
+Read that result precisely. This runbook sets the proxy **per Wi-Fi network** through Modify network
+(3.6), and Android stores that in the Wi-Fi configuration rather than in `settings global` — so this
+command returns `null` whether or not the Wi-Fi proxy is still set. It is a useful check for a
+global proxy left behind by some other tool, but it **cannot confirm** the cleanup in step 1. The
+authoritative checks are the Wi-Fi settings screen itself, and this functional one:
+
+- Close the proxy on the laptop, then browse to any site on the phone over Wi-Fi. Pages load →
+  cleanup succeeded. "No internet" → the Wi-Fi proxy is still set.
+
+#### Laptop
+
+1. **Stop the proxy.** Charles: close the window (**File → Quit** / the X). mitmweb: **Ctrl+C** in
+   its terminal. Neither leaves a background service behind.
+
+2. **Restore the normal environment:**
+
+   ```bash
+   npm -w mobile run env:internal
+   ```
+
+   Expected console:
+
+   ```
+   Switched mobile/.env -> .env.internal
+   ```
+
+   Confirm no diagnostic profile is still active — a generated `.env` carries a banner:
+
+   ```bash
+   head -12 mobile/.env      # a "GENERATED FILE" banner means a diagnostic profile is STILL active
+   ```
+
+3. **Rebuild if you will test again.** The environment switch alone changes nothing on the device —
+   pinning configuration is baked in at build time, so the installed APK is still the diagnostic
+   one. If more testing follows, run **[BUILD]** and confirm the app works normally per 4.1. If you
+   are finished, uninstalling is enough:
+
+   ```bash
+   adb uninstall com.ahmedmonib.eshop.internal
+   ```
+
+> **Charles and mitmproxy do not need to be uninstalled.** They are ordinary developer tools and
+> keeping them installed permanently is fine — that is the normal state for anyone who runs these
+> procedures more than once. Neither has any effect unless **both** conditions hold: the proxy is
+> running, _and_ the phone is configured to use it (3.6). With the phone's proxy set back to None,
+> Charles can sit installed and even running with no effect on anything. Reinstalling them for each
+> testing round would only mean redoing the firewall (3.3) and Access Control (3.5) setup each time.
+> The device-side CA is the part that must not be left behind, not the laptop-side application.
+
+#### Repository
+
+Diagnostic testing writes files. Review the working tree before committing anything:
+
+```bash
+git status
+```
+
+`mobile/.env`, `mobile/android/` and `mobile/ios/` are already gitignored (`mobile/.gitignore`), so
+they should not appear at all — if they do, something changed the ignore rules. Never commit them:
+they are regenerated by `env:*` and `expo prebuild`, and a committed diagnostic `.env` would carry
+`ANDROID_TRUST_USER_CAS=1` into someone else's build.
+
+The one **tracked** file this workflow can modify is `mobile/ssl-pins.json`, via
+`cert:pins -- --write` (section 6). That is a real change, not build output — check it deliberately:
+
+```bash
+git diff mobile/ssl-pins.json      # empty unless you intended to rotate pins
+```
+
+Anything else — `package-lock.json` churn, an edited `eas.json`, a stray script — should be
+inspected before it becomes part of a commit. Only intended source changes belong in the diff.
 
 ---
 
@@ -897,7 +1079,7 @@ npm -w mobile test
 #      4.2  internal-pinfail   (enforcement)
 #      4.3  internal-mitm-nopin (harness control)
 #      4.4  internal-mitm      (pinning proof)
-#      4.5  restore
+#      4.5  cleanup (device + laptop + repo)
 #      4.1  internal           (works against the real backend)
 
 # 5. Ship and verify production (section 5).
@@ -1227,9 +1409,17 @@ actually validated.
 - [x] Production profile pinned from the canonical source.
 - [x] Enablement audit: no Railway, backend, Expo/EAS secret, Gradle, CI or store-console change
       required (4.7).
-- [ ] **Outstanding —** production AAB built, uploaded to Internal testing, installed from Play, and
-      verified per [section 5](#5-production-release-verification) (Phases A, B and C) before
-      promotion to the Production track.
+- [x] Production AAB built, uploaded to Google Play **Internal testing**, installed **from Play**,
+      and verified per [section 5](#5-production-release-verification) — Phases A, B and C passed
+      (recorded 2026-08-02).
+
+That last item was the final gate on this migration, and it is the one that could not be satisfied
+by any local build: Play App Signing re-signs the upload, so the binary testers receive is not the
+one that left the build machine. A pinned app that works from Play is therefore the only evidence
+that pinning survives the store pipeline intact.
+
+Promotion from Internal testing to the **Production** track is a release decision, not a pinning
+verification — section 5 covers it whenever you choose to make it.
 
 ### Documentation
 
@@ -1246,3 +1436,83 @@ actually validated.
 - [ ] `mobile/scripts/release-pipeline.sh` calls `:app:assembleInternalRelease` /
       `:app:bundleProdRelease`, which do not exist (no Gradle flavors). Pre-existing, unrelated to
       pinning.
+
+---
+
+## 11. Reproducing SSL pinning verification on a new laptop
+
+**Start here** if you have a fresh machine and need to reproduce the whole proof from nothing. Each
+stage links to the section that gives the actual commands; this is the order and the dependencies,
+not a replacement for them.
+
+Budget roughly half a day the first time. Most of it is toolchain setup and Gradle builds — each
+release build takes about ten minutes, and stages 8 and 9 need one apiece.
+
+```
+STAGE                                          SECTION   NOTES
+--------------------------------------------------------------------------------------------
+ 1  Install prerequisites                       0.1      Node 20, npm 10, JDK 17, Android
+                                                         platform 36 + build-tools 36.0.0,
+                                                         platform-tools. JDK must be 17.
+ 2  Clone the repository                        0.3      Any directory; no submodules.
+ 3  Install dependencies                        0.3      npm install at the repo ROOT, not in
+                                                         mobile/ — this is an npm workspace.
+ 4  Configure the Android SDK and Java          0.2      ANDROID_HOME / ANDROID_SDK_ROOT,
+                                                         JAVA_HOME. Local release builds also
+                                                         need the ESHOP_ANDROID_* keystore set
+                                                         from Bitwarden.
+ 5  Install Charles or mitmproxy                3.2      Either one. Charles was used for the
+                                                         original verification. Windows firewall
+                                                         must allow it on Private networks (3.3).
+ 6  Enable USB debugging and connect the phone  0.3      adb devices -l shows state "device".
+                                                         Accept the RSA prompt on the phone.
+ 7  Configure the Android proxy and install     3.4-3.7  Laptop Wi-Fi IPv4 (not WSL/Hyper-V),
+    the proxy CA                                         phone proxy Manual, CA in the USER store.
+                                                         The CA goes on the PHONE only, never on
+                                                         Windows.
+ 8  Run the internal-mitm-nopin verification    4.3      HARNESS CONTROL. Proxy must decrypt
+                                                         api.vexflare.com and the app must work.
+                                                         If this fails, stop — nothing after it
+                                                         means anything.
+ 9  Run the internal-mitm verification          4.4      THE PROOF. Same build, real pins: every
+                                                         API call fails, proxy shows no
+                                                         api.vexflare.com flows, logcat shows
+                                                         "Certificate pinning failure!".
+10  Restore the phone                           4.5      Wi-Fi proxy -> None, remove the proxy CA,
+                                                         confirm the USER store is empty.
+11  Restore the development environment         4.5      npm -w mobile run env:internal, stop the
+                                                         proxy, rebuild or uninstall the
+                                                         diagnostic APK.
+12  Confirm cleanup                             4.5      Phone reaches the internet with the proxy
+                                                         closed; git status shows only intended
+                                                         source changes; git diff
+                                                         mobile/ssl-pins.json is empty unless you
+                                                         rotated pins.
+```
+
+Three things to understand before starting, because they are what the procedure is built around:
+
+- **Stages 8 and 9 are one experiment, not two tests.** Identical builds, identical proxy, one
+  variable changed — pins present or absent. Stage 8 alone proves the proxy works; stage 9 alone
+  proves nothing, because an app that fails under a proxy fails for many reasons. Only the
+  _contrast_ is evidence.
+- **A naive proxy test cannot substitute for them** (3.1). Apps targeting API 24+ ignore
+  user-installed CAs, so an ordinary build fails under any proxy whether or not it pins. The
+  `internal-mitm*` profiles exist solely to remove that confound, and they are the reason a
+  `network_security_config.xml` appears in those builds and in no shippable one.
+- **Stage 10 is not optional politeness.** A phone left pointing at a closed proxy has no internet
+  at all, and a phone left trusting the proxy CA is interceptable by anyone who can run that proxy
+  on its network.
+
+Two cheaper procedures are worth knowing about, because most days you do not need the full harness:
+
+- **4.2 `internal-pinfail`** — one build, no proxy, no CA. Ships deliberately wrong pins; the app
+  must lose all API access. This catches "pinning has silently become inert", which is the failure
+  mode that actually happens, and it is the right check after any pin change.
+- **Section 5 Phase A** — pure command-line checks with no device at all: canonical pins still match
+  the live chain, no shippable profile trusts user CAs, internal and production resolve identical
+  pinning config. Run before every release.
+
+Use stages 1–12 when the pinning implementation itself changes — a library upgrade, an Expo SDK or
+React Native upgrade, enabling the New Architecture, or edits to `sslPinningAdapter.native.js`. The
+full trigger table is in [section 7](#when-to-re-run-the-verification-suite).

@@ -12,8 +12,9 @@ Three things that commonly trip people up:
    canonical source is `mobile/ssl-pins.json`, which `app.config.js` injects into `extra` for both
    EAS and local Gradle builds. Full reference: [`ssl-pinning.md`](./ssl-pinning.md).
 2. **Path matters:** install the APK with an **absolute** path, or `adb` fails with `cannot stat`.
-3. **Internal builds now pin too.** That is deliberate: the internal APK is the vehicle for
-   validating pinning on a real device before production is switched on.
+3. **Internal builds pin too.** That is deliberate: the internal APK is the vehicle for validating
+   pinning on a real device ahead of each store release. Production pinning is enabled and has been
+   verified end to end from Google Play (see [`ssl-pinning.md`](./ssl-pinning.md) §10).
 
 > **Managed-workflow note.** EAS regenerates `android/` from `app.config.js` on every build. Because
 > the pins are plain environment values rather than binary assets, EAS needs no file secret and no
@@ -199,7 +200,7 @@ Windows-downloaded APK from WSL via `/mnt/c/Users/<you>/Downloads/…`.
 
 - No cert-fetching step: pins are strings in `mobile/eas.json`. Regenerate with `cert:pins`.
 - **Internal** = pinned sideload APK, `com.ahmedmonib.eshop.internal` — the device-validation
-  vehicle before production is switched on.
+  vehicle ahead of each store release.
 - **Production** = pinned AAB to Play. Turning pinning on or off is one line in `eas.json` plus a
   new build; it cannot be changed over the air.
 - Install with an **absolute** APK path; uninstall a conflicting package first if the signing key
