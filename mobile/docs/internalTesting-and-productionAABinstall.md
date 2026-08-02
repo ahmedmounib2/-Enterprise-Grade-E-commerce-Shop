@@ -61,7 +61,7 @@ Nothing is packaged as an asset, so there is no `assets/*.cer` to look for in th
 
 ```bash
 # 1) (optional) confirm the configured pins still appear in the live chain
-npm -w mobile run cert:pins
+npm -w mobile run cert:pins -- --check
 
 # 2) Build the APK on EAS (internal profile → com.ahmedmonib.eshop.internal, pinning ON).
 #    EAS prebuilds android/ from app.config.js and signs with the dashboard keystore.
@@ -89,8 +89,8 @@ renders categories/product images.
 ### B) Production AAB
 
 ```bash
-# 1) Confirm the configured pins still appear in the live chain
-npm -w mobile run cert:pins
+# 1) Confirm the configured pins still appear in the live chain (exits 1 if none do)
+npm -w mobile run cert:pins -- --check
 
 # 2) Build the AAB on EAS (production profile → com.ahmedmonib.eshop, signed by the dashboard keystore)
 eas build --platform android --profile production
@@ -147,17 +147,16 @@ uses the matching profile's `env` block in `mobile/eas.json`. Either way the pin
 byte-identical in pinning configuration (asserted by
 `mobile/src/tests/config/sslPinResolution.test.js`).
 
-> **`cert:pins` reads the API host from the active `mobile/.env`.** Run it after `env:emu` and it
-> will try to read a certificate chain from `10.0.2.2` and fail. Switch to `env:internal` or
-> `env:production` first, or pass the host explicitly:
+> **`cert:pins` takes its host from the active `mobile/.env` when there is one.** Precedence is
+> `--host`, then `EXPO_PUBLIC_API_BASE_URL` in `mobile/.env`, then the `host` field of
+> `ssl-pins.json`. So it works on a fresh clone with no `.env` at all, and in CI — but run it after
+> `env:emu` and it will try to read a certificate chain from `10.0.2.2` and fail. That is
+> deliberate: an active dev profile outranks the canonical fallback, so the command cannot quietly
+> report on production while you are pointed elsewhere. Switch profile first, or pass the host:
 >
 > ```bash
 > npm -w mobile run cert:pins -- --host api.vexflare.com
 > ```
->
-> On a **fresh clone** this matters more than it looks: `mobile/.env` is gitignored, so it does not
-> exist until you run an `env:*` script, and `cert:pins` exits 1 with
-> `No host provided. Pass --host <api-host> or set EXPO_PUBLIC_API_BASE_URL.` until then.
 
 > The emulator, LAN and tunnel profiles need no pinning setting at all: the app skips pinning
 > automatically whenever the API host is `localhost`, a raw IPv4 address, or a known tunnel domain.

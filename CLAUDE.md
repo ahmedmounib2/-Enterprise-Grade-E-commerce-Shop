@@ -147,8 +147,9 @@ repo root
 - **SSL pinning:** `react-native-ssl-public-key-pinning` via
   `packages/api-client/sslPinningAdapter.native.js`. Pins are base64 SHA-256 SPKI hashes whose
   single canonical source is `mobile/ssl-pins.json`; `app.config.js` injects them into `extra`.
-  Rotate with `npm -w mobile run cert:pins -- --write`. Full reference:
-  `mobile/docs/ssl-pinning.md`.
+  Never add the hashes to `eas.json` or any `.env` — a test asserts they appear in no other tracked
+  file. Check with `npm -w mobile run cert:pins -- --check`, rotate with `-- --write`; the
+  `ssl-pins.yml` workflow runs the same check weekly. Full reference: `mobile/docs/ssl-pinning.md`.
 
 ### Shared (`shared/`)
 
@@ -601,5 +602,3 @@ End every debugging task with:
 
 The goal is not only to fix the current bug but to improve the repository owner's debugging and
 engineering skills over time.
-
----

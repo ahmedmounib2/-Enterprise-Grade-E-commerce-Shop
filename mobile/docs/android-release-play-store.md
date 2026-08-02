@@ -373,7 +373,7 @@ only file accepted by Google Play.
 ```bash
 # from repo root
 npm install
-npm -w mobile run cert:pins   # confirm the configured pins still appear in the live chain
+npm -w mobile run cert:pins -- --check   # exits 1 if no configured pin is in the live chain
 ```
 
 EAS prebuilds `android/` on every build, so there is no native folder to refresh or clean by hand,
@@ -557,7 +557,8 @@ monitor Play Console vitals, and update documentation or changelogs as needed.
 1. Pull the latest `main` and merge your feature branch.
 2. Bump `version`/`versionCode` in `mobile/app.config.js`.
 3. Run `npm install`. (EAS prebuilds the native project from `app.config.js` automatically — no
-   manual prebuild needed; re-check the SSL pins with `cert:pins` if the issuer rotated.)
+   manual prebuild needed; re-check the SSL pins with `cert:pins -- --check` if the issuer rotated.
+   The scheduled `ssl-pins.yml` workflow checks this weekly too.)
 4. Build on EAS (`eas build --platform android --profile production` for the AAB,
    `--profile internal` for an optional APK).
 5. Smoke-test using the downloaded APK and deep-link command above.
@@ -566,5 +567,3 @@ monitor Play Console vitals, and update documentation or changelogs as needed.
 
 Following this loop ensures each Play Store update uses the same hardened process and reduces missed
 steps during future deploys.
-
----

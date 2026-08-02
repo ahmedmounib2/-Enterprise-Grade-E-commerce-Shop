@@ -7921,7 +7921,9 @@ history remains consistent.
   than falling back to an unpinned connection, and a failed initialization rejects every request.
   Pinning cannot be disabled at runtime, so a network error can never downgrade the connection. Pins
   are base64 SHA-256 SPKI hashes of the API's CA chain (`npm -w mobile run cert:pins`); they are not
-  secrets and live in `mobile/eas.json`.
+  secrets and their single canonical source is `mobile/ssl-pins.json`, which `app.config.js` injects
+  into the Expo config so EAS and local Gradle builds cannot drift. A test asserts the hashes appear
+  in no other tracked file, and `ssl-pins.yml` checks them against the live chain on a schedule.
 - **Job-health alerting:** settlement and payout cron job health alerts fan out via email (to the
   admin recipient list) and optionally to a Slack webhook (`OPS_SLACK_WEBHOOK`).
 
@@ -8355,11 +8357,16 @@ npm run -w frontend test -- --coverage --coverageReporters=text-summary
 
 ### CI/CD pipeline
 
-The repository ships three GitHub Actions workflows:
+The repository ships four GitHub Actions workflows:
 
-- **`ci.yml`** — lint, backend tests (with Redis service container), frontend tests, Architecture
-  page integrity, and a Vite production build. Runs on every push to `main` and every PR targeting
-  `main`.
+- **`ci.yml`** — lint, backend tests (with Redis service container), frontend tests, mobile tests,
+  Architecture page integrity, and a Vite production build. Runs on every push to `main` and every
+  PR targeting `main`.
+- **`ssl-pins.yml`** — opens a live TLS connection to the API and verifies the mobile certificate
+  pins in `mobile/ssl-pins.json` still appear in the presented chain, failing the run if none do.
+  Weekly, on demand, and on changes to the pinning inputs; the scheduled run also fails when the pin
+  set expires within 90 days and files a tracking issue. Kept out of `ci.yml` so a backend outage
+  cannot fail unrelated PRs. See [`docs/ci-cd-setup.md`](docs/ci-cd-setup.md).
 - **`frontend-sentry.yml`** — uploads frontend source maps to Sentry on release builds.
 - **`security.yml`** — Gitleaks secret scanning (full git history) and `npm audit` across all
   workspaces. Runs on every push.

@@ -99,22 +99,22 @@ keystore).
 git clone <repo> && cd <repo>
 npm install                       # workspaces: installs backend, frontend, mobile, shared, packages
 npm -w mobile test                # must be green before you start
-
-# Pass --host on a fresh clone. See the note below for why.
-npm -w mobile run cert:pins -- --host api.vexflare.com
+npm -w mobile run cert:pins       # must show pins matching mobile/ssl-pins.json
 ```
 
-> **Why `--host` is required here.** `cert:pins` takes the API host from `EXPO_PUBLIC_API_BASE_URL`
-> in `mobile/.env`, and that file is **gitignored** — a fresh clone does not have one until you run
-> an `env:*` script. Without it the command exits 1 with
-> `No host provided. Pass --host <api-host> or set EXPO_PUBLIC_API_BASE_URL.`
+> **Which host `cert:pins` reads.** In order: `--host`, then `EXPO_PUBLIC_API_BASE_URL` from
+> `mobile/.env`, then the `host` field of `mobile/ssl-pins.json`. That last fallback is why the
+> command works on a fresh clone even though `mobile/.env` is gitignored and does not exist yet, and
+> why the scheduled CI check needs no configuration.
 >
-> The same dependency bites later in a subtler way: after `npm -w mobile run env:emu`, a bare
-> `cert:pins` will try to read a certificate chain from `10.0.2.2` and fail. Either run
-> `env:internal` first, or keep passing `--host`. Once a `.env` pointing at the production API is in
-> place, plain `npm -w mobile run cert:pins` works and its output must match `mobile/ssl-pins.json`.
+> The middle step still matters: after `npm -w mobile run env:emu`, `mobile/.env` points at
+> `10.0.2.2`, so a bare `cert:pins` tries to read a certificate chain from the emulator bridge and
+> fails. That is deliberate — an active dev profile outranks the canonical fallback so the command
+> cannot quietly report on production while you are pointed somewhere else. Run `env:internal`
+> first, or pass `--host api.vexflare.com`.
 >
-> `npm -w mobile test` has no such dependency — the suite passes on a fresh clone with no `.env`.
+> `npm -w mobile test` has no host dependency at all — the suite passes on a fresh clone with no
+> `.env`.
 
 For any on-device procedure:
 
@@ -904,17 +904,17 @@ See [section 5](#5-production-release-verification).
 Audited when production pinning was switched on. Everything lives in the repository; **no external
 system needed a change.**
 
-| System                        | Change required | Why                                                                        |
-| ----------------------------- | --------------- | -------------------------------------------------------------------------- |
-| **Railway** (backend)         | **None**        | Pinning is entirely client-side. The server serves the same certificate.   |
-| **Backend code**              | **None**        | No pinning references exist in `backend/src`.                              |
-| **Expo secrets**              | **None**        | The pins are not secrets and are committed.                                |
-| **EAS secrets**               | **None**        | `eas.json` references no secrets. Values come from `ssl-pins.json`.        |
-| **EAS build profiles**        | Repo only       | `production` inherits the canonical pins; nothing to set in the dashboard. |
-| **Android gradle.properties** | **None**        | Pinning is library-level. No network security config in shipping builds.   |
-| **GitHub Actions**            | **None**        | No workflow references pinning or certificates.                            |
-| **Play Console**              | **None**        | No new permissions and no manifest changes in shipping builds.             |
-| **Apple Developer**           | **None**        | TrustKit needs no entitlement.                                             |
+| System                        | Change required | Why                                                                         |
+| ----------------------------- | --------------- | --------------------------------------------------------------------------- |
+| **Railway** (backend)         | **None**        | Pinning is entirely client-side. The server serves the same certificate.    |
+| **Backend code**              | **None**        | No pinning references exist in `backend/src`.                               |
+| **Expo secrets**              | **None**        | The pins are not secrets and are committed.                                 |
+| **EAS secrets**               | **None**        | `eas.json` references no secrets. Values come from `ssl-pins.json`.         |
+| **EAS build profiles**        | Repo only       | `production` inherits the canonical pins; nothing to set in the dashboard.  |
+| **Android gradle.properties** | **None**        | Pinning is library-level. No network security config in shipping builds.    |
+| **GitHub Actions**            | Repo only       | `.github/workflows/ssl-pins.yml` checks the live chain; added later, see 7. |
+| **Play Console**              | **None**        | No new permissions and no manifest changes in shipping builds.              |
+| **Apple Developer**           | **None**        | TrustKit needs no entitlement.                                              |
 
 **Certificate rotation touches exactly one file: `mobile/ssl-pins.json`.**
 
@@ -1199,6 +1199,24 @@ the same canonical file, and `src/tests/config/sslPinResolution.test.js` asserts
 expiry with differing package names. Do not add pinning-relevant env to one profile and not the
 other.
 
+### What CI checks automatically
+
+Two workflows, deliberately separate because only one needs the network.
+
+| Where                           | Runs                                                                                                    | Fails when                                                                                                                  |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `ci.yml` → **Test – Mobile**    | every pull request and push to `main`                                                                   | any mobile test fails, including the pin single-source rule and the adapter's fail-closed behaviour. No network, no device. |
+| `ssl-pins.yml` → **check-pins** | Mondays 06:00 UTC, on demand, and on changes to `ssl-pins.json`, `compute-ssl-pins.js`, `app.config.js` | no configured pin appears in the live chain; **on the scheduled run only**, also when the pin set expires within 90 days.   |
+
+The live-chain check is kept out of the main matrix on purpose: it needs a real TLS handshake
+against the API, so a backend outage would otherwise fail unrelated pull requests. A scheduled
+failure opens (or comments on) a single `ssl-pins`-labelled issue, because a red mark on a cron run
+has no pull request to annotate and would otherwise go unseen.
+
+Neither workflow proves pinning is **enforced** — that still needs a device (4.2, 4.3, 4.4). What
+they catch is the pins going stale or expiring, which is the failure mode that arrives on its own
+schedule rather than in response to a change.
+
 ### When to re-run the verification suite
 
 | Trigger                                                                | Run                                          |
@@ -1238,12 +1256,17 @@ npm -w mobile run cert:pins                 # live chain, print only
 npm -w mobile run cert:pins -- --check      # release gate: exit 1 if no configured pin is live
 npm -w mobile run cert:pins -- --write      # live chain, update ssl-pins.json
 
-# --host overrides the API host taken from mobile/.env. Required on a fresh clone
-# (no .env yet) and whenever a dev profile such as env:emu is active.
+# Host precedence: --host, then EXPO_PUBLIC_API_BASE_URL in mobile/.env, then the
+# "host" field of ssl-pins.json. Pass --host when a dev profile such as env:emu is
+# active and you still want to check production.
 npm -w mobile run cert:pins -- --host api.vexflare.com
+
+# Also fail when the pin set's own expirationDate is within N days. Used by the
+# scheduled CI workflow; --check alone keeps its staleness-only exit semantics.
+npm -w mobile run cert:pins -- --check --expiry-days 90
 ```
 
-`--check`, `--write` and `--host` are the only flags the script accepts.
+`--check`, `--write`, `--host` and `--expiry-days` are the only flags the script accepts.
 
 **Confirm no duplicate source exists**
 
@@ -1252,6 +1275,9 @@ grep -rn "$(node -e "console.log(require('./mobile/ssl-pins.json').pins[0].hash)
   --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=android --exclude-dir=ios .
 # Expect only mobile/ssl-pins.json (and test fixtures).
 ```
+
+`sslPinResolution.test.js` asserts the same thing across every **tracked** file, so this is a
+convenience check rather than the guard — the guard runs in CI on every pull request.
 
 **Generated native config** (after `expo prebuild`)
 
@@ -1515,9 +1541,10 @@ verification — section 5 covers it whenever you choose to make it.
       ticked above is Android. See [0.4](#04-platform-scope--what-has-and-has-not-been-verified).
 - [ ] New Architecture enablement — no remaining blockers, but a separate migration
       (`mobile/docs/docs/mobile/android-build-config.md`).
-- [ ] `mobile/scripts/release-pipeline.sh` calls `:app:assembleInternalRelease` /
-      `:app:bundleProdRelease`, which do not exist (no Gradle flavors). Pre-existing, unrelated to
-      pinning.
+- [x] `mobile/scripts/release-pipeline.sh` — fixed. It called `:app:assembleInternalRelease` /
+      `:app:bundleProdRelease`, which do not exist in a flavorless project, and read the pins from a
+      `.env` variable that no longer exists. Now uses `assembleRelease` / `bundleRelease` and
+      delegates the pin comparison to `cert:pins -- --check`.
 
 ---
 

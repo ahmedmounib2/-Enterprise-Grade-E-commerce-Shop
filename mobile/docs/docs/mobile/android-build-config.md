@@ -7,7 +7,7 @@ the next prebuild.
 
 So the rule is: **change `app.config.js` or a config plugin, never the generated Gradle files.** If
 you need something Expo does not expose as a config field, write a config plugin in
-`mobile/plugins/` — that is what the existing four do.
+`mobile/plugins/` — that is what the existing three do.
 
 ## Where the SDK levels come from
 
@@ -60,14 +60,23 @@ spec (`codegenConfig: { name: RNSslPublicKeyPinningSpec, type: modules }`) and r
 
 Readiness of every remaining native dependency, verified at the pinned versions:
 
-| Dependency                                                                       | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `expo` 54 and all `expo-*` modules                                               | Ready — SDK 54 defaults New Arch on for new projects.                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `@react-navigation/*` v7                                                         | JS only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `react-native-screens`, `safe-area-context`, `gesture-handler`, `svg`, `webview` | Ready — all ship a `codegenConfig`.                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `react-native-ssl-public-key-pinning`                                            | Ready — TurboModule spec.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `react-native-keyboard-aware-scroll-view` 0.9.5                                  | Compatible. Unmaintained since ~2020, so it was audited by source: `UIManager.viewIsDescendantOf` is implemented for bridgeless in `BridgelessUIManager.js` (via `FabricUIManager.compareDocumentPosition`), `UIManager.measureInWindow` dispatches Fabric tags in `UIManager.js`, and `scrollResponderScrollNativeHandleToKeyboard` plus `TextInput.State.currentlyFocusedInput` both still exist in RN 0.81.5. It is also currently unimported anywhere in `mobile/src`. |
-| Custom native modules                                                            | None.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Dependency                                                                       | Status                                                |
+| -------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `expo` 54 and all `expo-*` modules                                               | Ready — SDK 54 defaults New Arch on for new projects. |
+| `@react-navigation/*` v7                                                         | JS only.                                              |
+| `react-native-screens`, `safe-area-context`, `gesture-handler`, `svg`, `webview` | Ready — all ship a `codegenConfig`.                   |
+| `react-native-ssl-public-key-pinning`                                            | Ready — TurboModule spec.                             |
+| Custom native modules                                                            | None.                                                 |
+
+`react-native-keyboard-aware-scroll-view` 0.9.5 was the one entry that needed argument rather than a
+version check, and it has since been **removed** from `mobile/package.json`. It was audited by
+source first and found compatible — `UIManager.viewIsDescendantOf` is implemented for bridgeless in
+`BridgelessUIManager.js` via `FabricUIManager.compareDocumentPosition`, `UIManager.measureInWindow`
+dispatches Fabric tags, and `scrollResponderScrollNativeHandleToKeyboard` plus
+`TextInput.State.currentlyFocusedInput` both still exist in RN 0.81.5 — but it had no imports
+anywhere in `mobile/src`, so compatibility was moot and it was deleted rather than carried into the
+migration. Recorded here because the audit result is what justified deleting it instead of replacing
+it.
 
 So there is **no remaining blocker** — only cost. Enabling Fabric re-renders every screen and needs
 a full-app device pass (RTL, modals, lists, keyboard handling), which is unrelated to any pinning
@@ -76,23 +85,30 @@ attributable to a single architectural switch.
 
 Still a deadline, not a preference: **Expo SDK 55 removes the legacy architecture entirely** and
 `newArchEnabled` disappears from the config. The follow-up task is to flip `newArchEnabled`, upgrade
-to SDK 55, re-run the device matrix, and verify keyboard-aware scrolling behaviourally — replacing
-it with `react-native-keyboard-controller` only if it actually misbehaves.
+to SDK 55, and re-run the device matrix.
 
 ## Config plugins (`mobile/plugins/`)
 
-| Plugin                  | What it does                                                                                                                                                                                           | Removable when                              |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------- |
-| `withReleaseSigning`    | Injects `signingConfigs.release` into the generated `app/build.gradle` (reads `ESHOP_ANDROID_*`, defers to EAS's injected keystore on EAS Build, throws on a local release build with no credentials). | Never — required for manual release builds. |
-| `withLargeScreenCompat` | Adds `android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` to `<application>`. **Temporary.**                                                                                                 | See below.                                  |
+| Plugin                  | What it does                                                                                                                                                                                                                                                                                                                      | Removable when                                    |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `withReleaseSigning`    | Injects `signingConfigs.release` into the generated `app/build.gradle` (reads `ESHOP_ANDROID_*`, defers to EAS's injected keystore on EAS Build, throws on a local release build with no credentials).                                                                                                                            | Never — required for manual release builds.       |
+| `withUserCaTrust`       | **Diagnostic only.** When `ANDROID_TRUST_USER_CAS=1`, writes a `network_security_config.xml` trusting user-installed CAs and wires it into the manifest, so a proxy CA becomes valid and the certificate pinner is actually reached. Completely inert without the flag, and **throws** if combined with `APP_VARIANT=production`. | Never — it is what makes the MITM proof possible. |
+| `withLargeScreenCompat` | Adds `android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` to `<application>`. **Temporary.**                                                                                                                                                                                                                            | See below.                                        |
+
+`withUserCaTrust` exists because a naive proxy test proves nothing on a modern build: apps targeting
+API 24+ trust only the system CA store, so an ordinary build rejects an intercepted chain during
+normal validation and the pinner never runs — pinned and unpinned builds fail identically. Only the
+`internal-mitm` / `internal-mitm-nopin` profiles set the flag, and no shippable profile does (a test
+asserts it). Full procedure: [`../../ssl-pinning.md`](../../ssl-pinning.md) §4.3–4.4.
 
 Two pinning-related plugins were deleted alongside the `react-native-ssl-public-key-pinning`
 migration. `withSslPinningCerts` copied `mobile/certs/*.cer` into the generated Android assets; pins
-are now base64 SPKI hashes in `EXPO_PUBLIC_SSL_PINNING_HASHES`, so there is no file to copy — and no
-Android-only asymmetry (the old plugin never ran for iOS, which therefore was never pinned).
-`withSSLPinningFix` disabled `verifyReleaseResources` across subprojects because
-`react-native-ssl-pinning@1.6.0` referenced `android:attr/lStar` in its compiled resource table;
-with that dependency gone, AGP's static check passes on its own.
+are now base64 SPKI hashes whose canonical source is `mobile/ssl-pins.json`, injected by
+`app.config.js`, so there is no file to copy — and no Android-only asymmetry (the old plugin never
+ran for iOS, which therefore was never pinned). `withSSLPinningFix` disabled
+`verifyReleaseResources` across subprojects because `react-native-ssl-pinning@1.6.0` referenced
+`android:attr/lStar` in its compiled resource table; with that dependency gone, AGP's static check
+passes on its own.
 
 ## Large screens and the compatibility opt-out
 

@@ -457,8 +457,12 @@ Sanity checks:
       has not rotated:
 
   ```bash
-  npm -w mobile run cert:pins
+  npm -w mobile run cert:pins -- --check
   ```
+
+  Exits 1 when no configured pin appears in the live chain. A scheduled GitHub Actions workflow
+  (`ssl-pins.yml`) runs the same check weekly, so this is a confirmation rather than the only safety
+  net.
 
 - [ ] Switch the Expo env to production. No asset sync is involved any more, so it does **not** need
       re-running after `expo prebuild --clean`:

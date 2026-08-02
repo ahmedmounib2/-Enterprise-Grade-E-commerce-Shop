@@ -6,12 +6,14 @@
 
 Triggers on every push to `main` and every pull request targeting `main`.
 
-| Job             | What it does                                                 |
-| --------------- | ------------------------------------------------------------ |
-| `lint`          | Runs `npm run lint` across all workspaces                    |
-| `test-backend`  | Runs `npm test` in `backend/` (Jest + mongodb-memory-server) |
-| `test-frontend` | Runs `npm test` in `frontend/` (Jest + Testing Library)      |
-| `build`         | Runs `npm run build` in `frontend/` (Vite production build)  |
+| Job                      | What it does                                                        |
+| ------------------------ | ------------------------------------------------------------------- |
+| `lint`                   | Runs `npm run lint` across all workspaces                           |
+| `test-backend`           | Runs `npm test` in `backend/` (Jest + mongodb-memory-server)        |
+| `test-frontend`          | Runs `npm test` in `frontend/` (Jest + Testing Library)             |
+| `test-mobile`            | Runs `npm test` in `mobile/` (Jest; no device, emulator or network) |
+| `architecture-integrity` | Runs `npm run test:architecture` — see `docs/architecture-page.md`  |
+| `build`                  | Runs `npm run build` in `frontend/` (Vite production build)         |
 
 All jobs use `actions/setup-node@v4` with `cache: npm` to reuse `~/.npm` across runs. A
 `concurrency` group per branch cancels in-progress runs when a new push arrives.
@@ -30,6 +32,55 @@ are still mocked by Jest. The inline secret values are intentionally fake and mu
 outside of CI test runs.
 
 No additional repository secrets are needed for the base CI workflow to pass.
+
+#### What `test-mobile` protects
+
+The mobile suite is where the certificate-pinning guarantees are asserted, so it is a security gate
+rather than only a regression check:
+
+- `sslPinningAdapter.test.js` — pinning fails **closed** in production when the native module is
+  missing, no request escapes before native pinning finishes initialising, and a network error never
+  downgrades the connection to an unpinned one.
+- `sslPinResolution.test.js` — the pin hashes exist in **one** file only, `mobile/ssl-pins.json`
+  (checked across every tracked file); `internal` and `production` resolve byte-identical pinning
+  configuration; no shippable EAS profile trusts user-installed CA certificates.
+
+None of it touches the network or a device — `app.config.js` is resolved in a child process. The
+live certificate chain is checked separately, by `ssl-pins.yml` below.
+
+### `.github/workflows/ssl-pins.yml` – Mobile Certificate Pin Validation
+
+| Trigger                                                                                     | Checks                                           |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| Schedule, Mondays 06:00 UTC                                                                 | Stale pins **and** pin-set expiry within 90 days |
+| `workflow_dispatch`                                                                         | Stale pins                                       |
+| PR / push to `main` touching `mobile/ssl-pins.json`, `compute-ssl-pins.js`, `app.config.js` | Stale pins                                       |
+
+It runs `npm -w mobile run cert:pins -- --check`, which opens a real TLS connection to the API host
+and compares the presented chain against `mobile/ssl-pins.json`. It **fails** when no configured pin
+appears in the live chain — a build released in that state could not reach the API at all — and, on
+the scheduled run, when the pin set's `expirationDate` is within 90 days, after which pin validation
+switches itself off in every installed build.
+
+Both failures matter disproportionately because **pinning configuration cannot be delivered over the
+air**: an app that cannot reach the API also cannot download an OTA update to fix itself, so
+recovery requires a store release.
+
+Two deliberate design points:
+
+- **It is not part of `ci.yml`.** The check needs a live handshake against the API, so a backend
+  outage would otherwise fail unrelated pull requests. Keeping it separate means a red run here
+  always means something about the pins, never something about the backend's uptime.
+- **A scheduled failure opens a GitHub issue** (label `ssl-pins`, one open at a time, reused via a
+  comment). A cron run has no pull request to annotate, so the failure would otherwise be a red mark
+  nobody sees.
+
+No secrets or configuration are required: the host comes from the `host` field of `ssl-pins.json`,
+and `GITHUB_TOKEN` (with `issues: write`) is supplied automatically. The job carries
+`timeout-minutes: 10`, and the script caps its own TLS handshake at 15 seconds.
+
+Neither workflow proves pinning is **enforced** — that needs a physical device. See
+`mobile/docs/ssl-pinning.md` §4.2 (`internal-pinfail`) and §4.3–4.4 (the MITM pair).
 
 ### `.github/workflows/security.yml` – Security Scanning
 
@@ -58,7 +109,9 @@ Limit of 5 open PRs per ecosystem to avoid noise.
 2. Branch name pattern: `main`.
 3. Enable:
    - **Require a pull request before merging** (at least 1 approval)
-   - **Require status checks to pass** — add `lint`, `test-backend`, `test-frontend`, `build`
+   - **Require status checks to pass** — add `lint`, `test-backend`, `test-frontend`, `test-mobile`,
+     `architecture-integrity`, `build`. Do **not** add the SSL pin check: it only runs on some
+     pushes, and a required check that does not run blocks merges indefinitely.
    - **Require branches to be up to date before merging**
    - **Do not allow bypassing the above settings**
 4. Save.
@@ -125,11 +178,8 @@ clear error and exit immediately if any of the following are missing in producti
 ```
 MONGO_URI
 SESSION_SECRET
-CSRF_SECRET
-COOKIE_SECRET
 ACCESS_TOKEN_SECRET
 REFRESH_TOKEN_SECRET
-APP_SECRET
 FIELD_ENCRYPTION_KEY
 OAUTH_BRIDGE_SECRET
 MOBILE_DASHBOARD_BRIDGE_SECRET

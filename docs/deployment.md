@@ -136,6 +136,14 @@ Those hashes are **not secrets**: they are hashes of public keys that anyone con
 can compute. They belong committed in `ssl-pins.json`. Do not put them in EAS Secrets, Bitwarden,
 Railway variables, or GitHub Secrets — that would only make rotation harder.
 
+**Two CI gates back this up.** `ci.yml`'s `test-mobile` job asserts on every pull request that the
+hashes exist in that one file and nowhere else, that `internal` and `production` resolve identical
+pinning configuration, and that pinning fails closed. Separately, `ssl-pins.yml` opens a real TLS
+connection to the API weekly and fails if no configured pin still appears in the presented chain —
+or, on that scheduled run, if the pin set expires within 90 days — filing a tracking issue either
+way. Neither proves pinning is _enforced_; that still needs a device. See
+[`docs/ci-cd-setup.md`](./ci-cd-setup.md).
+
 Full reference, including the verification suite and the rotation procedure:
 [`mobile/docs/ssl-pinning.md`](../mobile/docs/ssl-pinning.md).
 
@@ -143,7 +151,8 @@ Regenerate them at any time with:
 
 ```bash
 npm -w mobile run cert:pins            # print the live chain
-npm -w mobile run cert:pins -- --write # update mobile/ssl-pins.json in place
+npm -w mobile run cert:pins -- --check  # release gate: exit 1 if no configured pin is live
+npm -w mobile run cert:pins -- --write  # update mobile/ssl-pins.json in place
 ```
 
 **Which certificates to pin.** `api.vexflare.com` is a CNAME to Railway, which auto-renews its Let's
