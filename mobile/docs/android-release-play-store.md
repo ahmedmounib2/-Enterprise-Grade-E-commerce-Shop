@@ -11,14 +11,18 @@ uploaded to the Expo dashboard; follow the steps in order.
 > release bundle by running these commands from the repo root:
 >
 > ```bash
-> npm -w mobile run cert:pins          # re-derive the pins from the live chain
-> # update EXPO_PUBLIC_SSL_PINNING_HASHES in mobile/eas.json if the issuer changed
+> npm -w mobile run cert:pins -- --check   # exits 1 if no configured pin is in the live chain
+> npm -w mobile run cert:pins -- --write   # regenerate mobile/ssl-pins.json from the live chain
+> git diff mobile/ssl-pins.json            # review — removed pins lock out fielded builds
 > eas build --platform android --profile production
 > ```
 >
+> `mobile/ssl-pins.json` is the only file edited; no environment variable is updated, because
+> `app.config.js` resolves the pins from it at build time.
+>
 > Download the freshly built `.aab` from the EAS dashboard and ship it to testers. The pins cover
-> the CA layer rather than the leaf, so a routine Let's Encrypt renewal does **not** invalidate
-> them — only an issuer change does.
+> the CA layer rather than the leaf, so a routine Let's Encrypt renewal does **not** invalidate them
+> — only an issuer change does.
 
 ---
 
@@ -385,9 +389,9 @@ Run the EAS build commands from section A once the pins are confirmed.
 > reuse a dev/tunnel `.env`.
 
 If the bundle fails API calls with a `Network request failed` error, run
-`npm -w mobile run cert:pins` and compare its output with `EXPO_PUBLIC_SSL_PINNING_HASHES` in
-`mobile/eas.json`. If none of the configured pins appears in the live chain, the issuer has changed;
-update the value and rebuild, and login, checkout (stock/restock mutations) and payment flows all
+`npm -w mobile run cert:pins -- --check`. It compares `mobile/ssl-pins.json` against the live chain
+and exits 1 when no configured pin appears in it, which means the issuer has changed; regenerate
+with `-- --write` and rebuild, and login, checkout (stock/restock mutations) and payment flows all
 resume once the updated bundle is installed. `adb logcat` shows
 `SSL pinning validation failed for <host>` when a pin is rejected.
 
@@ -452,9 +456,12 @@ Perform these checks **before** uploading anything to Play. Use the sideloaded
 
      Confirm you land on the reset screen and the token/email propagate correctly.
 
-4. If SSL pinning is enabled, confirm with `npm -w mobile run cert:pins` that at least one
-   configured pin still appears in the live backend TLS chain, and route the device through a MITM
-   proxy once to prove pinning is actually enforced.
+4. Confirm with `npm -w mobile run cert:pins -- --check` that the configured pins still appear in
+   the live backend TLS chain (it exits 1 if none do). To prove pinning is actually **enforced**,
+   run the documented procedures in [`ssl-pinning.md`](./ssl-pinning.md) — §4.2 `internal-pinfail`
+   for the cheap differential, or §4.3 + §4.4 for the full MITM proof. Routing a normal build
+   through a proxy does **not** work as a test: Android rejects a user-installed CA before the
+   pinner runs, so pinned and unpinned builds fail identically.
 5. Fix any issues before uploading to Google Play.
 
 ---

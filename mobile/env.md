@@ -235,10 +235,11 @@ the shared "Map unavailable — enter your address manually" fallback.
 
 For a **release build**, always run `npm -w mobile run env:production` (from the repo root) before
 invoking Gradle or EAS. The script copies `.env.production` into `mobile/.env`, embedding the public
-Railway hostname and the SSL pin hashes inside the bundle. There is no certificate-copying step: the
-pins are plain strings in the env file, so nothing has to be present on disk at prebuild time. The
-mobile API client trims trailing slashes and automatically appends `/api`, so the production profile
-deliberately omits the suffix—this keeps the setting in sync with Railway's `SERVER_URL` value.
+Railway hostname inside the bundle. Pinning needs no step here at all: the pins live in
+`mobile/ssl-pins.json` and `app.config.js` injects them, so nothing has to be present on disk or in
+the environment at prebuild time. The mobile API client trims trailing slashes and automatically
+appends `/api`, so the production profile deliberately omits the suffix—this keeps the setting in
+sync with Railway's `SERVER_URL` value.
 
 ### Transport security & pinning
 
@@ -258,17 +259,26 @@ deliberately omits the suffix—this keeps the setting in sync with Railway's `S
   IPs (e.g., `http://192.168.1.50:5001`), or temporary HTTPS tunnels (ngrok, Cloudflare tunnels).
   Those endpoints rotate certificates frequently or present self-signed certs, so the app
   automatically disables pin enforcement whenever the API URL resolves to `localhost`, a raw IPv4
-  address, or a known tunnelling domain suffix (e.g., `*.ngrok-free.app`). Leave
-  `EXPO_PUBLIC_SSL_PINNING_HASHES` empty for emulator-only work; populate it only when you need to
-  exercise production-grade networking against the Railway API or another stable host.
+  address, or a known tunnelling domain suffix (e.g., `*.ngrok-free.app`). This is host-based and
+  automatic — there is nothing to set or unset for emulator, LAN or tunnel work, and the pins are
+  injected into those builds all the same; they simply are not applied to a dev host.
 - **Pinning cannot be turned off at runtime.** Once installed it stays installed for the process. A
   failed initialization rejects every request rather than falling back to an unpinned connection.
-- **How to test the pin** – build a dev client with the variable set and point
-  `EXPO_PUBLIC_API_BASE_URL` at the production hostname, then route the device through Charles or
-  Proxyman with its CA installed. Every API call must fail, and a
-  `SSL pinning validation failed for <host>` line must appear in the device log. On iOS the
-  `networkInspector: false` build property is required for this to work — the dev network inspector
-  proxies URLSession and would defeat TrustKit.
+- **How to test the pin** – **do not** simply route a normal build through Charles or Proxyman with
+  its CA installed. Apps targeting API 24+ trust only the **system** CA store, so Android rejects
+  the intercepted chain during ordinary validation and the pinner is never reached; every build
+  fails identically, pinned or not, and the result proves nothing. Use the documented procedures in
+  [`docs/ssl-pinning.md`](./docs/ssl-pinning.md) §4 instead:
+  - **§4.2 `internal-pinfail`** — the cheap one. No proxy, no CA, one build with deliberately wrong
+    pins. Total API failure is the pass condition.
+  - **§4.3 + §4.4 `internal-mitm-nopin` / `internal-mitm`** — the real MITM proof. These profiles
+    set `ANDROID_TRUST_USER_CAS=1` so the proxy CA is genuinely valid and the pinner is reached;
+    running the pair isolates pinning as the only variable.
+
+  A pin rejection logs `SSL pinning validation failed for <host>`. On iOS the
+  `networkInspector: false` build property is required for pinning to be observable at all — the dev
+  network inspector proxies URLSession and would defeat TrustKit — though note that no iOS
+  verification has been performed (see `docs/ssl-pinning.md` §0.4).
 
 ---
 

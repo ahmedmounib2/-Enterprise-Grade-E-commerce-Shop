@@ -30,13 +30,28 @@ Three things that commonly trip people up:
   days with a new key, so a leaf pin would lock out every installed app at the next renewal. The
   intermediates and root are pinned instead.
 - `npm -w mobile run env:<profile>` copies `mobile/.env.<profile>` → `mobile/.env`. There is no
-  certificate sync step any more.
-- On an **EAS** build, `EXPO_PUBLIC_SSL_PINNING_HASHES` comes from the profile's `env` block in
-  `mobile/eas.json` and is baked into the JS bundle at prebuild.
+  certificate sync step any more, and **no `.env` file carries pin hashes**.
+- On **every** build — EAS or local Gradle — `app.config.js` reads `mobile/ssl-pins.json` and
+  injects `EXPO_PUBLIC_SSL_PINNING_HASHES` and `EXPO_PUBLIC_SSL_PINNING_EXPIRES` into the Expo
+  config's `extra` block, which is baked into the JS bundle at prebuild. `eas.json` supplies only
+  `APP_VARIANT` and the public runtime env.
 
-Nothing is packaged as an asset, so there is no `assets/*.cer` to look for in the APK or AAB. Verify
-instead from the EAS build page (**Build details → Environment variables**) that
-`EXPO_PUBLIC_SSL_PINNING_HASHES` is present.
+Nothing is packaged as an asset, so there is no `assets/*.cer` to look for in the APK or AAB.
+
+> **Verify from the EAS build page that `EXPO_PUBLIC_SSL_PINNING_HASHES` is _absent_ from
+> Environment variables.** That is the correct state: the pins come from `ssl-pins.json` via
+> `app.config.js`, not from the profile's `env`. Seeing it listed means someone reintroduced a
+> second source, which is exactly the drift that once left local Gradle builds unpinned while EAS
+> builds were pinned. The one exception is `internal-pinfail`, whose whole purpose is to override
+> the pins with invalid ones.
+>
+> To check what a build will actually use, resolve the config the same way the build does:
+>
+> ```bash
+> cd mobile && APP_VARIANT=internal node -e "
+>   console.log(require('./app.config.js').expo.extra.EXPO_PUBLIC_SSL_PINNING_HASHES);
+> "; cd ..
+> ```
 
 ---
 
@@ -66,10 +81,10 @@ adb install -r "$APK_ABS"
 > it fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, a build with the same id but a different
 > signing key is already installed — uninstall it first (shown above).
 
-The `internal` EAS profile sets `EXPO_PUBLIC_SSL_PINNING_HASHES` and injects the public runtime env
-(`EXPO_PUBLIC_API_BASE_URL`, `EXPO_PUBLIC_WEB_ASSET_ORIGIN`, and the `EXPO_PUBLIC_FEATURE_*` flags),
-so the app talks to the production API over a pinned connection and renders categories/product
-images.
+The `internal` EAS profile injects the public runtime env (`EXPO_PUBLIC_API_BASE_URL`,
+`EXPO_PUBLIC_WEB_ASSET_ORIGIN`, and the `EXPO_PUBLIC_FEATURE_*` flags), and `app.config.js` adds the
+pins from `ssl-pins.json`, so the app talks to the production API over a pinned connection and
+renders categories/product images.
 
 ### B) Production AAB
 
@@ -86,46 +101,63 @@ eas build --platform android --profile production
 
 #### Production pinning on EAS
 
-Pinning in production is controlled by one line: `EXPO_PUBLIC_SSL_PINNING_HASHES` in the
-`production` profile's `env` in `mobile/eas.json`. Present → pinned; absent → unpinned. No file
-secret and no `eas-build-post-install` hook is involved, because the pins are plain strings that
-live in the repository (they are hashes of public keys, not secrets).
+Production is pinned from `mobile/ssl-pins.json`, the same file the internal build uses — there is
+nothing to switch on per profile. No file secret and no `eas-build-post-install` hook is involved,
+because the pins are plain strings that live in the repository (they are hashes of public keys, not
+secrets).
 
-Removing that line and rebuilding is also the **rollback**. Note it requires a new store build: a
+**Rollback** is one line in the `production` profile's `env` in `mobile/eas.json`:
+
+```json
+"MOBILE_SSL_PINNING_DISABLED": "1"
+```
+
+`app.config.js` then injects no pins and the app runs unpinned. It requires a new store build: a
 binary that cannot reach the API also cannot download an OTA update, so pinning cannot be switched
-off over the air. The `DEFAULT_PIN_EXPIRATION_DATE` constant in
-`packages/api-client/sslPinningAdapter.native.js` is the last-resort net for builds already in the
-field — on that date pin validation disables itself.
+off over the air.
 
-For a fully **local** production build, `npm -w mobile run env:production` puts the same hashes into
-`mobile/.env` before you run the Gradle `bundleRelease` (see `build-and-install.md` → "Manual
-build").
+The last-resort net for builds already in the field is `expirationDate` in `ssl-pins.json`
+(currently `2027-08-01`), injected as `EXPO_PUBLIC_SSL_PINNING_EXPIRES` — on that date pin
+validation disables itself without user action. The `DEFAULT_PIN_EXPIRATION_DATE` constant in
+`packages/api-client/sslPinningAdapter.native.js` is only the fallback used when that value is
+missing.
+
+A fully **local** production build needs no pinning setup at all: `app.config.js` resolves the pins
+identically for Gradle. Run `npm -w mobile run env:production` for the API URL and feature flags,
+then `bundleRelease` (see `build-and-install.md` → "Manual build").
 
 ---
 
 ## Local env profiles
 
-`use-env.sh` swaps `mobile/.env` (API base URL, pin hashes, feature flags). All profiles already
-exist as npm scripts:
+`use-env.sh` swaps `mobile/.env` (API base URL, feature flags, theme defaults). It does **not**
+touch pinning — no `.env` file contains pin hashes. All profiles already exist as npm scripts:
 
 ```bash
-npm -w mobile run env:internal     # production API, pinning OFF locally — for dev-client work
-npm -w mobile run env:production   # production API, pinning ON — EXPO_PUBLIC_SSL_PINNING_HASHES set
+npm -w mobile run env:internal     # production API — pinned, because app.config.js supplies the pins
+npm -w mobile run env:production   # production API — same pins, production app id
 npm -w mobile run env:tunnel       # ngrok API — the daily dev client
 npm -w mobile run env:emu          # emulator (10.0.2.2)
 npm -w mobile run env:lan          # physical device on the LAN
 ```
 
-These local `.env` files govern **local** builds and the dev client. An EAS build ignores them and
-uses the matching profile's `env` block in `mobile/eas.json`, where the `internal` profile _does_
-set the pins.
+These local `.env` files govern **local** builds and the dev client; an EAS build ignores them and
+uses the matching profile's `env` block in `mobile/eas.json`. Either way the pins come from
+`ssl-pins.json`, which is what makes a local Gradle build and an EAS build of the same profile
+byte-identical in pinning configuration (asserted by
+`mobile/src/tests/config/sslPinResolution.test.js`).
 
-`mobile/.env.internal` keeps pinning off locally (a blank hash list disables pinning):
-
-```dotenv
-EXPO_PUBLIC_API_BASE_URL=https://api.vexflare.com
-EXPO_PUBLIC_SSL_PINNING_HASHES=         # blank = pinning OFF
-```
+> **`cert:pins` reads the API host from the active `mobile/.env`.** Run it after `env:emu` and it
+> will try to read a certificate chain from `10.0.2.2` and fail. Switch to `env:internal` or
+> `env:production` first, or pass the host explicitly:
+>
+> ```bash
+> npm -w mobile run cert:pins -- --host api.vexflare.com
+> ```
+>
+> On a **fresh clone** this matters more than it looks: `mobile/.env` is gitignored, so it does not
+> exist until you run an `env:*` script, and `cert:pins` exits 1 with
+> `No host provided. Pass --host <api-host> or set EXPO_PUBLIC_API_BASE_URL.` until then.
 
 > The emulator, LAN and tunnel profiles need no pinning setting at all: the app skips pinning
 > automatically whenever the API host is `localhost`, a raw IPv4 address, or a known tunnel domain.
@@ -138,13 +170,14 @@ EXPO_PUBLIC_SSL_PINNING_HASHES=         # blank = pinning OFF
 > output, pass/fail criteria and troubleshooting — follow [`ssl-pinning.md`](./ssl-pinning.md) §4.
 > The checks below are the short form.
 
-- **Are the pins in the build?** Open the EAS build page → **Build details → Environment variables**
-  and confirm `EXPO_PUBLIC_SSL_PINNING_HASHES` is listed with the expected comma-separated hashes.
-  There is no packaged asset to inspect.
+- **Are the pins in the build?** There is no packaged asset to inspect, and the EAS build page
+  should show `EXPO_PUBLIC_SSL_PINNING_HASHES` as **absent** (see the callout above). Resolve
+  `app.config.js` instead — that is the same path the build takes.
 
 - **Is pinning actually enforced?** Build the `internal-pinfail` profile
   (`npm -w mobile run eas:build:pinfail`) and install it. It is byte-for-byte the `internal` profile
-  except that `EXPO_PUBLIC_SSL_PINNING_HASHES` holds two deliberately non-matching hashes, so:
+  except that `EXPO_PUBLIC_SSL_PINNING_HASHES` in its `env` block overrides the canonical pins with
+  two deliberately non-matching hashes, so:
 
   | Build              | Expected                                                                                 |
   | ------------------ | ---------------------------------------------------------------------------------------- |
@@ -157,16 +190,30 @@ EXPO_PUBLIC_SSL_PINNING_HASHES=         # blank = pinning OFF
   `npm -w mobile run env:internal-pinfail` generates `mobile/.env` from this very profile; see
   [`build-and-install.md`](./build-and-install.md) → "Pin-enforcement regression APK".
 
+  > **The invalid hashes must still be well-formed.** Both are 44-character base64 strings decoding
+  > to exactly 32 bytes, like any real SHA-256 SPKI digest — they simply match nothing in the live
+  > chain. Do not "simplify" them to a short placeholder: a malformed pin can make the native
+  > library reject the configuration outright rather than accept it and fail the comparison, and an
+  > app that fails for that reason looks identical from the outside. That would turn this test — the
+  > one check whose entire job is to catch pinning having gone inert — into a false pass.
+
   > **A MITM-proxy test cannot serve as the control on a modern Android build.** Apps targeting API
   > 24+ do not trust user-installed CA certificates — only the system store — and this app targets
   > API 36 with no `network_security_config.xml`. So installing a mitmproxy/Charles CA through
   > Settings makes _every_ build reject the intercepted connection, pinned or not, with
   > `ERR_CERT_AUTHORITY_INVALID`. That failure comes from Android's CA validation, several layers
-  > below the pinning check, so a "blocked" result proves nothing about pinning. Making the proxy
-  > test meaningful requires installing the CA into the **system** store (rooted device or an
-  > emulator with a writable system partition), or shipping a throwaway build whose network security
-  > config trusts user CAs. Note also that `chromium … net_error -202` lines in logcat come from the
-  > WebView stack, not from the OkHttp client the API uses — an OkHttp pin rejection surfaces as
+  > below the pinning check, so a "blocked" result proves nothing about pinning.
+  >
+  > **That is what the `internal-mitm` / `internal-mitm-nopin` profiles are for.** They set
+  > `ANDROID_TRUST_USER_CAS=1`, which makes `plugins/withUserCaTrust.js` emit a
+  > `network_security_config.xml` trusting the user store, so the proxy CA becomes genuinely valid
+  > and the pinner is reached. Running the pair — identical builds, identical proxy, pins present
+  > versus absent — is the actual MITM proof; see [`ssl-pinning.md`](./ssl-pinning.md) §4.3 and
+  > §4.4. Neither profile is shippable, and the plugin throws if the flag is combined with
+  > `APP_VARIANT=production`.
+  >
+  > Note also that `chromium … net_error -202` lines in logcat come from the WebView stack, not from
+  > the OkHttp client the API uses — an OkHttp pin rejection surfaces as
   > `SSLPeerUnverifiedException: Certificate pinning failure!` plus the JS listener line above.
 
 - **Runtime logs** — tap "Login" and watch for TLS/pinning failures:
@@ -177,9 +224,9 @@ EXPO_PUBLIC_SSL_PINNING_HASHES=         # blank = pinning OFF
   ```
 
 - **"Network error" on every request** → none of the configured pins matches the live chain, or
-  initialization failed. Re-run `npm -w mobile run cert:pins` and compare with the values in
-  `mobile/eas.json`; `adb logcat` will show `SSL pinning validation failed for <host>`. Then clear
-  app data and retry:
+  initialization failed. Run `npm -w mobile run cert:pins -- --check`, which compares
+  `mobile/ssl-pins.json` against the live chain and exits 1 if no configured pin appears in it;
+  `adb logcat` will show `SSL pinning validation failed for <host>`. Then clear app data and retry:
 
   ```bash
   adb shell pm clear com.ahmedmonib.eshop.internal
@@ -198,10 +245,15 @@ Windows-downloaded APK from WSL via `/mnt/c/Users/<you>/Downloads/…`.
 
 ## TL;DR
 
-- No cert-fetching step: pins are strings in `mobile/eas.json`. Regenerate with `cert:pins`.
+- No cert-fetching step: pins are strings in `mobile/ssl-pins.json`, the single canonical source for
+  EAS and local Gradle alike. Regenerate with `cert:pins -- --write`, gate releases with
+  `cert:pins -- --check`.
 - **Internal** = pinned sideload APK, `com.ahmedmonib.eshop.internal` — the device-validation
   vehicle ahead of each store release.
-- **Production** = pinned AAB to Play. Turning pinning on or off is one line in `eas.json` plus a
-  new build; it cannot be changed over the air.
+- **Production** = pinned AAB to Play, from the same pins as internal. Turning pinning **off** is
+  `MOBILE_SSL_PINNING_DISABLED=1` in the profile's `env` plus a new build; it cannot be changed over
+  the air.
 - Install with an **absolute** APK path; uninstall a conflicting package first if the signing key
   differs.
+- Verification here is **Android-only**. See [`ssl-pinning.md`](./ssl-pinning.md) §0.4 for what that
+  does and does not cover on iOS.

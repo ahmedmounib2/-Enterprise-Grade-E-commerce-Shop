@@ -443,7 +443,8 @@ adb uninstall com.ahmedmonib.eshop          || true
 ### 2) “Network error” on the internal APK
 
 Internal builds ship with pinning **ON**, so first confirm the configured pins still appear in the
-live chain (`npm -w mobile run cert:pins`) and match `eas.json`. Then clear app data and check
+live chain: `npm -w mobile run cert:pins -- --check` exits 1 when none do. The pins come from
+`mobile/ssl-pins.json`, so there is no second copy to compare against. Then clear app data and check
 runtime logs — a pin failure logs `SSL pinning validation failed for <host>`:
 
 ```bash

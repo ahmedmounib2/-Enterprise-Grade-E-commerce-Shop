@@ -7,6 +7,7 @@ Where a step depends on something that was not captured during the original veri
 called out explicitly rather than guessed.
 
 - [0. Environment preparation](#0-environment-preparation)
+  - [0.4 Platform scope — Android verified, iOS not](#04-platform-scope--what-has-and-has-not-been-verified)
 - [1. Architecture](#1-architecture)
 - [2. Build matrix](#2-build-matrix)
 - [3. Proxy setup (Charles / mitmproxy)](#3-proxy-setup-charles--mitmproxy)
@@ -98,8 +99,22 @@ keystore).
 git clone <repo> && cd <repo>
 npm install                       # workspaces: installs backend, frontend, mobile, shared, packages
 npm -w mobile test                # must be green before you start
-npm -w mobile run cert:pins       # must show pins matching mobile/ssl-pins.json
+
+# Pass --host on a fresh clone. See the note below for why.
+npm -w mobile run cert:pins -- --host api.vexflare.com
 ```
+
+> **Why `--host` is required here.** `cert:pins` takes the API host from `EXPO_PUBLIC_API_BASE_URL`
+> in `mobile/.env`, and that file is **gitignored** — a fresh clone does not have one until you run
+> an `env:*` script. Without it the command exits 1 with
+> `No host provided. Pass --host <api-host> or set EXPO_PUBLIC_API_BASE_URL.`
+>
+> The same dependency bites later in a subtler way: after `npm -w mobile run env:emu`, a bare
+> `cert:pins` will try to read a certificate chain from `10.0.2.2` and fail. Either run
+> `env:internal` first, or keep passing `--host`. Once a `.env` pointing at the production API is in
+> place, plain `npm -w mobile run cert:pins` works and its output must match `mobile/ssl-pins.json`.
+>
+> `npm -w mobile test` has no such dependency — the suite passes on a fresh clone with no `.env`.
 
 For any on-device procedure:
 
@@ -108,6 +123,37 @@ For any on-device procedure:
 - `adb devices -l` lists it as `device` (not `unauthorized` — accept the RSA prompt on the phone).
 - The device is **not** already running another `com.ahmedmonib.eshop.internal*` build. All four
   `internal*` profiles share one application id, so install one at a time.
+
+> **On WSL2, `adb devices -l` will not see a USB phone until you attach it.** WSL2 has no native USB
+> passthrough, and `adb` here is a Linux binary inside the distro rather than `adb.exe` on the host.
+> Attaching the device requires **`usbipd-win`** on the Windows side — install, `usbipd list`,
+> `usbipd bind`, `usbipd attach --wsl` — and it must be re-attached after every unplug and every
+> reboot. The full procedure, including the "Android Device Missing in WSL" troubleshooting path, is
+> in [`../custom-dev-setup.md`](../custom-dev-setup.md) → "USB via `usbipd-win`" (that page also
+> documents Wi-Fi debugging as an alternative). Do that before starting section 4; every procedure
+> there depends on `adb`.
+
+### 0.4 Platform scope — what has and has not been verified
+
+**Every procedure in this runbook is Android.** Sections 3, 4 and 5 assume `adb`, logcat, Gradle and
+the Play Console, and the acceptance record in section 10 is entirely Android.
+
+| Platform    | Status                                                                                                                                    |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| **Android** | Implemented and verified end to end — enforcement (4.2), MITM proof (4.3 + 4.4), and a production build installed from Google Play (§10). |
+| **iOS**     | Implemented but **never built or verified**. `mobile/eas.json` contains no iOS profile; all six profiles are Android-only.                |
+
+The iOS side is real code, not a stub: `react-native-ssl-public-key-pinning` pins through TrustKit,
+`app.config.js` sets `ios.bundleIdentifier`, and `expo-build-properties` sets
+`ios.networkInspector: false` precisely because the dev network inspector proxies URLSession and
+would defeat TrustKit. The adapter is platform-agnostic — it calls `initializeSslPinning` and lets
+the library pick the platform mechanism.
+
+What is missing is evidence. Nothing here demonstrates that pinning is enforced on a real iOS
+device, and the MITM harness has no iOS equivalent: `withUserCaTrust` writes an Android
+`network_security_config.xml`, which has no counterpart on iOS. **Do not read an Android pass as
+proof of iOS behaviour.** Before shipping iOS, add an iOS EAS profile and reproduce at least the 4.2
+enforcement test on a device.
 
 ---
 
@@ -332,6 +378,18 @@ mitmweb --version
 ```
 
 Whichever proxy you install, it runs on the **laptop**. Section 3.6 points the phone at it.
+
+> **Install and run the proxy on Windows, not inside WSL.** This is the natural mistake, because the
+> repository, Node and `adb` all live in WSL — so installing mitmproxy there feels consistent. It
+> does not work: WSL2 sits behind a NAT with its own virtual adapter, so a listener bound inside the
+> distro is not reachable from the phone at the laptop's LAN address. The phone would need a
+> `netsh interface portproxy` rule on the Windows side to reach it, which is more moving parts in
+> exactly the layer whose correctness the whole test depends on.
+>
+> Run Charles or mitmproxy as a **Windows** application, and point the phone at the **Windows Wi-Fi
+> adapter's** IPv4 address (3.4). This split is normal for this repo — the toolchain in WSL, the
+> proxy and the phone on the LAN — and it is why 3.4 spends time on picking the right adapter and
+> why 3.3 covers Windows Defender Firewall.
 
 ### 3.3 Windows Defender Firewall
 
@@ -625,6 +683,20 @@ Then **[SIGNING]** and **[BUILD]**, proxy **OFF**. Start **[LOGCAT]**, launch th
 | Logcat        | `SSL pinning validation failed for api.vexflare.com: Certificate pinning failure!` |
 | **PASS**      | Total API failure **is** the pass condition.                                       |
 | **FAIL**      | The app working normally means pinning is inert. **Stop and investigate.**         |
+
+> **The invalid hashes in this profile must stay well-formed.** Both values in `internal-pinfail`'s
+> `env` are 44-character base64 strings decoding to exactly 32 bytes — structurally identical to a
+> real SHA-256 SPKI digest, they simply match nothing in the live chain. Keep them that way.
+>
+> A malformed pin can make the native library reject the configuration outright rather than accept
+> it and fail the comparison. Both outcomes look the same from the outside — no API traffic — so a
+> shortened placeholder would still "pass" while testing nothing. That would hollow out the one
+> check whose entire purpose is to catch pinning having gone inert. If you ever need to regenerate
+> them, take any valid SHA-256 digest that is not in the live chain, e.g.:
+>
+> ```bash
+> node -e "console.log(require('crypto').createHash('sha256').update('not-a-real-key').digest('base64'))"
+> ```
 
 ---
 
@@ -1163,8 +1235,15 @@ APP_VARIANT=internal node -e "
 ```bash
 node -e "console.log(require('./mobile/ssl-pins.json').pins.map(p => p.hash).join(','))"
 npm -w mobile run cert:pins                 # live chain, print only
+npm -w mobile run cert:pins -- --check      # release gate: exit 1 if no configured pin is live
 npm -w mobile run cert:pins -- --write      # live chain, update ssl-pins.json
+
+# --host overrides the API host taken from mobile/.env. Required on a fresh clone
+# (no .env yet) and whenever a dev profile such as env:emu is active.
+npm -w mobile run cert:pins -- --host api.vexflare.com
 ```
+
+`--check`, `--write` and `--host` are the only flags the script accepts.
 
 **Confirm no duplicate source exists**
 
@@ -1431,6 +1510,9 @@ verification — section 5 covers it whenever you choose to make it.
 
 ### Deferred, tracked elsewhere
 
+- [ ] **iOS verification.** Pinning is implemented for iOS (TrustKit) but has never been built or
+      tested: `eas.json` has no iOS profile, and the MITM harness is Android-specific. Everything
+      ticked above is Android. See [0.4](#04-platform-scope--what-has-and-has-not-been-verified).
 - [ ] New Architecture enablement — no remaining blockers, but a separate migration
       (`mobile/docs/docs/mobile/android-build-config.md`).
 - [ ] `mobile/scripts/release-pipeline.sh` calls `:app:assembleInternalRelease` /
@@ -1457,15 +1539,23 @@ STAGE                                          SECTION   NOTES
  2  Clone the repository                        0.3      Any directory; no submodules.
  3  Install dependencies                        0.3      npm install at the repo ROOT, not in
                                                          mobile/ — this is an npm workspace.
+                                                         cert:pins needs --host until an env:*
+                                                         script has created mobile/.env.
  4  Configure the Android SDK and Java          0.2      ANDROID_HOME / ANDROID_SDK_ROOT,
                                                          JAVA_HOME. Local release builds also
                                                          need the ESHOP_ANDROID_* keystore set
                                                          from Bitwarden.
  5  Install Charles or mitmproxy                3.2      Either one. Charles was used for the
-                                                         original verification. Windows firewall
-                                                         must allow it on Private networks (3.3).
+                                                         original verification. Install it on
+                                                         WINDOWS, not inside WSL — a listener
+                                                         inside WSL2 is unreachable from the
+                                                         phone. Windows firewall must allow it
+                                                         on Private networks (3.3).
  6  Enable USB debugging and connect the phone  0.3      adb devices -l shows state "device".
                                                          Accept the RSA prompt on the phone.
+                                                         On WSL2 attach the device first with
+                                                         usbipd-win (custom-dev-setup.md), and
+                                                         re-attach after every unplug/reboot.
  7  Configure the Android proxy and install     3.4-3.7  Laptop Wi-Fi IPv4 (not WSL/Hyper-V),
     the proxy CA                                         phone proxy Manual, CA in the USER store.
                                                          The CA goes on the PHONE only, never on
@@ -1516,3 +1606,6 @@ Two cheaper procedures are worth knowing about, because most days you do not nee
 Use stages 1–12 when the pinning implementation itself changes — a library upgrade, an Expo SDK or
 React Native upgrade, enabling the New Architecture, or edits to `sslPinningAdapter.native.js`. The
 full trigger table is in [section 7](#when-to-re-run-the-verification-suite).
+
+This checklist verifies **Android only**; see
+[0.4](#04-platform-scope--what-has-and-has-not-been-verified).
