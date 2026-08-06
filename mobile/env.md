@@ -44,15 +44,20 @@
 
 1. Mobile `ForgotPasswordPage` sends `POST /api/auth/forgot-password` with
    `{ email, client: 'mobile', mobile: true, scheme: getAppScheme() }`, where `scheme` is the active
-   variant's scheme (e.g. `vexflare-internal` for the internal build).
+   variant's scheme (e.g. `vexflareinternal` for the internal build).
 2. Backend validates the scheme against a whitelist and generates
    `deepLink={scheme}://reset-password?...#token=...` plus
    `webFallback=https://<vercel-app>/reset-password`. Old app versions that omit `scheme` fall back
-   to `MOBILE_RESET_REDIRECT_URI` (default `eshop://reset-password`).
+   to `MOBILE_RESET_REDIRECT_URI` (default `eshop://reset-password`, a legacy value — the Android
+   manifest itself no longer registers an `eshop` intent filter, see below).
 3. Android intent filters accept the per-variant scheme and open only the matching app (no chooser).
-4. Navigation prefixes include the active variant's `getAppScheme()://` plus legacy schemes
-   (`eshop://`, `vexflare://`). Config `{ ResetPassword: 'reset-password' }` ensures both logged-in
-   and anonymous users land on the `ResetPassword` screen.
+4. React Navigation's linking prefixes include the active variant's `getAppScheme()://` plus a
+   static legacy set (`eshop://`, `vexflare://`, `exp+eshop-mobile://`, `exp+vexflare-mobile://`)
+   for route-matching purposes — but only the variant scheme and `exp+vexflare-mobile://` are
+   actually declared as Android intent filters, so an external `eshop://` link never reaches the app
+   on a fresh install; the prefix exists defensively in the JS layer only. Config
+   `{ ResetPassword: 'reset-password' }` ensures both logged-in and anonymous users land on the
+   `ResetPassword` screen.
 
 ---
 
@@ -106,9 +111,11 @@ Handy tips:
 
 - Expo project defined in `mobile/` with custom dev client.
 - `app.config.js` declares a per-variant `scheme` (see the table below; `vexflare` for production)
-  selected by `process.env.APP_VARIANT` and read by the JS layer via `Constants.expoConfig`, plus
-  Android intent filters. The legacy `eshop://` scheme is still accepted by the manifest for
-  backwards compatibility.
+  selected by `process.env.APP_VARIANT` and read by the JS layer via `Constants.expoConfig`, plus a
+  matching Android intent filter. The manifest registers **only** the active variant's scheme (and
+  `exp+vexflare-mobile://` for the dev-client launcher) — the legacy `eshop://` scheme is not an
+  intent filter and will not open the app; it survives only as a backend-side fallback value and a
+  defensive entry in the JS navigation prefixes (see "Deep-link flow recap" above).
 - Development build installed via `APP_VARIANT=development npx expo run:android`.
 - `.env` management handled through scripts (see [Mobile `.env` profiles](#mobile-env-profiles)).
 
@@ -119,11 +126,11 @@ Without this, Android cannot tell which app an OAuth or password-reset callback 
 the "open with…" chooser. The scheme is set from `process.env.APP_VARIANT` in `app.config.js`, which
 prebuild injects into `AndroidManifest.xml`:
 
-| `APP_VARIANT` | applicationId                   | scheme              | OAuth callback              | Reset deep link                      |
-| ------------- | ------------------------------- | ------------------- | --------------------------- | ------------------------------------ |
-| `production`  | `com.ahmedmonib.eshop`          | `vexflare`          | `vexflare://oauth`          | `vexflare://reset-password`          |
-| `internal`    | `com.ahmedmonib.eshop.internal` | `vexflare-internal` | `vexflare-internal://oauth` | `vexflare-internal://reset-password` |
-| `development` | `com.ahmedmonib.eshop.dev`      | `vexflare-dev`      | `vexflare-dev://oauth`      | `vexflare-dev://reset-password`      |
+| `APP_VARIANT` | applicationId                   | scheme             | OAuth callback             | Reset deep link                     |
+| ------------- | ------------------------------- | ------------------ | -------------------------- | ----------------------------------- |
+| `production`  | `com.ahmedmonib.eshop`          | `vexflare`         | `vexflare://oauth`         | `vexflare://reset-password`         |
+| `internal`    | `com.ahmedmonib.eshop.internal` | `vexflareinternal` | `vexflareinternal://oauth` | `vexflareinternal://reset-password` |
+| `development` | `com.ahmedmonib.eshop.dev`      | `vexflaredev`      | `vexflaredev://oauth`      | `vexflaredev://reset-password`      |
 
 At runtime the JS layer cannot read the native manifest, so `mobile/src/utils/appScheme.js` derives
 the active scheme from `expo-application`'s `Application.applicationId` and forces it into every
@@ -156,19 +163,20 @@ headers).
 
 ### Backend (Railway)
 
-| Variable                     | Description                                                                                    | Typical value                              |
-| ---------------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `PUBLIC_CLIENT_FALLBACK_URL` | Matches the Vercel fallback so emails share the same SPA link.                                 | `https://vexflare.com/reset-password`      |
-| `MOBILE_RESET_REDIRECT_URI`  | Fallback deep link for password resets (overridden when the app sends a per-variant `scheme`). | `eshop://reset-password`                   |
-| `MOBILE_MAIL_CONFIRM_URI`    | Custom-scheme deep link for mailing confirmations.                                             | `eshop://mailing/confirm`                  |
-| `MAIL_CONFIRM_WEB_URL`       | Optional HTTPS override used inside confirmation emails.                                       | `https://shop.example.com/mailing/confirm` |
-| `MOBILE_OAUTH_REDIRECT_URI`  | Custom-scheme deep link for OAuth return.                                                      | `eshop://oauth`                            |
+| Variable                     | Description                                                                                                  | Typical value                                                     |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| `PUBLIC_CLIENT_FALLBACK_URL` | Matches the Vercel fallback so emails share the same SPA link.                                               | `https://vexflare.com/reset-password`                             |
+| `MOBILE_RESET_REDIRECT_URI`  | Fallback deep link for password resets (overridden when the app sends a per-variant `scheme`).               | `eshop://reset-password` (code fallback and `.env.example` agree) |
+| `MOBILE_MAIL_CONFIRM_URI`    | Custom-scheme deep link for mailing confirmations. No code-level fallback — required.                        | `eshop://mailing/confirm` (per `.env.example`)                    |
+| `MAIL_CONFIRM_WEB_URL`       | Optional HTTPS override used inside confirmation emails.                                                     | `https://shop.example.com/mailing/confirm`                        |
+| `MOBILE_OAUTH_REDIRECT_URI`  | Custom-scheme deep link for OAuth return. Used only when the mobile client's own `redirect` param is absent. | `vexflare://oauth`                                                |
 
 > **Branding tip:** The public-facing app name shown in the Google Play Console (e.g. "Ecommerce")
-> can differ from the internal deep-link scheme (`eshop://…`). Only change the scheme and the values
-> above if you intend to rebrand all mobile links and have also updated `mobile/app.config.js`, the
-> published Android intent filters, and any emails that reference these URIs. Simply renaming the
-> store listing does **not** require touching the scheme or redirect values.
+> can differ from the internal deep-link scheme (`vexflare://…`, plus the legacy `eshop://` fallback
+> above). Only change the scheme and the values above if you intend to rebrand all mobile links and
+> have also updated `mobile/app.config.js`, the Android intent filters, and any emails that
+> reference these URIs. Simply renaming the store listing does **not** require touching the scheme
+> or redirect values.
 
 ### Shared contracts
 
@@ -310,7 +318,7 @@ git push railway main        # if Railway is wired to the repo remote
 ### Deep-link validation
 
 ```bash
-npx uri-scheme open "eshop://reset-password?token=TEST123&email=user%40example.com" --android
+npx uri-scheme open "vexflare://reset-password?token=TEST123&email=user%40example.com" --android
 adb shell dumpsys package com.ahmedmonib.eshop | grep -i "scheme"
 ```
 
@@ -354,7 +362,7 @@ adb reverse tcp:19000 tcp:19000
 
 ```bash
 cd mobile
-npx expo start --localhost -c
+npx expo start --localhost --dev-client -c
 # press "a" to open the running emulator
 ```
 
@@ -382,8 +390,8 @@ npm -w mobile run env:lan  # ensure file has your current IPv4
 
 ```bash
 cd mobile
-npx expo start --tunnel -c
-# scan QR with dev client or Expo Go
+npx expo start --tunnel --dev-client -c
+# scan QR with the custom dev client (Expo Go is not supported — see mobile/dev-setup.md)
 ```
 
 Sanity checks:
@@ -419,7 +427,7 @@ npm -w mobile run env:tunnel  # paste the ngrok HTTPS URL into .env.tunnel
 
 ```bash
 cd mobile
-npx expo start --tunnel -c
+npx expo start --tunnel --dev-client -c
 ```
 
 Sanity checks:
@@ -430,11 +438,11 @@ Sanity checks:
 
 ### Mode picker cheat sheet
 
-| Mode                    | Use when…                                     | Pros                                 | Cons                                                            | Core commands                                                                                      |
-| ----------------------- | --------------------------------------------- | ------------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| **A. Emulator**         | Fast iteration on one machine                 | No Wi-Fi dependencies; quick reloads | Must keep emulator running; re-run `adb reverse` after restarts | `npm run dev` → `npm -w mobile run env:emu` → `adb reverse …` → `npx expo start --localhost -c`    |
-| **B. Tunnel + LAN API** | Real device on same Wi-Fi                     | Stable Metro tunnel, fast LAN API    | Requires firewall rule & up-to-date IPv4                        | `npm run dev` → `npm -w mobile run env:lan` → `npx expo start --tunnel -c`                         |
-| **C. Tunnel + ngrok**   | HTTPS required or sharing with remote testers | Works anywhere, trusted cert         | Keep ngrok session alive; URLs change                           | `npm run dev` → `npx ngrok http …` → `npm -w mobile run env:tunnel` → `npx expo start --tunnel -c` |
+| Mode                    | Use when…                                     | Pros                                 | Cons                                                            | Core commands                                                                                                   |
+| ----------------------- | --------------------------------------------- | ------------------------------------ | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **A. Emulator**         | Fast iteration on one machine                 | No Wi-Fi dependencies; quick reloads | Must keep emulator running; re-run `adb reverse` after restarts | `npm run dev` → `npm -w mobile run env:emu` → `adb reverse …` → `npx expo start --localhost --dev-client -c`    |
+| **B. Tunnel + LAN API** | Real device on same Wi-Fi                     | Stable Metro tunnel, fast LAN API    | Requires firewall rule & up-to-date IPv4                        | `npm run dev` → `npm -w mobile run env:lan` → `npx expo start --tunnel --dev-client -c`                         |
+| **C. Tunnel + ngrok**   | HTTPS required or sharing with remote testers | Works anywhere, trusted cert         | Keep ngrok session alive; URLs change                           | `npm run dev` → `npx ngrok http …` → `npm -w mobile run env:tunnel` → `npx expo start --tunnel --dev-client -c` |
 
 ---
 
@@ -446,7 +454,8 @@ Sanity checks:
 - ✅ Choose environment profile (`env:emu`, `env:lan`, or `env:tunnel`).
 - ✅ Launch Metro with `--localhost` (emulator) or `--tunnel` (physical devices) and include `-c`
   after env changes.
-- ✅ Test deep link: `npx uri-scheme open "eshop://reset-password?token=TEST..." --android`.
+- ✅ Test deep link: `npx uri-scheme open "vexflaredev://reset-password?token=TEST..." --android`
+  (adjust the scheme for whichever variant is installed).
 - ✅ Confirm Expo JS console shows expected `EXPO_PUBLIC_API_BASE_URL`.
 
 ### Release checklist
@@ -584,7 +593,7 @@ Tunnel ready.
 and a URL similar to:
 
 ```text
-exp+eshop-mobile://expo-development-client/?url=https://<id>.exp.direct
+exp+vexflare-mobile://expo-development-client/?url=https://<id>.exp.direct
 ```
 
 #### Reproducible tunnel startup checklist
@@ -649,7 +658,6 @@ APP_VARIANT=development npx expo run:android
 
 - The API ngrok tunnel and the Expo tunnel are separate systems.
 - A healthy ngrok session does not guarantee Expo tunnel connectivity.
-- A healthy ngrok session does not guarantee Expo tunnel connectivity.
 - If tunnel mode suddenly stops working after previously working, always run:
 
 ```bash
@@ -662,7 +670,7 @@ before troubleshooting networking or ngrok.
 
 ## Reference links
 
-- [Custom dev client setup](./dev-setup.md)
+- [Custom dev client setup](./custom-dev-setup.md)
 - [Expo Linking guide](https://docs.expo.dev/guides/linking/)
 - [Vercel CLI docs](https://vercel.com/docs/cli)
 - [Railway docs](https://docs.railway.app/)

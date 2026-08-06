@@ -143,7 +143,7 @@ Some screenshots and historical references may still contain the previous domain
   - [Mobile deep-link flow overview](#mobile-deep-link-flow-overview)
     - [Payment return (Stripe checkout) — direct 303 redirect](#payment-return-stripe-checkout--direct-303-redirect)
     - [OAuth login (Google/Facebook) — in-process interception](#oauth-login-googlefacebook--in-process-interception)
-    - [Why two strategies?](#why-two-strategies)
+    - [Why payment and OAuth use different launch mechanisms](#why-payment-and-oauth-use-different-launch-mechanisms)
     - [Supported return schemes](#supported-return-schemes)
     - [Key files](#key-files)
     - [Testing matrix](#testing-matrix)
@@ -549,8 +549,9 @@ decide to collaborate with others or formalise operations:
 
 - [`mobile/env.md`](mobile/env.md) — environments, workspace responsibilities, run modes, deployment
   checklists.
-- [`mobile/dev-setup.md`](mobile/dev-setup.md) — Android toolchain, device connectivity, Expo
-  workflows.
+- [`mobile/dev-setup.md`](mobile/dev-setup.md) — why Expo Go isn't supported, and a pointer to
+  [`mobile/custom-dev-setup.md`](mobile/custom-dev-setup.md) for the Android toolchain, device
+  connectivity, and the full custom dev-client workflow (the only supported way to run the app).
 - [`docs/deployment.md`](docs/deployment.md) — optional release runbook covering frontend, backend,
   and mobile rollouts when multiple people coordinate deployments.
 - [`docs/security/access-controls.md`](docs/security/access-controls.md) — optional template for
@@ -2283,9 +2284,9 @@ graph LR
   | `MAIL_CONFIRM_WEB_URL`       | `https://shop.example.com/mailing/confirm?token={{token}}` | Overrides the browser confirmation URL.               |
   | `MOBILE_OAUTH_REDIRECT_URI`  | `vexflare://oauth`                                         | Deep link used by OAuth providers.                    |
 
-- **`MOBILE_RESET_REDIRECT_URI` note:** Newer app versions send a per-flavor `scheme` field
-  (`vexflare`, `vexflare-internal`, or `vexflare-dev`) in the `POST /api/auth/forgot-password`
-  request body. When present, the backend uses that scheme to construct the deep link instead of
+- **`MOBILE_RESET_REDIRECT_URI` note:** Newer app versions send a per-variant `scheme` field
+  (`vexflare`, `vexflareinternal`, or `vexflaredev`) in the `POST /api/auth/forgot-password` request
+  body. When present, the backend uses that scheme to construct the deep link instead of
   `MOBILE_RESET_REDIRECT_URI`. The env var remains the fallback for older app versions that do not
   send `scheme`. See [Password reset deep-link flow](#password-reset-deep-link-flow) for details.
 - Redeploy whenever you change env vars, email templates, or native deep-link paths.
@@ -2315,31 +2316,29 @@ Refer to [`mobile/env.md`](mobile/env.md) for the full run-mode matrix and env p
 ## Mobile deep-link flow overview
 
 The app returns from external browsers (Stripe Checkout, Google/Facebook OAuth) into the native app
-using **two distinct deep-link strategies**, because the two flows hand control back to the app in
-fundamentally different ways. Both work across the dev client over tunnel, the internal APK, and
-production with a single shared code path each.
+using **one unified strategy**: `createAppDeepLink()` (`mobile/src/utils/appScheme.js`) always
+forces the installed variant's own scheme — `vexflare://` (production), `vexflareinternal://`
+(internal APK), `vexflaredev://` (dev client) — via `getAppScheme()`, which derives the scheme from
+`Application.applicationId` at runtime. This works uniformly across payment and OAuth, and across
+the dev client over tunnel, the internal APK, and production, because every scheme is
+**hyphen-free** by design: `checkout.stripe.com`'s client-side JS mangles a hyphenated custom scheme
+into a bogus `https://<scheme>//<path>` fetch instead of an app redirect (confirmed via controlled
+A/B testing), so a per-variant scheme only became safe to force unconditionally once the hyphens
+were removed. An earlier implementation special-cased payment links to avoid forcing a hyphenated
+dev-client scheme; that special-casing no longer exists or is needed.
 
 ### Payment return (Stripe checkout) — direct 303 redirect
 
-- The mobile client builds the return link with `createReturnDeepLink()`
-  (`mobile/src/utils/appScheme.js`) and sends it as `successUrl` / `cancelReturnUrl` to
-  `POST /payments/create-checkout-session`.
-- `createReturnDeepLink()` is **environment-aware** (it does _not_ force a scheme):
-  - **Dev server present** (Expo Go / dev client / tunnel — detected via
-    `Constants.expoConfig.hostUri`): it uses Expo's bare `ExpoLinking.createURL(path)`, which the
-    running client actually re-opens — `vexflare://checkout-success` on a development build, or
-    `exp://<host>/--/checkout-success` under Expo Go. Forcing the per-flavor scheme here would emit
-    `vexflare-dev://…`, which the tunnelled dev client cannot open (Stripe's redirect dead-ends with
-    "this site can't be reached").
-  - **Installed standalone build** (no dev server): it forces the active flavor's scheme via
-    `getAppScheme()` — `vexflare://` (production), `vexflare-internal://` (internal APK),
-    `vexflare-dev://` (dev build) — so the redirect re-opens the exact app that started checkout.
+- `CheckoutPage` (`mobile/src/screens/CheckoutPage.js`) builds the return links via
+  `createAppDeepLink('checkout-success')` / `createAppDeepLink('checkout-cancel')` and sends them as
+  `successUrl` / `cancelReturnUrl` to `POST /payments/create-checkout-session`.
 - The backend validates the link against `ALLOWED_RETURN_PROTOCOLS`
   (`backend/src/controllers/payment.controller.js`) and passes it **directly to Stripe as
   `success_url`** — there is **no `/checkout-return` server bridge**.
-- Stripe performs a **server-side 303 redirect** to that deep link. A Chrome Custom Tab honors a 303
-  all the way to a registered custom scheme, so the OS re-opens the app on `PurchaseSuccessPage`,
-  which calls `GET /payments/checkout-success` to confirm the order.
+- The app opens the Stripe checkout URL with `Linking.openURL()` — a full app-switch to the device's
+  default browser, not a Chrome Custom Tab. Stripe performs a **server-side 303 redirect** to the
+  deep link; the browser hands the custom-scheme URL off to Android, which reopens the app on
+  `PurchaseSuccessPage`, which calls `GET /payments/checkout-success` to confirm the order.
 - **Cold-start safety:** `PurchaseSuccessPage` (`mobile/src/screens/PurchaseSuccessPage.js`)
   restores the Bearer token before issuing authenticated requests, so a deep-link cold start cannot
   fire a request without auth.
@@ -2349,13 +2348,8 @@ production with a single shared code path each.
 - The mobile client opens the provider with `WebBrowser.openAuthSessionAsync(target, redirectUrl)`
   (`mobile/src/screens/LoginScreen.js`, `mobile/src/screens/SignupPage.js`), passing
   `createAppDeepLink('oauth')` as the watched `redirectUrl`. `expo-web-browser` intercepts the
-  redirect **in-process** — the OS never has to resolve the scheme from a Custom Tab.
-- `createAppDeepLink()` **always forces the per-flavor scheme** via `getAppScheme()`:
-  `vexflare://oauth` (production), `vexflare-internal://oauth` (internal APK),
-  `vexflare-dev://oauth` (dev build), and the `exp`/`exp+vexflare-mobile` dev-client scheme under
-  Expo tooling. Forcing the flavor scheme is safe here precisely because the redirect is intercepted
-  in-process.
-- After the provider callback the backend redirects to the per-flavor deep link via a bridge page
+  redirect **in-process**, via a Chrome Custom Tab — the OS never has to resolve the scheme itself.
+- After the provider callback the backend redirects to the per-variant deep link via a bridge page
   (`buildMobileTarget` + `sendMobileBridgePage` in `backend/src/app.js`). On Android the bridge
   emits an **Android Intent URL**
   (`intent://oauth?code=…#Intent;scheme=vexflare;package=com.ahmedmonib.eshop;end`) so the redirect
@@ -2364,15 +2358,17 @@ production with a single shared code path each.
   `AuthProvider` exchanges it via `POST /api/auth/oauth-signup`
   (`backend/src/controllers/auth.controller.js`). See the bridge-code details below.
 
-### Why two strategies?
+### Why payment and OAuth use different launch mechanisms
+
+Both now force the same per-variant scheme, but they open the external page differently because the
+two flows hand control back to the app in different ways:
 
 - **Payment** cannot intercept in-process — Stripe owns the hosted checkout page and issues a real
-  303 redirect. The link therefore has to be a scheme the **OS** resolves, which is why the dev
-  client must use Expo's environment-aware (generic / `exp`) link rather than a forced
-  `vexflare-dev://`.
-- **OAuth** uses `openAuthSessionAsync`, which resolves the redirect inside the browser session, so
-  it can (and should) use the **flavor-specific** scheme to disambiguate between build types when
-  several flavors are installed side by side.
+  303 redirect, so `Linking.openURL()` (full app-switch) is what's needed; a Custom Tab isn't
+  involved on this path.
+- **OAuth** uses `openAuthSessionAsync`, which opens a Chrome Custom Tab and resolves the redirect
+  inside that session, so the flavor-specific scheme disambiguates between build types without ever
+  leaving the in-app browser context.
 
 ### Supported return schemes
 
@@ -2380,40 +2376,39 @@ production with a single shared code path each.
 Payment — ALLOWED_RETURN_PROTOCOLS (backend/src/controllers/payment.controller.js)
   http:                      web fallback
   https:                     web fallback
-  vexflare:                  production APK + dev-client generic link
-  vexflare-internal:         internal APK
-  vexflare-dev:              development build
+  vexflare:                  production APK
+  vexflareinternal:          internal APK
+  vexflaredev:               development build
   eshop:                     legacy, kept for backward compatibility
   exp* (startsWith 'exp')    exp:// (Expo Go) and exp+vexflare-mobile:// (dev client launcher)
 
 OAuth — mobile deep-link helpers (getAppScheme / createAppDeepLink)
   vexflare://oauth                     production APK
-  vexflare-internal://oauth            internal APK
-  vexflare-dev://oauth                 development build
+  vexflareinternal://oauth             internal APK
+  vexflaredev://oauth                  development build
   exp+vexflare-mobile://…/oauth        Expo dev client
   exp://…/oauth                        Expo Go
 
 Password reset — ALLOWED_MOBILE_SCHEMES (backend/src/controllers/auth.controller.js)
   vexflare://reset-password            production APK
-  vexflare-internal://reset-password   internal APK
-  vexflare-dev://reset-password        development build
+  vexflareinternal://reset-password    internal APK
+  vexflaredev://reset-password         development build
   eshop://reset-password               legacy / env var fallback
 ```
 
 ### Key files
 
 ```text
-mobile/src/utils/appScheme.js        getAppScheme() → flavor scheme (OAuth, payment, reset);
-                                     createReturnDeepLink() → env-aware link (payment);
-                                     isDevServerEnvironment() → Constants.expoConfig.hostUri probe
-mobile/src/screens/CheckoutPage.js   builds the payment return link via createReturnDeepLink()
+mobile/src/utils/appScheme.js        getAppScheme() → per-variant scheme (OAuth, payment, reset);
+                                     createAppDeepLink() → always forces that scheme
+mobile/src/screens/CheckoutPage.js   builds the payment return links via createAppDeepLink()
 mobile/src/screens/LoginScreen.js    OAuth via openAuthSessionAsync + createAppDeepLink('oauth')
 mobile/src/screens/SignupPage.js     same OAuth pattern for the signup path
 mobile/src/screens/ForgotPasswordPage.js  sends scheme: getAppScheme() to forgot-password endpoint
 mobile/src/auth/AuthProvider.js      handles the intercepted OAuth URL + bridge-code exchange
 backend/src/controllers/payment.controller.js  ALLOWED_RETURN_PROTOCOLS + success_url passthrough
-backend/src/app.js                   OAuth provider callback → per-flavor deep-link bridge page
-backend/src/controllers/auth.controller.js     ALLOWED_MOBILE_SCHEMES + flavor-specific reset link;
+backend/src/app.js                   OAuth provider callback → per-variant deep-link bridge page
+backend/src/controllers/auth.controller.js     ALLOWED_MOBILE_SCHEMES + variant-specific reset link;
                                                POST /api/auth/oauth-signup bridge-code exchange
 frontend/src/pages/MobileResetPasswordPage.jsx  bridge page: auto-opens deep link, web fallback
 ```
@@ -2421,25 +2416,24 @@ frontend/src/pages/MobileResetPasswordPage.jsx  bridge page: auto-opens deep lin
 ### Testing matrix
 
 ```text
-Environment            Payment flow                          OAuth flow                                 Password reset
----------------------  ------------------------------------  -----------------------------------------  -------------------------------------------
-Production APK         works — vexflare:// (flavor scheme)   works — vexflare:// (flavor scheme)        works — vexflare:// (flavor scheme)
-Internal APK          works — vexflare-internal://          works — vexflare-internal://               works — vexflare-internal://
-Prod Debug            works — vexflare-dev://               works — vexflare-dev://                    works — vexflare-dev://
-Dev client + tunnel   works — generic vexflare:// (bare     works — vexflare-dev:// / Expo launcher,   falls back to MOBILE_RESET_REDIRECT_URI
-                      createURL); SERVER_URL must be the    intercepted in-process by                  (dev server env does not send scheme)
-                      ngrok / HTTPS URL                     openAuthSessionAsync
-Expo Go               limited — exp:// may work, not        limited — openAuthSessionAsync has         limited — falls back to env var
-                      officially supported                  constraints, not officially supported
+Environment            Payment flow                           OAuth flow                              Password reset
+---------------------  --------------------------------------  ---------------------------------------  -------------------------------------------
+Production APK         works — vexflare:// (variant scheme)    works — vexflare:// (variant scheme)     works — vexflare:// (variant scheme)
+Internal APK           works — vexflareinternal://             works — vexflareinternal://              works — vexflareinternal://
+Dev client + tunnel    works — vexflaredev:// (forced scheme,   works — vexflaredev:// intercepted        falls back to MOBILE_RESET_REDIRECT_URI
+                       hyphen-free so Stripe's redirect         in-process by openAuthSessionAsync        (dev server env does not send scheme)
+                       resolves it); SERVER_URL must be the
+                       ngrok / HTTPS URL
+Expo Go                not supported — the app fails on its first network call regardless of deep-link
+                       flow; see mobile/dev-setup.md
 ```
 
 Notes:
 
 - **Dev client + tunnel** requires `SERVER_URL` (backend) to be the public ngrok / HTTPS origin so
   Stripe can reach it and the 303 returns to the device.
-- **Multiple flavors installed:** OAuth and password reset both rely on the flavor-specific scheme
-  to disambiguate; the installed-build payment link is also flavor-specific, while the dev-client
-  payment link is generic.
+- **Multiple variants installed:** payment, OAuth, and password reset all rely on the
+  variant-specific scheme to disambiguate which installed app a callback belongs to.
 - **Cold-start auth races** are handled by `PurchaseSuccessPage` restoring Bearer auth before
   authenticated calls.
 
@@ -2450,9 +2444,9 @@ the app that initiated the request, with no Android chooser dialog.
 
 1. `ForgotPasswordPage` sends `POST /api/auth/forgot-password` with
    `{ email, client: 'mobile', mobile: true, scheme: getAppScheme() }`. The `scheme` field carries
-   the active flavor's scheme (`vexflare`, `vexflare-internal`, or `vexflare-dev`).
-2. The backend validates `scheme` against a hardcoded whitelist (`vexflare`, `vexflare-internal`,
-   `vexflare-dev`, `eshop`). If valid, it constructs the deep link as
+   the active variant's scheme (`vexflare`, `vexflareinternal`, or `vexflaredev`).
+2. The backend validates `scheme` against a hardcoded whitelist (`vexflare`, `vexflareinternal`,
+   `vexflaredev`, `eshop`). If valid, it constructs the deep link as
    `{scheme}://reset-password?…#token=…`. Invalid or missing schemes fall back to the
    `MOBILE_RESET_REDIRECT_URI` env var (default `eshop://reset-password`), preserving backward
    compatibility with older app versions.
@@ -2461,7 +2455,7 @@ the app that initiated the request, with no Android chooser dialog.
 4. The user taps the email link → the frontend bridge page (`MobileResetPasswordPage.jsx`) loads →
    after 300 ms it calls `window.location.assign(deepLink)` to trigger the native deep link. If the
    app does not open within 1.8 s, the page falls back to the web reset form.
-5. Android resolves the flavor-specific scheme (e.g. `vexflare-internal://`) and opens only the
+5. Android resolves the variant-specific scheme (e.g. `vexflareinternal://`) and opens only the
    matching app — no chooser.
 
 **Key files:**
@@ -2476,10 +2470,13 @@ shared/auth/deepLinkValidator.js             extractResetParamsFromUrl() (scheme
 
 ### Other deep-linked flows
 
-- Android intent filters in `mobile/app.config.js` accept the `vexflare://` scheme and route to the
-  Expo app. Per-flavor variants (`vexflare-internal://`, `vexflare-dev://`) are resolved at runtime
-  by `src/utils/appScheme.js` based on `applicationId`.
-- Navigation prefixes (`AppNavigator.js`): the active flavor's `${getAppScheme()}://` plus the
+- `mobile/app.config.js`'s `VARIANTS` map sets one Android intent filter per build, keyed off
+  `APP_VARIANT` at prebuild time — the production build declares only `vexflare://`, the internal
+  build only `vexflareinternal://`, and the dev build only `vexflaredev://`; a single installed app
+  never accepts more than its own scheme. `src/utils/appScheme.js`'s `getAppScheme()` derives the
+  same scheme at **runtime** from `Application.applicationId`, purely to construct outgoing links
+  (OAuth, payment, reset) that match whichever variant is actually running.
+- Navigation prefixes (`AppNavigator.js`): the active variant's `${getAppScheme()}://` plus the
   static set `['eshop://', 'vexflare://', 'exp+eshop-mobile://', 'exp+vexflare-mobile://']` and the
   dynamic `ExpoLinking.createURL('/')`, with screen config that maps `checkout-success` →
   `PurchaseSuccess`, `checkout-cancel` → `PurchaseCancel`, and `reset-password` → `ResetPassword`
@@ -2606,14 +2603,23 @@ All mobile-specific runbooks live alongside the app code:
 
 - [`mobile/env.md`](mobile/env.md) — Environment matrix, API profiles (emulator/LAN/tunnel), and
   deployment checklist.
+- [`mobile/dev-setup.md`](mobile/dev-setup.md) — Why Expo Go isn't supported for this project.
 - [`mobile/custom-dev-setup.md`](mobile/custom-dev-setup.md) — Android Studio, Java, Gradle, and
-  Expo prerequisites for a fresh machine.
+  Expo prerequisites for a fresh machine; the full custom dev-client workflow.
+- [`mobile/docs/build-and-install.md`](mobile/docs/build-and-install.md) — EAS internal APK /
+  production AAB command reference, manual local builds, and OTA update/rollback commands.
 - [`mobile/docs/mobile-checkout-flow.md`](mobile/docs/mobile-checkout-flow.md) — Annotated checkout
   sequence from product selection to confirmation screens.
+- [`mobile/docs/branding.md`](mobile/docs/branding.md) — Where each branding/versioning value lives
+  and whether changing it needs a new build.
 - [`mobile/docs/android-release-play-store.md`](mobile/docs/android-release-play-store.md) — Release
   readiness checklist for generating an Android App Bundle and submitting to Play Console.
+- [`mobile/docs/internalTesting-and-productionAABinstall.md`](mobile/docs/internalTesting-and-productionAABinstall.md)
+  — Internal APK / production AAB install and SSL-pinning mechanics.
+- [`mobile/docs/ssl-pinning.md`](mobile/docs/ssl-pinning.md) — SSL certificate pinning operational
+  runbook: architecture, verification procedures, certificate rotation.
 - [`mobile/docs/docs/mobile/android-build-config.md`](mobile/docs/docs/mobile/android-build-config.md)
-  — Native build configuration (gradle.properties, signing files, `eas.json` notes).
+  — Native build configuration (SDK levels, New Architecture, config plugins, `gradle.properties`).
 - Expo CLI metadata (`mobile/.expo/`) is ephemeral and Git-ignored; regenerate locally via
   `expo start` when needed.
 
@@ -6166,8 +6172,8 @@ monitor** sweeps the JournalEntry shadow ledger for account-level corruption tha
 checks cannot see (positive per-seller Reserve balances, Seller*Payable drift vs the flat ledger,
 Cash mismatches vs a cross-source reconstruction, duplicate journal idempotency keys), and the **job
 heartbeat watchdog** alerts when any finance cron has not completed successfully within its expected
-interval (`HEARTBEAT*\*\_INTERVAL_MINUTES`). Both log with `alert:
-true`and email the reconciliation ops recipients; see`docs/settlements-runbook.md` §15.
+interval (`HEARTBEAT*\*\_INTERVAL_MINUTES`). Both log with `alert: true`and email the reconciliation
+ops recipients; see`docs/settlements-runbook.md` §15.
 
 #### 1) Reconciliation Architecture (Backend)
 
@@ -9784,7 +9790,7 @@ Extra reference material that complements this README:
 - [`docs/architecture-page.md`](docs/architecture-page.md) — how to maintain the Architecture page,
   what its integrity suite checks, and how to re-measure the metrics it displays.
 - [`frontend/README.md`](frontend/README.md) — frontend-specific architecture, scripts, and tooling.
-- [`mobile/dev-setup.md`](mobile/dev-setup.md) — Expo environment setup and troubleshooting.
+- [`mobile/dev-setup.md`](mobile/dev-setup.md) — why Expo Go isn't supported for this project.
 - [`mobile/custom-dev-setup.md`](mobile/custom-dev-setup.md) — deeper dive into native module
   development and custom client rebuilds.
 - [`mobile/docs/branding.md`](mobile/docs/branding.md) — how to apply bespoke branding assets in the

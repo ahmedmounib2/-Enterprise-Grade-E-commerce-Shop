@@ -25,7 +25,6 @@
   - [Clean builds \& cache resets](#clean-builds--cache-resets)
   - [Examples of “native-affecting” changes in app.config.js](#examples-of-native-affecting-changes-in-appconfigjs)
   - [Troubleshooting](#troubleshooting)
-  - [Troubleshooting](#troubleshooting-1)
     - [Android Device Missing in WSL](#android-device-missing-in-wsl)
       - [Symptoms](#symptoms)
     - [Fast Diagnosis](#fast-diagnosis)
@@ -54,7 +53,8 @@ client** inside the monorepo.
 
 - All commands run from **WSL (Ubuntu 22.04)** unless noted.
 - The monorepo uses **npm workspaces**; scope with `npm -w <workspace> run <script>`.
-- The mobile app registers the custom scheme `eshop://` (e.g. `eshop://reset-password?...`).
+- The mobile app registers a distinct custom scheme per variant (`vexflare` / `vexflareinternal` /
+  `vexflaredev`, e.g. `vexflaredev://reset-password?...` for the dev client).
 - Web on **Vercel**, backend on **Railway**. Emails include the deep link + a SPA fallback.
 
 ---
@@ -238,11 +238,11 @@ all: the pins are environment values baked into the JS bundle.
 There are no Gradle flavors. `app.config.js` reads `process.env.APP_VARIANT` and sets the
 `applicationId`, deep-link scheme, and launcher label per build:
 
-| `APP_VARIANT` | applicationId                   | Scheme              | Use                     |
-| ------------- | ------------------------------- | ------------------- | ----------------------- |
-| `production`  | `com.ahmedmonib.eshop`          | `vexflare`          | Play Store (default)    |
-| `internal`    | `com.ahmedmonib.eshop.internal` | `vexflare-internal` | EAS internal / sideload |
-| `development` | `com.ahmedmonib.eshop.dev`      | `vexflare-dev`      | local dev / dev-client  |
+| `APP_VARIANT` | applicationId                   | Scheme             | Use                     |
+| ------------- | ------------------------------- | ------------------ | ----------------------- |
+| `production`  | `com.ahmedmonib.eshop`          | `vexflare`         | Play Store (default)    |
+| `internal`    | `com.ahmedmonib.eshop.internal` | `vexflareinternal` | EAS internal / sideload |
+| `development` | `com.ahmedmonib.eshop.dev`      | `vexflaredev`      | local dev / dev-client  |
 
 - **Locally**, pick the variant with the env var: `APP_VARIANT=development npx expo run:android`.
 - **On EAS**, each `eas.json` profile sets `APP_VARIANT` in its `env` (production / internal /
@@ -254,7 +254,7 @@ The three application IDs differ, so all three apps install side-by-side on one 
 
 ## Build or refresh the custom dev client
 
-The dev client is the `development` variant (`com.ahmedmonib.eshop.dev`, scheme `vexflare-dev`).
+The dev client is the `development` variant (`com.ahmedmonib.eshop.dev`, scheme `vexflaredev`).
 
 ```bash
 # 1) Set the JS env FIRST (tunnel is the daily default for dev builds).
@@ -290,6 +290,9 @@ APP_VARIANT=development npx expo start --dev-client
 # repo root
 rm -rf node_modules && npm install
 
+npm -w mobile run env:tunnel
+adb uninstall com.ahmedmonib.eshop.dev || true
+
 cd mobile
 adb kill-server && adb start-server
 adb devices -l                                   # must show ONE 'device'
@@ -304,9 +307,9 @@ APP_VARIANT=development npx expo run:android
 
 ## Deep-link scheme
 
-The deep-link scheme is set by `app.config.js` from `APP_VARIANT` (`vexflare` / `vexflare-internal`
-/ `vexflare-dev`) — there is no committed `AndroidManifest.xml` to hand-edit. To change a scheme,
-edit the `VARIANTS` map in `mobile/app.config.js` and rebuild (`expo run:android` locally, or
+The deep-link scheme is set by `app.config.js` from `APP_VARIANT` (`vexflare` / `vexflareinternal` /
+`vexflaredev`) — there is no committed `AndroidManifest.xml` to hand-edit. To change a scheme, edit
+the `VARIANTS` map in `mobile/app.config.js` and rebuild (`expo run:android` locally, or
 `eas build`); prebuild regenerates the manifest from the config.
 
 ## Daily development loop
@@ -331,8 +334,8 @@ npx expo start --tunnel --dev-client --clear
 
 # 4) Open the dev client (scan QR, choose “Development Build”)
 
-# 5) Smoke test deep link
-npx uri-scheme open "eshop://reset-password?token=TEST123&email=user%40example.com" --android
+# 5) Smoke test deep link (dev client scheme)
+npx uri-scheme open "vexflaredev://reset-password?token=TEST123&email=user%40example.com" --android
 ```
 
 ---
@@ -411,7 +414,7 @@ APP_VARIANT=development npx expo run:android   # regenerates android/ and rebuil
 
 - android.permissions (adding/removing)
 
-- android.edgeToEdgeEnabled, icon, adaptiveIcon images
+- android.icon, adaptiveIcon images
 
 - android.package (applicationId), versionCode, minSdkVersion/targetSdkVersion via plugins
 
@@ -492,11 +495,7 @@ APP_VARIANT=development npx expo run:android   # regenerates android/ and rebuil
 
   when the backend is configured for HTTPS.
 
-  when the backend is configured for HTTPS.
-
 ---
-
-## Troubleshooting
 
 ### Android Device Missing in WSL
 
@@ -838,7 +837,7 @@ For a side-loadable release APK for quick QA, build the `internal` profile on EA
 downloaded APK (full details in `mobile/docs/build-and-install.md`):
 
 ```bash
-eas build --platform android --profile internal   # com.ahmedmonib.eshop.internal, scheme vexflare-internal
+eas build --platform android --profile internal   # com.ahmedmonib.eshop.internal, scheme vexflareinternal
 # then download the APK from the EAS dashboard and:
 adb uninstall com.ahmedmonib.eshop.internal || true
 adb install -r ~/Downloads/<downloaded>.apk

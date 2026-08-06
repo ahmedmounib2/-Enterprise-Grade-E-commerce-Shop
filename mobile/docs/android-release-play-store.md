@@ -227,12 +227,16 @@ The printed SHA1 must match the upload certificate stored in the Play Console.
 
 ## Only upload the freshly generated bundle after these checks pass
 
-## 4. Enable R8 minification and crash deobfuscation
+## 4. R8 minification and crash deobfuscation (not currently enabled)
 
 R8 shrinking trims unused code/resources, shortens symbol names, and makes reverse-engineering
-harder. We enable it to ship a smaller, harder-to-tamper bundle. Because minification rewrites class
-names, we must keep the generated mapping file so Play Console and crash reporters can deobfuscate
-stack traces.
+harder. **This is not currently turned on** — `mobile/app.config.js`'s `expo-build-properties` block
+does not set `enableProguardInReleaseBuilds` / `enableShrinkResourcesInReleaseBuilds`, so release
+builds ship unminified (confirm with
+`grep enableMinifyInReleaseBuilds mobile/android/app/build.gradle` after a prebuild — it resolves to
+`false`). The steps below are what enabling it would look like; treat this section as a how-to, not
+a description of the current build. Because minification rewrites class names, keep the generated
+mapping file so Play Console and crash reporters can deobfuscate stack traces once it is turned on.
 
 ### Enable minification
 
@@ -258,45 +262,46 @@ In the managed workflow, enable R8/ProGuard through `expo-build-properties` in
 
 ### Harden the ProGuard configuration
 
-Add reflection-keep rules via `extraProguardRules` in the `expo-build-properties` plugin (a
-committed `android/app/proguard-rules.pro` would be overwritten by prebuild), so libraries that rely
-on reflection keep their entry points while everything else can be stripped:
+Add reflection-keep rules via `extraProguardRules` in the `expo-build-properties` plugin — **not**
+by editing `android/app/proguard-rules.pro` directly, since that generated file is overwritten by
+the next prebuild:
 
-```diff
---- a/mobile/android/app/proguard-rules.pro
-+++ b/mobile/android/app/proguard-rules.pro
-@@
--# react-native-reanimated
---keep class com.swmansion.reanimated.** { *; }
---keep class com.facebook.react.turbomodule.** { *; }
--
--# Add any project specific keep options here:
-+# react-native core & dependencies
-+-keep class com.facebook.react.** { *; }
-+-keep class com.facebook.hermes.** { *; }
-+-keep class com.facebook.react.turbomodule.** { *; }
-+-keep class com.facebook.react.bridge.** { *; }
-+-keepclassmembers class * extends com.facebook.react.bridge.JavaScriptModule { *; }
-+-keepclassmembers class * extends com.facebook.react.bridge.NativeModule { *; }
-+-keepclassmembers class * extends com.facebook.react.uimanager.ViewManager { *; }
-+-dontwarn com.facebook.react.**
-+-dontwarn com.facebook.hermes.**
-+
-+# react-native-reanimated
-+-keep class com.swmansion.reanimated.** { *; }
-+-dontwarn com.swmansion.reanimated.**
-+
-+# Expo modules that rely on reflection
-+-keep class expo.modules.** { *; }
-+-keep class com.swmansion.gesturehandler.** { *; }
-+-dontwarn expo.modules.**
-+-dontwarn com.swmansion.gesturehandler.**
-+
-+# Keep the generated BuildConfig fields so R8 doesn't strip them.
-+-keepclassmembers class **.BuildConfig { *; }
-+
-+# Add any project specific keep options here:
+```js
+[
+  "expo-build-properties",
+  {
+    android: {
+      // ...existing SDK versions, enableProguardInReleaseBuilds, etc...
+      extraProguardRules: `
+        # react-native core & dependencies
+        -keep class com.facebook.react.** { *; }
+        -keep class com.facebook.hermes.** { *; }
+        -keep class com.facebook.react.turbomodule.** { *; }
+        -keep class com.facebook.react.bridge.** { *; }
+        -keepclassmembers class * extends com.facebook.react.bridge.JavaScriptModule { *; }
+        -keepclassmembers class * extends com.facebook.react.bridge.NativeModule { *; }
+        -keepclassmembers class * extends com.facebook.react.uimanager.ViewManager { *; }
+        -dontwarn com.facebook.react.**
+        -dontwarn com.facebook.hermes.**
+
+        # Expo modules that rely on reflection
+        -keep class expo.modules.** { *; }
+        -keep class com.swmansion.gesturehandler.** { *; }
+        -dontwarn expo.modules.**
+        -dontwarn com.swmansion.gesturehandler.**
+
+        # Keep the generated BuildConfig fields so R8 doesn't strip them.
+        -keepclassmembers class **.BuildConfig { *; }
+      `,
+    },
+  },
+];
 ```
+
+`extraProguardRules` is appended to the default template Expo generates at prebuild time (which
+already keeps `com.swmansion.reanimated.**`, present even though `reanimated` isn't a current
+dependency — it ships in Expo's default template regardless), so there is no separate file to
+maintain.
 
 ### Archive the mapping file on every build
 
@@ -365,8 +370,11 @@ APP_VARIANT=development npx expo run:android        # com.ahmedmonib.eshop.dev d
 Why it matters: the internal APK sideloads quickly for regression testing, while the prod AAB is the
 only file accepted by Google Play.
 
-> 🔐 The `copyPinnedCerts` Gradle task runs before every variant build, so both internal and prod
-> outputs bundle the refreshed SSL pin automatically after `npm -w mobile run env:production`.
+> 🔐 There is no Gradle task or asset copy step for pinning. `mobile/app.config.js` resolves the
+> pins from `mobile/ssl-pins.json` and injects them into `extra` at prebuild time, so both internal
+> and prod outputs pick up the current pins automatically on every build — there is nothing to run
+> after `npm -w mobile run env:production` beyond the build itself. Full reference:
+> [`ssl-pinning.md`](./ssl-pinning.md).
 
 ### B. Prepare environments before building
 
@@ -396,7 +404,7 @@ resume once the updated bundle is installed. `adb logcat` shows
 `SSL pinning validation failed for <host>` when a pin is rejected.
 
 ```bash
-     npx uri-scheme open "eshop://reset-password?token=TEST123&email=user%40example.com" --android
+     npx uri-scheme open "vexflare://reset-password?token=TEST123&email=user%40example.com" --android
 ```
 
 Verify the reset screen opens and the token/email parameters propagate through the UI.
@@ -451,7 +459,7 @@ Perform these checks **before** uploading anything to Play. Use the sideloaded
    - Trigger the deep link via `uri-scheme`:
 
      ```bash
-     npx uri-scheme open "eshop://reset-password?token=TEST123&email=user%40example.com" --android
+     npx uri-scheme open "vexflare://reset-password?token=TEST123&email=user%40example.com" --android
      ```
 
      Confirm you land on the reset screen and the token/email propagate correctly.
@@ -466,7 +474,7 @@ Perform these checks **before** uploading anything to Play. Use the sideloaded
 
 ---
 
-## 7. Play Console upload & roll-out
+## 8. Play Console upload & roll-out
 
 1. Create or open the **Eshop** app in the Play Console. The package name **must** be
    `com.ahmedmonib.eshop`.
@@ -503,7 +511,7 @@ rejection should not happen for EAS builds. If Play still rejects an upload with
 
 ---
 
-## 8. Dev vs. prod workflow (quick reference)
+## 9. Dev vs. prod workflow (quick reference)
 
 Keep your environment clean between daily development and release prep:
 
@@ -526,7 +534,7 @@ production values (copy from `.env.production`).
 
 ---
 
-## 9. Final quick checklist
+## 10. Final quick checklist
 
 - [ ] Railway `MOBILE_*` variables and `PUBLIC_CLIENT_FALLBACK_URL` configured for production.
 - [ ] `mobile/.env.production` targets the production API and web origin; `mobile/.env` matches it
@@ -543,7 +551,7 @@ monitor Play Console vitals, and update documentation or changelogs as needed.
 
 ---
 
-## 10. Troubleshooting & recurring release workflow
+## 11. Troubleshooting & recurring release workflow
 
 | Symptom                                            | Fix                                                                                                                          |
 | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
@@ -567,3 +575,5 @@ monitor Play Console vitals, and update documentation or changelogs as needed.
 
 Following this loop ensures each Play Store update uses the same hardened process and reduces missed
 steps during future deploys.
+
+---

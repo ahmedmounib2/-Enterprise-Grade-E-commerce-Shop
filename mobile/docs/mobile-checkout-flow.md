@@ -29,18 +29,22 @@ light/dark modes and locales.
      screen.
    - If the cart is empty, an alert explains that checkout requires products.
    - Otherwise the screen calls `navigation.navigate('Checkout')`.
-3. **Handle deep links** with the helper `extractCheckoutParams` inside `AppNavigator`. Stripe
-   redirects back to `eshop://checkout-success?session_id=...` while COD orders can send
-   `eshop://checkout-success?orderId=...&cod=true`. Cancellation uses `eshop://checkout-cancel`. The
-   navigator queues navigation events until the container is ready, so tapping links outside the app
-   still lands on the correct screen.
+3. **Handle deep links** with the helper `extractCheckoutParams` inside `AppNavigator`.
+   `CheckoutPage` builds the return links via `createAppDeepLink()`
+   (`mobile/src/utils/appScheme.js`), which always forces the installed variant's own scheme —
+   `vexflare://checkout-success` (production), `vexflareinternal://checkout-success` (internal APK),
+   or `vexflaredev://checkout-success` (dev client) — so Stripe's redirect re-opens the exact app
+   that started checkout. COD orders send the same success link with `orderId=...&cod=true`
+   appended. Cancellation uses the equivalent `.../checkout-cancel` link. The navigator queues
+   navigation events until the container is ready, so tapping links outside the app still lands on
+   the correct screen.
 
 ## Checkout Flow Details
 
 ### Card (Stripe) Checkout
 
-1. `CheckoutPage` posts to `/payments/create-checkout-session` with calculated totals and the return
-   deep-link URLs (`eshop://checkout-success` and `eshop://checkout-cancel`).
+1. `CheckoutPage` posts to `/payments/create-checkout-session` with calculated totals and the
+   variant-scoped return deep-link URLs (see "Handle deep links" above).
 2. The backend (`backend/src/controllers/payment.controller.js`) validates the supplied URLs, passes
    them to Stripe, and returns the hosted checkout URL and the deep-link safe payload.
 3. The app opens the `stripeSession.url` in the device browser. Stripe redirects to the supplied
@@ -61,9 +65,9 @@ light/dark modes and locales.
 ### Cancellation Handling
 
 - Any failure that occurs before redirecting to Stripe surfaces as an error alert on `CheckoutPage`.
-- Stripe cancellations or manual cancellations redirect to `eshop://checkout-cancel`, which
-  `AppNavigator` maps to `PurchaseCancel` with friendly messaging and a button that routes back to
-  the cart.
+- Stripe cancellations or manual cancellations redirect to the variant-scoped `.../checkout-cancel`
+  link, which `AppNavigator` maps to `PurchaseCancel` with friendly messaging and a button that
+  routes back to the cart.
 
 ## Translation & Theme Notes
 

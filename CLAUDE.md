@@ -75,7 +75,7 @@ npm workspaces: `backend`, `frontend`, `mobile`, `shared`, `packages/*`.
 repo root
 ├── backend/          Node.js + Express 5 API (ESM)
 ├── frontend/         React 19 + Vite + Tailwind/DaisyUI SPA
-├── mobile/           React Native + Expo 54
+├── mobile/           React Native + Expo 55 (New Architecture)
 ├── shared/           @eshop/locales — JSON translations (en/ar/es/fr) + shared theme + utilities
 └── packages/
     └── api-client/   @eshop/api-client — axios HTTP client (used by frontend & mobile)
@@ -121,8 +121,8 @@ repo root
 
 ### Mobile (`mobile/src/`)
 
-- **Framework:** Expo 54 + React Native 0.81. Navigation via `@react-navigation/native-stack`
-  (`src/navigation/AppNavigator.js`).
+- **Framework:** Expo 55 + React Native 0.83, New Architecture (mandatory as of SDK 55). Navigation
+  via `@react-navigation/native-stack` (`src/navigation/AppNavigator.js`).
 - **Auth:** `expo-secure-store` for token persistence (`src/auth/secureStore.js`). Auth state via
   `src/auth/AuthProvider.js`.
 - **Cart:** `src/cart/CartProvider.js`.
@@ -602,3 +602,5 @@ End every debugging task with:
 
 The goal is not only to fix the current bug but to improve the repository owner's debugging and
 engineering skills over time.
+
+---

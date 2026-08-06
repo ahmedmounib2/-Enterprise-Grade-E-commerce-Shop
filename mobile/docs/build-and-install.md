@@ -16,11 +16,11 @@ flavors**; the app variant is selected by `APP_VARIANT` (see below).
 deep-link scheme, and launcher name per build. Each `eas.json` profile sets `APP_VARIANT` in its
 `env`, so all three apps can be installed on one device at once:
 
-| Variant / profile | applicationId                   | Scheme              | Output             |
-| ----------------- | ------------------------------- | ------------------- | ------------------ |
-| `production`      | `com.ahmedmonib.eshop`          | `vexflare`          | AAB (Play Console) |
-| `internal`        | `com.ahmedmonib.eshop.internal` | `vexflare-internal` | APK (sideload)     |
-| `development`     | `com.ahmedmonib.eshop.dev`      | `vexflare-dev`      | local dev-client   |
+| Variant / profile | applicationId                   | Scheme             | Output             |
+| ----------------- | ------------------------------- | ------------------ | ------------------ |
+| `production`      | `com.ahmedmonib.eshop`          | `vexflare`         | AAB (Play Console) |
+| `internal`        | `com.ahmedmonib.eshop.internal` | `vexflareinternal` | APK (sideload)     |
+| `development`     | `com.ahmedmonib.eshop.dev`      | `vexflaredev`      | local dev-client   |
 
 Locally, pick the variant with the env var, e.g. `APP_VARIANT=development npx expo run:android`.
 
@@ -38,7 +38,7 @@ Locally, pick the variant with the env var, e.g. `APP_VARIANT=development npx ex
 
 ```bash
 cd mobile
-# Build the internal APK on EAS (com.ahmedmonib.eshop.internal, scheme vexflare-internal).
+# Build the internal APK on EAS (com.ahmedmonib.eshop.internal, scheme vexflareinternal).
 # eas.json's `internal` profile sets APP_VARIANT=internal and buildType apk.
 eas build --platform android --profile internal
 
@@ -340,27 +340,40 @@ EAS Update ships **JavaScript-only** fixes over-the-air to installed builds, wit
 
 ```bash
 # Publish a JS-only fix to the internal channel
-eas update --channel internal --message "fix: <describe the fix>"
+eas update --channel internal --environment preview --message "fix: <describe the fix>"
 
 # Publish a JS-only fix to the production channel
-eas update --channel production --message "fix: <describe the fix>"
+eas update --channel production --environment production --message "fix: <describe the fix>"
 ```
+
+> `--environment` is required for Expo SDK 55+ projects (`eas update --help` states this explicitly)
+> — omitting it fails the command. This repo does not use EAS's dashboard "Environments" feature for
+> actual variables (those are inlined per-profile in `eas.json`), so the flag only selects which
+> environment name the CLI reports; `internal` maps to `preview`, `production` maps to `production`
+> (matching `mobile/package.json`'s `eas:update:internal` / `eas:update:production` scripts, which
+> already carry the flag — prefer running those over the raw command above).
 
 Verify the update appears in the Expo dashboard, then relaunch the app on a device on that channel —
 the launch-time hook (`src/hooks/useOtaUpdates.js` → `src/ota/otaService.js`) checks on cold launch
 and either applies it seamlessly during the launch gate or surfaces an "Update ready" banner. On
-dev/internal builds, open the `ota-debug` deep link (e.g. `vexflare-internal://ota-debug`) to
-inspect the running channel / runtimeVersion / updateId and the stage log if an update never
-applies. See `docs/deployment.md` for the full OTA flow and diagnostic runbook.
+dev/internal builds, open the `ota-debug` deep link (e.g. `vexflareinternal://ota-debug`) to inspect
+the running channel / runtimeVersion / updateId and the stage log if an update never applies. See
+`docs/deployment.md` for the full OTA flow and diagnostic runbook.
 
 **Rollback:**
 
-```bash
-# Rollback internal
-eas update:rollback --channel internal
+`eas update:rollback` has no `--channel`/`--branch` flag (verified against
+`eas update:rollback --help`) — it always operates on one branch, selected either interactively or
+by update group:
 
-# Rollback production
-eas update:rollback --channel production
+```bash
+# Interactive: prompts you to pick the branch (internal/production) and the update
+# group to roll back to.
+eas update:rollback
+
+# Non-interactive: look up the group id for the branch first, then pass it explicitly.
+eas update:list --branch internal --limit 5     # find the GROUPID to roll back to
+eas update:rollback <GROUPID> --non-interactive
 ```
 
 When you need a rollback:

@@ -33,16 +33,16 @@ end-to-end path through everything below.
 
 ### 0.1 Required software
 
-| Tool                           | Version                                 | Notes                                                                       |
-| ------------------------------ | --------------------------------------- | --------------------------------------------------------------------------- |
-| Node.js                        | 20.x                                    | Verified on v20.19.4. Matches the Vercel build baseline.                    |
-| npm                            | 10.x                                    | Workspaces are required; do not use yarn/pnpm here.                         |
-| Java JDK                       | **17**                                  | Required by Gradle 8.14.3 / AGP 8.11. Java 21 is not supported by this AGP. |
-| Android SDK                    | **platform 36**, build-tools **36.0.0** | The app targets API 36. Installing only 35 will fail the build.             |
-| Android platform-tools         | any recent                              | Provides `adb`.                                                             |
-| Expo CLI                       | bundled                                 | Invoked as `npx expo`; not installed globally.                              |
-| EAS CLI                        | `>= 12.0.0`                             | Only needed for cloud builds. `npm i -g eas-cli`.                           |
-| Charles Proxy **or** mitmproxy | any recent                              | Only for the MITM procedures (4.3 / 4.4).                                   |
+| Tool                           | Version                                 | Notes                                                           |
+| ------------------------------ | --------------------------------------- | --------------------------------------------------------------- |
+| Node.js                        | 20.x                                    | Verified on v20.19.4. Matches the Vercel build baseline.        |
+| npm                            | 10.x                                    | Workspaces are required; do not use yarn/pnpm here.             |
+| Java JDK                       | **17**                                  | Required by Gradle 9.0.0 / AGP 8.12.0.                          |
+| Android SDK                    | **platform 36**, build-tools **36.0.0** | The app targets API 36. Installing only 35 will fail the build. |
+| Android platform-tools         | any recent                              | Provides `adb`.                                                 |
+| Expo CLI                       | bundled                                 | Invoked as `npx expo`; not installed globally.                  |
+| EAS CLI                        | `>= 12.0.0`                             | Only needed for cloud builds. `npm i -g eas-cli`.               |
+| Charles Proxy **or** mitmproxy | any recent                              | Only for the MITM procedures (4.3 / 4.4).                       |
 
 Install the Android pieces (see `mobile/custom-dev-setup.md` for full first-time setup):
 
@@ -165,11 +165,9 @@ Pinning uses **`react-native-ssl-public-key-pinning`** — OkHttp's `Certificate
 TrustKit on iOS. It installs pinning **globally at the platform networking layer**, so every request
 made through standard React Native networking is covered, not just axios calls.
 
-It replaced `react-native-ssl-pinning@1.6.0`, which was a legacy bridge module and the only
-dependency blocking the New Architecture. The replacement ships a TurboModule codegen spec
-(`RNSslPublicKeyPinningSpec`) and resolves through `TurboModuleRegistry.get` when
-`global.__turboModuleProxy` exists, falling back to `NativeModules` otherwise — so it works under
-both architectures.
+It replaced `react-native-ssl-pinning@1.6.0`, a legacy bridge module. The replacement ships a
+TurboModule codegen spec (`RNSslPublicKeyPinningSpec`) and resolves through
+`TurboModuleRegistry.get`, confirmed via logcat on the current always-on New Architecture.
 
 ### The adapter boundary
 
@@ -1219,14 +1217,13 @@ schedule rather than in response to a change.
 
 ### When to re-run the verification suite
 
-| Trigger                                                                | Run                                          |
-| ---------------------------------------------------------------------- | -------------------------------------------- |
-| `ssl-pins.json` changed                                                | Full suite: 4.2, 4.3, 4.4, 4.5, 4.1, then 5. |
-| `react-native-ssl-public-key-pinning` upgraded                         | Full suite.                                  |
-| Expo SDK / React Native upgrade                                        | Full suite — networking internals move.      |
-| New Architecture enabled                                               | Full suite.                                  |
-| `sslPinningAdapter.native.js` or the AuthProvider mount effect changed | Full suite.                                  |
-| Routine feature work                                                   | `npm -w mobile test` only.                   |
+| Trigger                                                                | Run                                                                                                                                             |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ssl-pins.json` changed                                                | Full suite: 4.2, 4.3, 4.4, 4.5, 4.1, then 5.                                                                                                    |
+| `react-native-ssl-public-key-pinning` upgraded                         | Full suite.                                                                                                                                     |
+| Expo SDK / React Native upgrade                                        | Full suite — networking internals move. (The New Architecture cutover, since SDK 55, falls under this row — it is no longer a separate toggle.) |
+| `sslPinningAdapter.native.js` or the AuthProvider mount effect changed | Full suite.                                                                                                                                     |
+| Routine feature work                                                   | `npm -w mobile test` only.                                                                                                                      |
 
 ---
 
@@ -1508,6 +1505,11 @@ actually validated.
 - [x] `internal-mitm`: all API requests failed, **no** `api.vexflare.com` traffic in Charles, logcat
       showed `SSL pinning validation failed for api.vexflare.com: Certificate pinning failure!` —
       proving the pinner ran _after_ Android accepted the chain.
+- [x] **Re-run in full under Expo SDK 55 / React Native 0.83 / the New Architecture cutover**
+      (2026-08-05): §4.2 `internal-pinfail`, §4.3 `internal-mitm-nopin`, §4.4 `internal-mitm`, and
+      §4.5 cleanup all re-verified with the same pass/fail pattern as above.
+      `react-native-ssl-public-key-pinning` confirmed resolving via TurboModule at runtime — no
+      legacy-bridge fallback.
 
 ### Production
 
@@ -1539,8 +1541,6 @@ verification — section 5 covers it whenever you choose to make it.
 - [ ] **iOS verification.** Pinning is implemented for iOS (TrustKit) but has never been built or
       tested: `eas.json` has no iOS profile, and the MITM harness is Android-specific. Everything
       ticked above is Android. See [0.4](#04-platform-scope--what-has-and-has-not-been-verified).
-- [ ] New Architecture enablement — no remaining blockers, but a separate migration
-      (`mobile/docs/docs/mobile/android-build-config.md`).
 - [x] `mobile/scripts/release-pipeline.sh` — fixed. It called `:app:assembleInternalRelease` /
       `:app:bundleProdRelease`, which do not exist in a flavorless project, and read the pins from a
       `.env` variable that no longer exists. Now uses `assembleRelease` / `bundleRelease` and

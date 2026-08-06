@@ -90,11 +90,11 @@ There are no Gradle flavors. Instead, `app.config.js` reads `process.env.APP_VAR
 distinct `applicationId`, deep-link scheme, and launcher label per build. Each `eas.json` profile
 sets `APP_VARIANT` in its `env`:
 
-| Profile       | `APP_VARIANT` | applicationId                   | Display name          | Scheme              | Output | Channel      |
-| ------------- | ------------- | ------------------------------- | --------------------- | ------------------- | ------ | ------------ |
-| `production`  | `production`  | `com.ahmedmonib.eshop`          | `Vexflare`            | `vexflare`          | AAB    | `production` |
-| `internal`    | `internal`    | `com.ahmedmonib.eshop.internal` | `Vexflare (Internal)` | `vexflare-internal` | APK    | `internal`   |
-| `development` | `development` | `com.ahmedmonib.eshop.dev`      | `Vexflare (Dev)`      | `vexflare-dev`      | APK    | `internal`   |
+| Profile       | `APP_VARIANT` | applicationId                   | Display name          | Scheme             | Output | Channel      |
+| ------------- | ------------- | ------------------------------- | --------------------- | ------------------ | ------ | ------------ |
+| `production`  | `production`  | `com.ahmedmonib.eshop`          | `Vexflare`            | `vexflare`         | AAB    | `production` |
+| `internal`    | `internal`    | `com.ahmedmonib.eshop.internal` | `Vexflare (Internal)` | `vexflareinternal` | APK    | `internal`   |
+| `development` | `development` | `com.ahmedmonib.eshop.dev`      | `Vexflare (Dev)`      | `vexflaredev`      | APK    | `internal`   |
 
 Because the three application IDs differ, all three apps can be installed on one device at once.
 
@@ -220,23 +220,33 @@ regression is JavaScript-only.
 
    ```bash
    # Publish a JS-only fix to the internal channel
-   eas update --channel internal --message "fix: <describe the fix>"
+   eas update --channel internal --environment preview --message "fix: <describe the fix>"
 
    # Publish a JS-only fix to the production channel
-   eas update --channel production --message "fix: <describe the fix>"
+   eas update --channel production --environment production --message "fix: <describe the fix>"
    ```
+
+   `--environment` is required for Expo SDK 55+ projects (`eas update --help`). It only selects
+   which environment name the CLI reports — this repo doesn't use EAS's dashboard "Environments"
+   feature for actual variables, those stay inlined per-profile in `eas.json`.
 
 3. Verify the update appears in the Expo dashboard, then relaunch the app on a device on that
    channel to confirm it downloads and applies on the next launch.
 
 **Rollback:**
 
-```bash
-# Rollback internal
-eas update:rollback --channel internal
+`eas update:rollback` has no `--channel`/`--branch` flag (verified against
+`eas update:rollback --help`) — it operates on one branch, selected either interactively or by
+update group:
 
-# Rollback production
-eas update:rollback --channel production
+```bash
+# Interactive: prompts you to pick the branch (internal/production) and the update
+# group to roll back to.
+eas update:rollback
+
+# Non-interactive: look up the group id for the branch first, then pass it explicitly.
+eas update:list --branch internal --limit 5     # find the GROUPID to roll back to
+eas update:rollback <GROUPID> --non-interactive
 ```
 
 When you need a rollback:
@@ -300,9 +310,9 @@ The OTA Debug surface is compiled only into dev/internal builds (`isOtaDebugEnab
 code path, publish the same update to `internal` and open the debug screen:
 
 ```bash
-eas update --channel internal --message "ota diag"
+eas update --channel internal --environment preview --message "ota diag"
 # install the internal build, then open the deep link:
-#   vexflare-internal://ota-debug
+#   vexflareinternal://ota-debug
 ```
 
 The screen shows the running `channel`, `runtimeVersion`, `updateId`, `isEmbeddedLaunch`,
